@@ -15,7 +15,7 @@
 ├────────────────────────────────┴────────────────────────────────────┴────────────────────────────────────────┤
 │ Filter (Col 2): █   [Col1: '' | Col2: '' | Col3: '']                                                         │
 │ Command Line  : Get-Process -Id                                                                              │
-│ [↑/↓] Move  [←/→] Column  [Type] Fuzzy Filter  [Tab] Append Token  [Ctrl+R] Sync PS  [Enter] Accept  [Esc]   │
+│ [↑/↓] Move  [←/→] Column  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [Ctrl+R] Sync  [Enter] Accept  [Esc]  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -187,12 +187,13 @@ bind \em _zpane_fish
 | Key | Action |
 | :--- | :--- |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | Move selection up / down in the active column (wraps around) |
-| <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Jump 12 items up / down |
+| <kbd>PgUp</kbd> / <kbd>PgDn</kbd> | Jump one visible screenful up / down in the active column (accounts for Column 3's inspector header) |
 | <kbd>Home</kbd> / <kbd>End</kbd> | Jump to first / last item in the active column |
 | <kbd>→</kbd> / <kbd>←</kbd> | Move focus to the next / previous Miller column |
 | <kbd>Tab</kbd> | Append the highlighted token/flag/value to the command line and advance |
 | `Type any char` | Fuzzy-filter the active column (or type a custom argument value in Column 3) |
 | <kbd>Backspace</kbd> | Delete the last filter character, or pop the last appended command token if the filter is empty |
+| <kbd>Ctrl+U</kbd> | Clear the active column's fuzzy filter |
 | <kbd>Ctrl+R</kbd> | Re-synchronize PowerShell cmdlet/function/alias metadata (`ps_metadata.json`) |
 | <kbd>Enter</kbd> | Accept the assembled command line and exit |
 | <kbd>Esc</kbd> / <kbd>Ctrl+C</kbd> | Cancel and exit without modifying the prompt |

@@ -1,5 +1,5 @@
-use crate::fuzzy::FilteredItem;
-use crate::model::{ItemKind, MillerItem};
+use crate::fuzzy::{selected_item, FilteredItem};
+use crate::model::{Column, ItemKind, MillerItem};
 use std::fmt::Write as FmtWrite;
 use unicode_width::UnicodeWidthChar;
 
@@ -35,15 +35,29 @@ impl ItemKind {
 /// Rows consumed by Column 3's inspector header (title, description, divider).
 const COL3_INSPECTOR_ROWS: usize = 3;
 
-/// Authoritative visible row count for a given terminal height and Miller column (`0..=2`).
-/// Accounts for the 6 rows of frame chrome (top border, divider, 3 status/footer bars, bottom border)
-/// and Column 3's 3-row inspector header.
-pub fn viewport_rows(term_h: usize, col: usize) -> usize {
-    let list_rows = term_h.saturating_sub(6).max(4);
-    if col == 2 {
-        list_rows.saturating_sub(COL3_INSPECTOR_ROWS).max(1)
-    } else {
-        list_rows
+/// Rows consumed by the outer frame: top border, divider, 3 status/footer bars, bottom border.
+const FRAME_CHROME_ROWS: usize = 6;
+
+/// Terminal dimensions shared by viewport geometry, scrolling, and rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    pub width: usize,
+    pub height: usize,
+}
+
+impl Viewport {
+    pub const fn new(width: usize, height: usize) -> Self {
+        Self { width, height }
+    }
+
+    /// Authoritative visible list-row count for `col`, accounting for frame chrome
+    /// and Column 3's inspector header. Never exceeds the terminal height.
+    pub fn rows(self, col: Column) -> usize {
+        let list_rows = self.height.saturating_sub(FRAME_CHROME_ROWS);
+        match col {
+            Column::Third => list_rows.saturating_sub(COL3_INSPECTOR_ROWS),
+            Column::First | Column::Second => list_rows,
+        }
     }
 }
 
@@ -165,9 +179,8 @@ fn render_miller_cell(
 }
 
 pub struct RenderState<'a> {
-    pub term_w: usize,
-    pub term_h: usize,
-    pub active_col: usize,
+    pub viewport: Viewport,
+    pub active_col: Column,
     pub filters: &'a [String; 3],
     pub sel_idx: &'a [usize; 3],
     pub scroll_idx: &'a [usize; 3],
@@ -184,23 +197,14 @@ pub struct RenderState<'a> {
 /// Resolves the currently inspected item from the active column, falling back to parent columns
 /// when the active column has no selection.
 pub fn selected_info_item<'a>(st: &RenderState<'a>) -> Option<&'a MillerItem> {
-    let cur_c1 = st
-        .col1_filtered
-        .get(st.sel_idx[0])
-        .and_then(|f| st.col1_items.get(f.item_idx));
-    let cur_c2 = st
-        .col2_filtered
-        .get(st.sel_idx[1])
-        .and_then(|f| st.col2_items.get(f.item_idx));
-    let cur_c3 = st
-        .col3_filtered
-        .get(st.sel_idx[2])
-        .and_then(|f| st.col3_items.get(f.item_idx));
+    let cur_c1 = selected_item(st.col1_filtered, st.col1_items, st.sel_idx[0]);
+    let cur_c2 = selected_item(st.col2_filtered, st.col2_items, st.sel_idx[1]);
+    let cur_c3 = selected_item(st.col3_filtered, st.col3_items, st.sel_idx[2]);
 
     match st.active_col {
-        2 => cur_c3.or(cur_c2).or(cur_c1),
-        1 => cur_c2.or(cur_c1),
-        _ => cur_c1,
+        Column::Third => cur_c3.or(cur_c2).or(cur_c1),
+        Column::Second => cur_c2.or(cur_c1),
+        Column::First => cur_c1,
     }
 }
 
@@ -217,8 +221,8 @@ pub fn inspector_header(st: &RenderState<'_>) -> (String, String) {
 }
 
 pub fn render_frame(st: &RenderState<'_>) -> String {
-    let win_w = st.term_w.max(76);
-    let list_rows = viewport_rows(st.term_h, 0); // 1 top border + list_rows + 1 sep + 3 status/footer + 1 bottom border
+    let win_w = st.viewport.width.max(76);
+    let list_rows = st.viewport.rows(Column::First); // 1 top border + list_rows + 1 sep + 3 status/footer + 1 bottom border
     let (info_title, info_desc) = inspector_header(st);
 
     let inner_w = win_w.saturating_sub(4);
@@ -238,17 +242,17 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     };
     let h3_txt = format!(" 3. Flags / Values / Info ({}) ", st.col3_filtered.len());
 
-    let h1_c = if st.active_col == 0 {
+    let h1_c = if st.active_col == Column::First {
         C_HEADER_ACT
     } else {
         C_HEADER_DIM
     };
-    let h2_c = if st.active_col == 1 {
+    let h2_c = if st.active_col == Column::Second {
         C_HEADER_ACT
     } else {
         C_HEADER_DIM
     };
-    let h3_c = if st.active_col == 2 {
+    let h3_c = if st.active_col == Column::Third {
         C_HEADER_ACT
     } else {
         C_HEADER_DIM
@@ -272,7 +276,13 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         let idx1 = st.scroll_idx[0] + r;
         let cell1 = if let Some(f1) = st.col1_filtered.get(idx1) {
             let it1 = &st.col1_items[f1.item_idx];
-            render_miller_cell(it1, f1, w1, idx1 == st.sel_idx[0], st.active_col == 0)
+            render_miller_cell(
+                it1,
+                f1,
+                w1,
+                idx1 == st.sel_idx[0],
+                st.active_col == Column::First,
+            )
         } else {
             empty_c1.clone()
         };
@@ -281,7 +291,13 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         let idx2 = st.scroll_idx[1] + r;
         let cell2 = if let Some(f2) = st.col2_filtered.get(idx2) {
             let it2 = &st.col2_items[f2.item_idx];
-            render_miller_cell(it2, f2, w2, idx2 == st.sel_idx[1], st.active_col == 1)
+            render_miller_cell(
+                it2,
+                f2,
+                w2,
+                idx2 == st.sel_idx[1],
+                st.active_col == Column::Second,
+            )
         } else {
             empty_c2.clone()
         };
@@ -299,7 +315,13 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             let idx3 = st.scroll_idx[2] + (r - COL3_INSPECTOR_ROWS);
             if let Some(f3) = st.col3_filtered.get(idx3) {
                 let it3 = &st.col3_items[f3.item_idx];
-                render_miller_cell(it3, f3, w3, idx3 == st.sel_idx[2], st.active_col == 2)
+                render_miller_cell(
+                    it3,
+                    f3,
+                    w3,
+                    idx3 == st.sel_idx[2],
+                    st.active_col == Column::Third,
+                )
             } else {
                 empty_c3.clone()
             }
@@ -325,8 +347,8 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     // Filter Bar
     let filter_line = format!(
         " Filter (Col {}): {}█   [Col1: '{}' | Col2: '{}' | Col3: '{}']",
-        st.active_col + 1,
-        st.filters[st.active_col],
+        st.active_col.index() + 1,
+        st.filters[st.active_col.index()],
         st.filters[0],
         st.filters[1],
         st.filters[2]
@@ -346,7 +368,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     );
 
     // Footer Help Bar
-    let footer = " [↑/↓] Move  [←/→] Column  [Type] Fuzzy Filter  [Tab] Append Token  [Ctrl+R] Sync PS  [Enter] Accept  [Esc] Exit";
+    let footer = " [↑/↓] Move  [←/→] Column  [Type] Fuzzy Filter  [Tab] Append Token  [Ctrl+U] Clear Filter  [Ctrl+R] Sync PS  [Enter] Accept  [Esc] Exit";
     let footer_pad = pad_or_truncate(footer, full_inner);
     let _ = writeln!(
         sb,
@@ -369,20 +391,48 @@ mod tests {
 
     #[test]
     fn test_viewport_rows_standard_and_small_terminals() {
+        let standard = Viewport::new(120, 30);
         // Standard 30-row terminal: 30 - 6 = 24 list rows in Col 1/2, 21 in Col 3
-        assert_eq!(viewport_rows(30, 0), 24);
-        assert_eq!(viewport_rows(30, 1), 24);
-        assert_eq!(viewport_rows(30, 2), 21);
+        assert_eq!(standard.rows(Column::First), 24);
+        assert_eq!(standard.rows(Column::Second), 24);
+        assert_eq!(standard.rows(Column::Third), 21);
 
         // Compact terminal (term_h < 16): e.g. 12 rows -> 6 list rows in Col 1/2, 3 in Col 3
-        assert_eq!(viewport_rows(12, 0), 6);
-        assert_eq!(viewport_rows(12, 1), 6);
-        assert_eq!(viewport_rows(12, 2), 3);
+        let compact = Viewport::new(90, 12);
+        assert_eq!(compact.rows(Column::First), 6);
+        assert_eq!(compact.rows(Column::Second), 6);
+        assert_eq!(compact.rows(Column::Third), 3);
 
-        // Very small terminal clamping: minimum 4 list rows in Col 1/2, minimum 1 row in Col 3
-        assert_eq!(viewport_rows(8, 0), 4);
-        assert_eq!(viewport_rows(8, 1), 4);
-        assert_eq!(viewport_rows(8, 2), 1);
+        // Below 10 rows the viewport must shrink rather than floor at 4 list rows.
+        let tiny = Viewport::new(80, 8);
+        assert_eq!(tiny.rows(Column::First), 2);
+        assert_eq!(tiny.rows(Column::Second), 2);
+        assert_eq!(tiny.rows(Column::Third), 0);
+        assert_eq!(tiny.height - FRAME_CHROME_ROWS, tiny.rows(Column::First));
+    }
+
+    #[test]
+    fn test_tiny_terminal_frame_never_exceeds_height() {
+        let filters = [String::new(), String::new(), String::new()];
+        let sel_idx = [0, 0, 0];
+        let scroll_idx = [0, 0, 0];
+        let st = RenderState {
+            viewport: Viewport::new(80, 8),
+            active_col: Column::First,
+            filters: &filters,
+            sel_idx: &sel_idx,
+            scroll_idx: &scroll_idx,
+            col1_items: &[],
+            col1_filtered: &[],
+            col2_items: &[],
+            col2_filtered: &[],
+            col3_items: &[],
+            col3_filtered: &[],
+            cmd_preview: "",
+            active_param_set: None,
+        };
+
+        assert_eq!(render_frame(&st).lines().count(), 8);
     }
 
     #[test]
@@ -405,8 +455,9 @@ mod tests {
         let col3_filtered = filter_items(&col3_items, "");
 
         let term_h = 12; // < 16 rows
-        let max_r_c1 = viewport_rows(term_h, 0); // 6
-        let max_r_c3 = viewport_rows(term_h, 2); // 3
+        let viewport = Viewport::new(100, term_h);
+        let max_r_c1 = viewport.rows(Column::First); // 6
+        let max_r_c3 = viewport.rows(Column::Third); // 3
 
         let sel_c1 = 7;
         let scroll_c1 = sel_c1 + 1 - max_r_c1; // 2 (visible indices 2..=7)
@@ -418,9 +469,8 @@ mod tests {
         let scroll_idx = [scroll_c1, 0, scroll_c3];
 
         let frame = render_frame(&RenderState {
-            term_w: 100,
-            term_h,
-            active_col: 2,
+            viewport,
+            active_col: Column::Third,
             filters: &filters,
             sel_idx: &sel_idx,
             scroll_idx: &scroll_idx,
@@ -467,9 +517,8 @@ mod tests {
 
         // Active Col 0 -> inspects col1 item
         let st_col0 = RenderState {
-            term_w: 100,
-            term_h: 20,
-            active_col: 0,
+            viewport: Viewport::new(100, 20),
+            active_col: Column::First,
             filters: &filters,
             sel_idx: &sel_idx,
             scroll_idx: &scroll_idx,
@@ -488,7 +537,7 @@ mod tests {
 
         // Active Col 2 with empty Col 3 -> falls back to Col 2 selected item
         let st_col2_fallback = RenderState {
-            active_col: 2,
+            active_col: Column::Third,
             ..st_col0
         };
         let (title2, desc2) = inspector_header(&st_col2_fallback);

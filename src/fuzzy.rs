@@ -131,16 +131,14 @@ fn fuzzy_match_precomputed(
     None
 }
 
-/// Computes fuzzy subsequence match score and matched char indices on `label`,
-/// with fallback to substring match on `desc`.
-#[allow(dead_code)]
-pub fn fuzzy_match(label: &str, desc: &str, query: &str) -> Option<(i32, Vec<usize>)> {
-    if query.is_empty() {
-        return Some((0, Vec::new()));
-    }
-    let q_lower = query.to_ascii_lowercase();
-    let q_chars: Vec<char> = q_lower.chars().collect();
-    fuzzy_match_precomputed(label, desc, &q_chars, &q_lower)
+/// Resolves the selected item in a filtered view against its backing catalog.
+#[inline]
+pub fn selected_item<'a>(
+    filtered: &[FilteredItem],
+    items: &'a [MillerItem],
+    sel_idx: usize,
+) -> Option<&'a MillerItem> {
+    filtered.get(sel_idx).and_then(|f| items.get(f.item_idx))
 }
 
 pub fn filter_items(items: &[MillerItem], query: &str) -> Vec<FilteredItem> {

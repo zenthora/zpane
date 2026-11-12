@@ -151,30 +151,36 @@ impl ShellDialect {
         }
     }
 
+    /// Whether this dialect uses PowerShell syntax and cmdlet/parameter-set sources.
+    pub const fn is_powershell(self) -> bool {
+        matches!(self, ShellDialect::PowerShell)
+    }
+
     /// Formats an environment variable reference in this dialect's syntax.
     pub fn env_token(self, name: &str) -> String {
-        match self {
-            ShellDialect::PowerShell => format!("$env:{name}"),
-            ShellDialect::Posix | ShellDialect::Fish => format!("${name}"),
+        if self.is_powershell() {
+            format!("$env:{name}")
+        } else {
+            format!("${name}")
         }
     }
 
     /// Returns the path-list separator for this dialect.
     pub fn path_sep(self) -> char {
-        match self {
-            ShellDialect::PowerShell => ';',
-            ShellDialect::Posix | ShellDialect::Fish => ':',
+        if self.is_powershell() {
+            ';'
+        } else {
+            ':'
         }
     }
 
     /// Whether an environment variable holds a list of paths that should be split into entries.
     pub fn is_path_list(self, name: &str, value: &str) -> bool {
-        match self {
-            ShellDialect::PowerShell => value.contains(';'),
-            ShellDialect::Posix | ShellDialect::Fish => {
-                let upper = name.to_ascii_uppercase();
-                value.contains(':') && (upper.contains("PATH") || upper.ends_with("DIRS"))
-            }
+        if self.is_powershell() {
+            value.contains(';')
+        } else {
+            let upper = name.to_ascii_uppercase();
+            value.contains(':') && (upper.contains("PATH") || upper.ends_with("DIRS"))
         }
     }
 
@@ -283,11 +289,6 @@ impl ShellDialect {
     }
 }
 
-/// Formats an environment variable reference in the given shell dialect's syntax.
-pub fn env_token(name: &str, dialect: ShellDialect) -> String {
-    dialect.env_token(name)
-}
-
 /// Prevents a console window from flashing up for child processes on Windows; no-op elsewhere.
 fn hide_window(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -338,15 +339,6 @@ fn save_cli_disk_cache_to(path: &Path, cache: &HashMap<String, Vec<MillerItem>>)
     }
 }
 
-pub fn common_var_items(dialect: ShellDialect) -> Vec<MillerItem> {
-    dialect.common_var_items()
-}
-
-/// Whether an environment variable holds a list of paths that should be split into entries.
-pub fn is_path_list(name: &str, value: &str, dialect: ShellDialect) -> bool {
-    dialect.is_path_list(name, value)
-}
-
 pub fn build_env_scope_item_from_vars<I>(dialect: ShellDialect, vars_iter: I) -> MillerItem
 where
     I: IntoIterator<Item = (String, String)>,
@@ -357,10 +349,10 @@ where
 
     let mut children = Vec::with_capacity(vars.len());
     for (k, v) in vars {
-        let token = env_token(&k, dialect);
+        let token = dialect.env_token(&k);
         let mut item = MillerItem::new(&token, &k, ItemKind::Env, &v);
 
-        if is_path_list(&k, &v, dialect) {
+        if dialect.is_path_list(&k, &v) {
             for part in v.split(list_sep).filter(|s| !s.is_empty()) {
                 item.children.push(MillerItem::new(
                     format!("\"{part}\""),
@@ -388,9 +380,10 @@ where
         children.push(item);
     }
 
-    let (text, label) = match dialect {
-        ShellDialect::PowerShell => ("$env:", "$env:Variables"),
-        ShellDialect::Posix | ShellDialect::Fish => ("$", "$ENV Variables"),
+    let (text, label) = if dialect.is_powershell() {
+        ("$env:", "$env:Variables")
+    } else {
+        ("$", "$ENV Variables")
     };
     let mut root = MillerItem::new(
         text,
@@ -422,7 +415,7 @@ pub fn build_ps_var_scope_item(dialect: ShellDialect) -> MillerItem {
         ),
     };
     let mut root = MillerItem::new("$", label, ItemKind::Var, desc);
-    root.children = common_var_items(dialect);
+    root.children = dialect.common_var_items();
     for child in &mut root.children {
         let tok = child.text.clone();
         let val = child.desc.clone();
@@ -1033,7 +1026,7 @@ where
     }
 
     let mut items = parse_cli_help(&text);
-    let vars = common_var_items(dialect);
+    let vars = dialect.common_var_items();
 
     // If this is a subcommand or leaf level, also append helpful shell variables
     if chain.len() >= 2 {
@@ -1056,12 +1049,6 @@ where
     items
 }
 
-#[allow(dead_code)]
-pub fn introspect_cli_chain(chain: &[&str], dialect: ShellDialect) -> Vec<MillerItem> {
-    let runner = default_command_runner();
-    introspect_cli_chain_with(chain, dialect, &*runner)
-}
-
 /// Deep CLI introspection and caching module owning the in-memory CLI cache map,
 /// dirty tracking, disk persistence, canonical command-chain cache keys, background
 /// worker thread/channels, and priority tool cache warming.
@@ -1074,7 +1061,6 @@ pub struct CliIntrospector {
     runner: Arc<CommandRunner>,
     req_tx: Sender<BgRequest>,
     res_rx: Receiver<BgResponse>,
-    wait_on_poll: bool,
 }
 
 impl CliIntrospector {
@@ -1083,11 +1069,11 @@ impl CliIntrospector {
         let path = cli_cache_path();
         let cache = load_cli_disk_cache_from(&path);
         let runner = default_command_runner();
-        Self::build(dialect, cache, Some(path), runner, false)
+        Self::build(dialect, cache, Some(path), runner)
     }
 
     /// Creates a `CliIntrospector` with an injected command-output adapter and optional disk cache path.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_runner<F>(dialect: ShellDialect, cache_path: Option<PathBuf>, runner: F) -> Self
     where
         F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
@@ -1096,17 +1082,17 @@ impl CliIntrospector {
             .as_deref()
             .map(load_cli_disk_cache_from)
             .unwrap_or_default();
-        Self::build(dialect, cache, cache_path, Arc::new(runner), true)
+        Self::build(dialect, cache, cache_path, Arc::new(runner))
     }
 
     /// Creates an in-memory `CliIntrospector` pre-seeded with `cache` that never spawns OS processes.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn with_initial_cache(
         dialect: ShellDialect,
         cache: HashMap<String, Vec<MillerItem>>,
     ) -> Self {
         let runner: Arc<CommandRunner> = Arc::new(|_, _| None);
-        Self::build(dialect, cache, None, runner, false)
+        Self::build(dialect, cache, None, runner)
     }
 
     fn build(
@@ -1114,7 +1100,6 @@ impl CliIntrospector {
         cache: HashMap<String, Vec<MillerItem>>,
         cache_path: Option<PathBuf>,
         runner: Arc<CommandRunner>,
-        wait_on_poll: bool,
     ) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
         let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
@@ -1130,7 +1115,6 @@ impl CliIntrospector {
             runner,
             req_tx,
             res_rx,
-            wait_on_poll,
         }
     }
 
@@ -1161,43 +1145,45 @@ impl CliIntrospector {
         vec![Self::loading_item(chain)]
     }
 
-    /// Read-only inspection of cached items for `chain`, if present.
-    #[allow(dead_code)]
-    pub fn get(&self, chain: &[&str]) -> Option<&[MillerItem]> {
-        let key = Self::chain_key(chain);
-        self.cache.get(&key).map(|v| v.as_slice())
-    }
-
     /// Drains completed background introspection responses into the cache.
     /// Returns `true` if one or more cache entries were added/updated.
     pub fn poll(&mut self) -> bool {
-        let mut updated = false;
-        while let Ok(resp) = self.res_rx.try_recv() {
-            self.pending_keys.remove(&resp.cache_key);
-            self.cache.insert(resp.cache_key, resp.items);
-            self.dirty = true;
-            updated = true;
-        }
+        self.drain_ready()
+    }
 
-        if self.wait_on_poll {
-            while !self.pending_keys.is_empty() {
-                match self.res_rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(resp) => {
-                        self.pending_keys.remove(&resp.cache_key);
-                        self.cache.insert(resp.cache_key, resp.items);
-                        self.dirty = true;
-                        updated = true;
-                    }
-                    Err(_) => break,
+    /// Test-only blocking poll that waits for every queued background job to finish.
+    #[cfg(test)]
+    pub fn poll_blocking(&mut self) -> bool {
+        let mut updated = self.drain_ready();
+        while !self.pending_keys.is_empty() {
+            match self.res_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(resp) => {
+                    self.record(resp);
+                    updated = true;
                 }
+                Err(_) => break,
             }
         }
-
         updated
     }
 
+    fn drain_ready(&mut self) -> bool {
+        let mut updated = false;
+        while let Ok(resp) = self.res_rx.try_recv() {
+            self.record(resp);
+            updated = true;
+        }
+        updated
+    }
+
+    fn record(&mut self, resp: BgResponse) {
+        self.pending_keys.remove(&resp.cache_key);
+        self.cache.insert(resp.cache_key, resp.items);
+        self.dirty = true;
+    }
+
     /// Whether new cache entries have been recorded since startup or the last `flush()`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -1562,14 +1548,14 @@ work on the current change (see also: git help everyday)
     #[test]
     fn test_shell_dialects_side_by_side_in_same_process() {
         // 1. Variable tokens across all three dialects in the same test run
-        assert_eq!(env_token("PATH", ShellDialect::PowerShell), "$env:PATH");
-        assert_eq!(env_token("PATH", ShellDialect::Posix), "$PATH");
-        assert_eq!(env_token("PATH", ShellDialect::Fish), "$PATH");
+        assert_eq!(ShellDialect::PowerShell.env_token("PATH"), "$env:PATH");
+        assert_eq!(ShellDialect::Posix.env_token("PATH"), "$PATH");
+        assert_eq!(ShellDialect::Fish.env_token("PATH"), "$PATH");
 
         // 2. Built-in common variable items across all three dialects in the same test run
-        let ps_vars = common_var_items(ShellDialect::PowerShell);
-        let posix_vars = common_var_items(ShellDialect::Posix);
-        let fish_vars = common_var_items(ShellDialect::Fish);
+        let ps_vars = ShellDialect::PowerShell.common_var_items();
+        let posix_vars = ShellDialect::Posix.common_var_items();
+        let fish_vars = ShellDialect::Fish.common_var_items();
 
         let ps_texts: Vec<&str> = ps_vars.iter().map(|i| i.text.as_str()).collect();
         assert!(ps_texts.contains(&"$PWD"));
@@ -1794,10 +1780,10 @@ Options:
         assert_eq!(miss_dup[0].kind, ItemKind::Loading);
 
         // 2. Poll drains background worker completion and marks cache dirty
-        assert!(introspector.poll());
+        assert!(introspector.poll_blocking());
         assert!(introspector.is_dirty());
         assert!(
-            !introspector.poll(),
+            !introspector.poll_blocking(),
             "Second poll with no pending jobs returns false"
         );
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
@@ -1814,7 +1800,7 @@ Options:
         assert_eq!(sub_miss.len(), 1);
         assert_eq!(sub_miss[0].kind, ItemKind::Loading);
 
-        assert!(introspector.poll());
+        assert!(introspector.poll_blocking());
         let sub_cached = introspector.query(&["CARGO", "BUILD"]);
         let sub_texts: Vec<&str> = sub_cached.iter().map(|i| i.text.as_str()).collect();
         assert!(sub_texts.contains(&"--release"));
@@ -1888,7 +1874,7 @@ start a working area
             ItemKind::Loading
         );
         assert_eq!(introspector.query(&["git"])[0].kind, ItemKind::Loading);
-        assert!(introspector.poll());
+        assert!(introspector.poll_blocking());
 
         let legacy_items = introspector.query(&["legacytool"]);
         let legacy_texts: Vec<&str> = legacy_items.iter().map(|i| i.text.as_str()).collect();

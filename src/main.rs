@@ -269,8 +269,7 @@ fn main() -> anyhow::Result<()> {
         col1_items,
         introspector,
         &initial_buffer,
-        term_w,
-        term_h,
+        ui::Viewport::new(term_w, term_h),
         dialect,
     )
     .with_catalog_loader(|d| {
@@ -336,7 +335,8 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ItemKind, MillerItem};
+    use crate::model::{Column, ItemKind, MillerItem};
+    use crate::ui::Viewport;
 
     #[test]
     fn test_interactive_custom_value_journey() {
@@ -350,8 +350,13 @@ mod tests {
 
         let introspector =
             CliIntrospector::with_initial_cache(ShellDialect::Posix, Default::default());
-        let mut session =
-            MillerSession::new(vec![git], introspector, "", 120, 30, ShellDialect::Posix);
+        let mut session = MillerSession::new(
+            vec![git],
+            introspector,
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
 
         session.apply(UserAction::StepRight);
         session.apply(UserAction::StepRight);
@@ -362,7 +367,9 @@ mod tests {
             session.apply(UserAction::InsertChar(ch));
         }
 
-        let first_col3 = session.selected_item(2).expect("custom value prompt");
+        let first_col3 = session
+            .selected_item(Column::Third)
+            .expect("custom value prompt");
         assert_eq!(first_col3.text, custom_url);
         assert!(first_col3.label.contains(custom_url));
         assert_eq!(first_col3.kind, ItemKind::Value);
@@ -413,10 +420,10 @@ mod tests {
 
         // Simulate typing "git" character by character + 30 rapid Down presses.
         // Scheduler noise under parallel test/hook load can add a fraction of a
-        // millisecond to one step, so measure the fastest of three runs. A real
-        // regression (>6x) fails every run, so the signal is preserved.
-        let mut best_total_ms = f64::INFINITY;
-        let mut best_step_ms = f64::INFINITY;
+        // millisecond to one run, so compare the median of three runs. A real
+        // regression (>6x) is consistent and still fails the median.
+        let mut total_runs = Vec::with_capacity(3);
+        let mut step_runs = Vec::with_capacity(3);
 
         for _ in 0..3 {
             let introspector =
@@ -425,8 +432,7 @@ mod tests {
                 col1_items.clone(),
                 introspector,
                 "",
-                120,
-                30,
+                Viewport::new(120, 30),
                 ShellDialect::PowerShell,
             );
             let _ = session.render(); // initial frame
@@ -456,20 +462,25 @@ mod tests {
                 total_nav_ms += step_ms;
             }
 
-            best_total_ms = best_total_ms.min(total_nav_ms);
-            best_step_ms = best_step_ms.min(max_step_ms);
+            total_runs.push(total_nav_ms);
+            step_runs.push(max_step_ms);
         }
 
+        total_runs.sort_by(f64::total_cmp);
+        step_runs.sort_by(f64::total_cmp);
+        let median_total_ms = total_runs[1];
+        let median_step_ms = step_runs[1];
+
         assert!(
-            best_total_ms < total_budget_ms,
-            "Interactive navigation/filtering is too slow: {:.2}ms for 38 steps (budget < {:.1}ms)",
-            best_total_ms,
+            median_total_ms < total_budget_ms,
+            "Interactive navigation/filtering is too slow: {:.2}ms median for 38 steps (budget < {:.1}ms)",
+            median_total_ms,
             total_budget_ms
         );
         assert!(
-            best_step_ms < step_budget_ms,
-            "Worst-case single interactive step is too slow: {:.2}ms (budget < {:.1}ms)",
-            best_step_ms,
+            median_step_ms < step_budget_ms,
+            "Worst-case single interactive step is too slow: {:.2}ms median (budget < {:.1}ms)",
+            median_step_ms,
             step_budget_ms
         );
     }

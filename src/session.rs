@@ -1,7 +1,7 @@
-use crate::discovery::{common_var_items, CliIntrospector, ShellDialect};
-use crate::fuzzy::{filter_items, FilteredItem};
-use crate::model::{ItemKind, MillerItem};
-use crate::ui::{render_frame, viewport_rows, RenderState};
+use crate::discovery::{CliIntrospector, ShellDialect};
+use crate::fuzzy::{filter_items, selected_item, FilteredItem};
+use crate::model::{Column, ItemKind, MillerItem};
+use crate::ui::{render_frame, RenderState, Viewport};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::HashSet;
 
@@ -100,80 +100,6 @@ fn is_childless_col2_flag_or_switch(item: &MillerItem) -> bool {
     item.kind == ItemKind::Switch || (item.kind == ItemKind::Flag && item.children.is_empty())
 }
 
-/// Checks whether a parameter `MillerItem` matches a raw command token case-insensitively
-/// by exact parameter flag name or structured alias entry.
-fn parameter_matches_token(param: &MillerItem, token: &str) -> bool {
-    if !token.starts_with('-') {
-        return false;
-    }
-    let clean = token
-        .trim_start_matches('-')
-        .split(':')
-        .next()
-        .unwrap_or("");
-    if clean.is_empty() {
-        return false;
-    }
-
-    let p_name = param.text.trim_start_matches('-');
-    if p_name.eq_ignore_ascii_case(clean) {
-        return true;
-    }
-
-    param
-        .aliases
-        .iter()
-        .any(|alias| alias.trim_start_matches('-').eq_ignore_ascii_case(clean))
-}
-
-/// Computes the active PowerShell parameter sets for the selected Column 1 command
-/// based on committed parameter tokens, using exact parameter name and structured alias matching.
-pub fn compute_active_parameter_sets(
-    c1: Option<&MillerItem>,
-    tokens: &[String],
-) -> Option<HashSet<String>> {
-    let c1 = c1?;
-    if !matches!(c1.kind, ItemKind::Cmdlet | ItemKind::Func | ItemKind::Alias) {
-        return None;
-    }
-    let mut active_sets: Option<HashSet<String>> = None;
-
-    for tok in tokens.iter().skip(1) {
-        if !tok.starts_with('-') {
-            continue;
-        }
-
-        for param in &c1.children {
-            if parameter_matches_token(param, tok) {
-                let non_all: HashSet<String> = param
-                    .parameter_sets
-                    .iter()
-                    .filter(|s| s.as_str() != "__AllParameterSets")
-                    .cloned()
-                    .collect();
-
-                if !non_all.is_empty() {
-                    active_sets = match active_sets {
-                        None => Some(non_all),
-                        Some(cur) => {
-                            let inter: HashSet<String> =
-                                cur.intersection(&non_all).cloned().collect();
-                            if inter.is_empty() {
-                                Some(cur)
-                            } else {
-                                Some(inter)
-                            }
-                        }
-                    };
-                }
-                break;
-            }
-        }
-    }
-
-    active_sets
-}
-
 fn resolve_col2_items(
     col1: Option<&MillerItem>,
     active_param_sets: Option<&HashSet<String>>,
@@ -213,7 +139,7 @@ fn resolve_col3_items(
     col1: Option<&MillerItem>,
     col2: Option<&MillerItem>,
     introspector: &mut CliIntrospector,
-    custom_input: &str,
+    col3_filter: &str,
     dialect: ShellDialect,
 ) -> Vec<MillerItem> {
     let (Some(c1), Some(c2)) = (col1, col2) else {
@@ -225,7 +151,7 @@ fn resolve_col3_items(
     }
 
     let mut items = Vec::new();
-    let trimmed_input = custom_input.trim();
+    let trimmed_input = col3_filter.trim();
 
     if !trimmed_input.is_empty() {
         items.push(MillerItem::new(
@@ -249,7 +175,7 @@ fn resolve_col3_items(
     if !c2.children.is_empty() {
         items.extend_from_slice(&c2.children);
         if matches!(c2.kind, ItemKind::Param | ItemKind::Switch) {
-            items.extend(common_var_items(dialect));
+            items.extend(dialect.common_var_items());
         }
         return items;
     }
@@ -259,7 +185,7 @@ fn resolve_col3_items(
         return items;
     }
 
-    items.extend(common_var_items(dialect));
+    items.extend(dialect.common_var_items());
     items
 }
 
@@ -299,7 +225,7 @@ pub struct MillerSession {
     col3_cache_state: Option<Col3CacheState>,
     introspector: CliIntrospector,
     catalog_loader: Option<CatalogLoader>,
-    active_col: usize,
+    active_col: Column,
     filters: [String; 3],
     sel_idx: [usize; 3],
     scroll_idx: [usize; 3],
@@ -307,8 +233,7 @@ pub struct MillerSession {
     pending_second_token: Option<String>,
     active_param_set_label: Option<String>,
     suppress_col2_preview: bool,
-    term_w: usize,
-    term_h: usize,
+    viewport: Viewport,
     dialect: ShellDialect,
     dirty: bool,
 }
@@ -318,11 +243,10 @@ impl MillerSession {
         col1_items: Vec<MillerItem>,
         introspector: CliIntrospector,
         initial_buffer: &str,
-        term_w: usize,
-        term_h: usize,
+        viewport: Viewport,
         dialect: ShellDialect,
     ) -> Self {
-        let mut active_col = 0;
+        let mut active_col = Column::First;
         let mut sel_idx = [0, 0, 0];
         let tokens: Vec<String> = initial_buffer
             .split_whitespace()
@@ -336,7 +260,7 @@ impl MillerSession {
                 .position(|it| it.text.eq_ignore_ascii_case(first_tok))
             {
                 sel_idx[0] = pos;
-                active_col = 1;
+                active_col = Column::Second;
             }
         }
 
@@ -368,8 +292,7 @@ impl MillerSession {
             pending_second_token,
             active_param_set_label: None,
             suppress_col2_preview: false,
-            term_w,
-            term_h,
+            viewport,
             dialect,
             dirty: true,
         };
@@ -389,25 +312,39 @@ impl MillerSession {
     /// Polls background CLI introspection jobs and refreshes dependent columns if new entries arrived.
     pub fn poll_introspector(&mut self) -> bool {
         if self.introspector.poll() {
-            if self.col2_items.is_empty()
-                || self.col2_items.first().map(|i| i.kind) == Some(ItemKind::Loading)
-            {
-                self.col2_cache_state = None;
-            }
-            // Only refresh Column 3 when it is still waiting on background data.
-            // An unrelated cache completion must not reset the user's Column 3
-            // cursor or shift the live preview.
-            if self.col3_items.is_empty()
-                || self.col3_items.iter().any(|i| i.kind == ItemKind::Loading)
-            {
-                self.col3_cache_state = None;
-            }
-            self.sync_columns();
-            self.dirty = true;
+            self.refresh_after_introspector_update();
             true
         } else {
             false
         }
+    }
+
+    /// Test-only blocking variant of [`Self::poll_introspector`].
+    #[cfg(test)]
+    pub fn poll_introspector_blocking(&mut self) -> bool {
+        if self.introspector.poll_blocking() {
+            self.refresh_after_introspector_update();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn refresh_after_introspector_update(&mut self) {
+        if self.col2_items.is_empty()
+            || self.col2_items.first().map(|i| i.kind) == Some(ItemKind::Loading)
+        {
+            self.col2_cache_state = None;
+        }
+        // Only refresh Column 3 when it is still waiting on background data.
+        // An unrelated cache completion must not reset the user's Column 3
+        // cursor or shift the live preview.
+        if self.col3_items.is_empty() || self.col3_items.iter().any(|i| i.kind == ItemKind::Loading)
+        {
+            self.col3_cache_state = None;
+        }
+        self.sync_columns();
+        self.dirty = true;
     }
 
     /// Flushes the underlying [`CliIntrospector`] cache to disk if dirty.
@@ -422,12 +359,12 @@ impl MillerSession {
                 let new_w = if w >= 40 {
                     (w as usize).saturating_sub(1)
                 } else {
-                    self.term_w
+                    self.viewport.width
                 };
                 let new_h = if h >= 12 {
                     (h as usize).saturating_sub(1)
                 } else {
-                    self.term_h
+                    self.viewport.height
                 };
                 self.apply(UserAction::Resize(new_w, new_h))
             }
@@ -453,8 +390,8 @@ impl MillerSession {
                 return SessionOutcome::Confirmed(cmd);
             }
             UserAction::Resize(w, h) => {
-                self.term_w = w;
-                self.term_h = h;
+                self.viewport.width = w;
+                self.viewport.height = h;
                 self.clamp_scroll();
                 self.dirty = true;
                 return SessionOutcome::Continue;
@@ -472,86 +409,92 @@ impl MillerSession {
             }
             UserAction::MoveUp => {
                 let cur_len = self.active_filtered_len();
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
                 if cur_len > 0 {
-                    self.sel_idx[self.active_col] = if self.sel_idx[self.active_col] > 0 {
-                        self.sel_idx[self.active_col] - 1
-                    } else {
-                        cur_len - 1
-                    };
+                    self.sel_idx[self.active_col.index()] =
+                        if self.sel_idx[self.active_col.index()] > 0 {
+                            self.sel_idx[self.active_col.index()] - 1
+                        } else {
+                            cur_len - 1
+                        };
                     self.dirty = true;
                 }
             }
             UserAction::MoveDown => {
                 let cur_len = self.active_filtered_len();
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
                 if cur_len > 0 {
-                    self.sel_idx[self.active_col] = if self.sel_idx[self.active_col] + 1 < cur_len {
-                        self.sel_idx[self.active_col] + 1
-                    } else {
-                        0
-                    };
+                    self.sel_idx[self.active_col.index()] =
+                        if self.sel_idx[self.active_col.index()] + 1 < cur_len {
+                            self.sel_idx[self.active_col.index()] + 1
+                        } else {
+                            0
+                        };
                     self.dirty = true;
                 }
             }
             UserAction::PageUp => {
                 let cur_len = self.active_filtered_len();
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
                 if cur_len > 0 {
-                    let page_rows = viewport_rows(self.term_h, self.active_col);
-                    self.sel_idx[self.active_col] =
-                        self.sel_idx[self.active_col].saturating_sub(page_rows);
-                    self.dirty = true;
+                    let page_rows = self.viewport.rows(self.active_col);
+                    if page_rows > 0 {
+                        self.sel_idx[self.active_col.index()] =
+                            self.sel_idx[self.active_col.index()].saturating_sub(page_rows);
+                        self.dirty = true;
+                    }
                 }
             }
             UserAction::PageDown => {
                 let cur_len = self.active_filtered_len();
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
                 if cur_len > 0 {
-                    let page_rows = viewport_rows(self.term_h, self.active_col);
-                    self.sel_idx[self.active_col] =
-                        (self.sel_idx[self.active_col] + page_rows).min(cur_len - 1);
-                    self.dirty = true;
+                    let page_rows = self.viewport.rows(self.active_col);
+                    if page_rows > 0 {
+                        self.sel_idx[self.active_col.index()] =
+                            (self.sel_idx[self.active_col.index()] + page_rows).min(cur_len - 1);
+                        self.dirty = true;
+                    }
                 }
             }
             UserAction::MoveHome => {
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
-                self.sel_idx[self.active_col] = 0;
+                self.sel_idx[self.active_col.index()] = 0;
                 self.dirty = true;
             }
             UserAction::MoveEnd => {
                 let cur_len = self.active_filtered_len();
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
                 if cur_len > 0 {
-                    self.sel_idx[self.active_col] = cur_len - 1;
+                    self.sel_idx[self.active_col.index()] = cur_len - 1;
                     self.dirty = true;
                 }
             }
             UserAction::StepRight => {
-                if self.active_col == 0 {
-                    if let Some(c1) = self.selected_item(0).cloned() {
+                if self.active_col == Column::First {
+                    if let Some(c1) = self.selected_item(Column::First).cloned() {
                         if c1.kind != ItemKind::Loading {
                             self.commit_col1_item(&c1);
-                            self.active_col = 1;
-                            self.suppress_col2_preview = false;
+                            self.active_col = Column::Second;
+                            self.resume_col2_preview();
                             self.dirty = true;
                         }
                     }
-                } else if self.active_col == 1 {
-                    let c1_opt = self.selected_item(0).cloned();
-                    let c2_opt = self.selected_item(1).cloned();
+                } else if self.active_col == Column::Second {
+                    let c1_opt = self.selected_item(Column::First).cloned();
+                    let c2_opt = self.selected_item(Column::Second).cloned();
                     if let Some(c2) = c2_opt {
                         if c2.kind != ItemKind::Loading {
                             if let Some(ref c1) = c1_opt {
@@ -565,56 +508,44 @@ impl MillerSession {
                             {
                                 self.tokens.push(c2.text);
                             }
-                            self.active_col = 2;
-                            self.suppress_col2_preview = false;
+                            self.active_col = Column::Third;
+                            self.resume_col2_preview();
                             self.dirty = true;
                         }
                     }
                 }
             }
             UserAction::StepLeft => {
-                if self.active_col == 2 {
-                    if let Some(c2) = self.selected_item(1).cloned() {
-                        if self.tokens.last().map(|s| s.as_str()) == Some(c2.text.as_str()) {
-                            self.tokens.pop();
-                        }
-                    }
-                    self.active_col = 1;
-                    self.suppress_col2_preview = false;
+                if self.active_col == Column::Third {
+                    self.active_col = Column::Second;
+                    self.resume_col2_preview();
                     self.dirty = true;
-                } else if self.active_col == 1 {
-                    if self.tokens.len() == 1 {
-                        if let Some(c1) = self.selected_item(0) {
-                            if self.tokens[0].eq_ignore_ascii_case(&c1.text) {
-                                self.tokens.clear();
-                            }
-                        }
-                    }
-                    self.active_col = 0;
-                    self.suppress_col2_preview = false;
+                } else if self.active_col == Column::Second {
+                    self.active_col = Column::First;
+                    self.resume_col2_preview();
                     self.dirty = true;
                 }
             }
             UserAction::AcceptToken => {
-                if self.active_col == 0 {
-                    if let Some(c1) = self.selected_item(0).cloned() {
+                if self.active_col == Column::First {
+                    if let Some(c1) = self.selected_item(Column::First).cloned() {
                         if c1.kind != ItemKind::Loading {
                             self.commit_col1_item(&c1);
                             if !self.filters[0].is_empty() {
                                 self.filters[0].clear();
                                 self.col1_filter_dirty = true;
                             }
-                            self.active_col = 1;
-                            self.suppress_col2_preview = false;
+                            self.active_col = Column::Second;
+                            self.resume_col2_preview();
                             self.dirty = true;
                         }
                     }
-                } else if self.active_col == 1 {
+                } else if self.active_col == Column::Second {
                     // A suppressed Column 2 preview means the reset index-0 item was
                     // never shown; Tab is a no-op until navigation or typing clears it.
                     if !self.suppress_col2_preview {
-                        let c1_opt = self.selected_item(0).cloned();
-                        let c2_opt = self.selected_item(1).cloned();
+                        let c1_opt = self.selected_item(Column::First).cloned();
+                        let c2_opt = self.selected_item(Column::Second).cloned();
                         if let Some(c2) = c2_opt {
                             if is_selectable_col2_item(&c2) {
                                 if let Some(ref c1) = c1_opt {
@@ -643,19 +574,19 @@ impl MillerSession {
                                     {
                                         self.tokens.push(c2.text);
                                     }
-                                    self.active_col = 2;
+                                    self.active_col = Column::Third;
                                     self.sel_idx[2] = 0;
                                     self.scroll_idx[2] = 0;
-                                    self.suppress_col2_preview = false;
+                                    self.resume_col2_preview();
                                     self.dirty = true;
                                 }
                             }
                         }
                     }
-                } else if self.active_col == 2 {
-                    let c1_opt = self.selected_item(0).cloned();
-                    let c2_opt = self.selected_item(1).cloned();
-                    let c3_opt = self.selected_item(2).cloned();
+                } else if self.active_col == Column::Third {
+                    let c1_opt = self.selected_item(Column::First).cloned();
+                    let c2_opt = self.selected_item(Column::Second).cloned();
+                    let c3_opt = self.selected_item(Column::Third).cloned();
                     let val_to_add = resolve_col3_token(c3_opt.as_ref(), &self.filters[2]);
                     let is_switch_placeholder = c3_opt
                         .as_ref()
@@ -689,7 +620,7 @@ impl MillerSession {
                             self.filters[1].clear();
                             self.col2_filter_dirty = true;
                         }
-                        self.active_col = 1;
+                        self.active_col = Column::Second;
                         self.sel_idx[1] = 0;
                         self.scroll_idx[1] = 0;
                         self.suppress_col2_preview = true;
@@ -698,50 +629,53 @@ impl MillerSession {
                 }
             }
             UserAction::Backspace => {
-                if !self.filters[self.active_col].is_empty() {
-                    self.filters[self.active_col].pop();
+                if !self.filters[self.active_col.index()].is_empty() {
+                    self.filters[self.active_col.index()].pop();
                     self.mark_active_filter_dirty();
-                    self.sel_idx[self.active_col] = 0;
-                    if self.active_col == 1 {
-                        self.suppress_col2_preview = false;
+                    self.sel_idx[self.active_col.index()] = 0;
+                    if self.active_col == Column::Second {
+                        self.resume_col2_preview();
                     }
                     self.dirty = true;
                 } else if !self.tokens.is_empty() {
                     self.tokens.pop();
-                    if self.active_col == 2 && self.tokens.len() <= 1 {
-                        self.active_col = 1;
-                        self.suppress_col2_preview = false;
-                    } else if self.active_col == 1 {
+                    if self.active_col == Column::Third && self.tokens.len() <= 1 {
+                        self.active_col = Column::Second;
+                        self.resume_col2_preview();
+                    } else if self.active_col == Column::Second {
                         if self.tokens.is_empty() {
-                            self.active_col = 0;
-                            self.suppress_col2_preview = false;
+                            self.active_col = Column::First;
+                            self.resume_col2_preview();
                         } else {
                             self.suppress_col2_preview = true;
                         }
                     }
                     self.dirty = true;
-                } else if self.active_col > 0 {
-                    self.active_col -= 1;
-                    self.suppress_col2_preview = false;
+                } else if self.active_col != Column::First {
+                    self.active_col = match self.active_col {
+                        Column::Third => Column::Second,
+                        Column::Second | Column::First => Column::First,
+                    };
+                    self.resume_col2_preview();
                     self.dirty = true;
                 }
             }
             UserAction::InsertChar(ch) => {
-                self.filters[self.active_col].push(ch);
+                self.filters[self.active_col.index()].push(ch);
                 self.mark_active_filter_dirty();
-                self.sel_idx[self.active_col] = 0;
-                if self.active_col == 1 {
-                    self.suppress_col2_preview = false;
+                self.sel_idx[self.active_col.index()] = 0;
+                if self.active_col == Column::Second {
+                    self.resume_col2_preview();
                 }
                 self.dirty = true;
             }
             UserAction::ClearFilter => {
-                if !self.filters[self.active_col].is_empty() {
-                    self.filters[self.active_col].clear();
+                if !self.filters[self.active_col.index()].is_empty() {
+                    self.filters[self.active_col.index()].clear();
                     self.mark_active_filter_dirty();
-                    self.sel_idx[self.active_col] = 0;
-                    if self.active_col == 1 {
-                        self.suppress_col2_preview = false;
+                    self.sel_idx[self.active_col.index()] = 0;
+                    if self.active_col == Column::Second {
+                        self.resume_col2_preview();
                     }
                     self.dirty = true;
                 }
@@ -756,9 +690,9 @@ impl MillerSession {
 
     /// Builds the live command preview string from the current session state.
     pub fn preview_command(&self) -> String {
-        let cur_c1 = self.selected_item(0);
-        let cur_c2 = self.selected_item(1);
-        let cur_c3 = self.selected_item(2);
+        let cur_c1 = self.selected_item(Column::First);
+        let cur_c2 = self.selected_item(Column::Second);
+        let cur_c3 = self.selected_item(Column::Third);
 
         let mut out: Vec<String> = self.tokens.clone();
 
@@ -768,7 +702,7 @@ impl MillerSession {
                     out.push(c1.text.clone());
                 }
             }
-        } else if self.active_col == 0 && out.len() == 1 {
+        } else if self.active_col == Column::First && out.len() == 1 {
             if let Some(c1) = cur_c1 {
                 if !is_scope_root(c1) {
                     out[0] = c1.text.clone();
@@ -776,7 +710,7 @@ impl MillerSession {
             }
         }
 
-        if self.active_col == 1 {
+        if self.active_col == Column::Second {
             if !self.suppress_col2_preview {
                 if let Some(c2) = cur_c2 {
                     if is_selectable_col2_item(c2)
@@ -786,7 +720,7 @@ impl MillerSession {
                     }
                 }
             }
-        } else if self.active_col == 2 {
+        } else if self.active_col == Column::Third {
             if let (Some(c1), Some(c2)) = (cur_c1, cur_c2) {
                 if !is_scope_root(c1)
                     && is_selectable_col2_item(c2)
@@ -813,8 +747,7 @@ impl MillerSession {
         let cmd_preview = self.preview_command();
 
         let frame = render_frame(&RenderState {
-            term_w: self.term_w,
-            term_h: self.term_h,
+            viewport: self.viewport,
             active_col: self.active_col,
             filters: &self.filters,
             sel_idx: &self.sel_idx,
@@ -837,132 +770,73 @@ impl MillerSession {
         self.dirty
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn active_col(&self) -> usize {
-        self.active_col
+        self.active_col.index()
     }
 
-    #[allow(dead_code)]
-    pub fn filters(&self) -> &[String; 3] {
-        &self.filters
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn sel_idx(&self) -> &[usize; 3] {
         &self.sel_idx
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn scroll_idx(&self) -> &[usize; 3] {
         &self.scroll_idx
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn tokens(&self) -> &[String] {
         &self.tokens
     }
 
-    #[allow(dead_code)]
-    pub fn col1_items(&self) -> &[MillerItem] {
-        &self.col1_items
-    }
-
-    #[allow(dead_code)]
-    pub fn col2_items(&self) -> &[MillerItem] {
-        &self.col2_items
-    }
-
-    #[allow(dead_code)]
-    pub fn col3_items(&self) -> &[MillerItem] {
-        &self.col3_items
-    }
-
-    #[allow(dead_code)]
-    pub fn col1_filtered(&self) -> &[FilteredItem] {
-        &self.col1_filtered
-    }
-
-    #[allow(dead_code)]
-    pub fn col2_filtered(&self) -> &[FilteredItem] {
-        &self.col2_filtered
-    }
-
-    #[allow(dead_code)]
-    pub fn col3_filtered(&self) -> &[FilteredItem] {
-        &self.col3_filtered
-    }
-
-    /// Returns the currently visible (fuzzy-filtered) items in `col` (`0..=2`).
-    #[allow(dead_code)]
-    pub fn visible_col_items(&self, col: usize) -> Vec<&MillerItem> {
-        match col {
-            0 => self
-                .col1_filtered
-                .iter()
-                .filter_map(|f| self.col1_items.get(f.item_idx))
-                .collect(),
-            1 => self
-                .col2_filtered
-                .iter()
-                .filter_map(|f| self.col2_items.get(f.item_idx))
-                .collect(),
-            2 => self
-                .col3_filtered
-                .iter()
-                .filter_map(|f| self.col3_items.get(f.item_idx))
-                .collect(),
-            _ => Vec::new(),
-        }
-    }
-
-    /// Returns the currently highlighted item in `col` (`0..=2`).
-    pub fn selected_item(&self, col: usize) -> Option<&MillerItem> {
-        match col {
-            0 => self
-                .col1_filtered
-                .get(self.sel_idx[0])
-                .and_then(|f| self.col1_items.get(f.item_idx)),
-            1 => self
-                .col2_filtered
-                .get(self.sel_idx[1])
-                .and_then(|f| self.col2_items.get(f.item_idx)),
-            2 => self
-                .col3_filtered
-                .get(self.sel_idx[2])
-                .and_then(|f| self.col3_items.get(f.item_idx)),
-            _ => None,
-        }
-    }
-
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn active_param_set(&self) -> Option<&str> {
         self.active_param_set_label.as_deref()
     }
 
-    #[allow(dead_code)]
-    pub fn dialect(&self) -> ShellDialect {
-        self.dialect
+    /// Returns the currently visible (fuzzy-filtered) items in `col`.
+    #[cfg(test)]
+    pub fn visible_col_items(&self, col: Column) -> Vec<&MillerItem> {
+        let (filtered, items) = match col {
+            Column::First => (&self.col1_filtered, &self.col1_items),
+            Column::Second => (&self.col2_filtered, &self.col2_items),
+            Column::Third => (&self.col3_filtered, &self.col3_items),
+        };
+        filtered
+            .iter()
+            .filter_map(|f| items.get(f.item_idx))
+            .collect()
     }
 
-    #[allow(dead_code)]
-    pub fn term_size(&self) -> (usize, usize) {
-        (self.term_w, self.term_h)
+    /// Returns the currently highlighted item in `col`.
+    pub fn selected_item(&self, col: Column) -> Option<&MillerItem> {
+        match col {
+            Column::First => selected_item(&self.col1_filtered, &self.col1_items, self.sel_idx[0]),
+            Column::Second => selected_item(&self.col2_filtered, &self.col2_items, self.sel_idx[1]),
+            Column::Third => selected_item(&self.col3_filtered, &self.col3_items, self.sel_idx[2]),
+        }
     }
 
     fn active_filtered_len(&self) -> usize {
         match self.active_col {
-            0 => self.col1_filtered.len(),
-            1 => self.col2_filtered.len(),
-            _ => self.col3_filtered.len(),
+            Column::First => self.col1_filtered.len(),
+            Column::Second => self.col2_filtered.len(),
+            Column::Third => self.col3_filtered.len(),
         }
     }
 
     fn mark_active_filter_dirty(&mut self) {
         match self.active_col {
-            0 => self.col1_filter_dirty = true,
-            1 => self.col2_filter_dirty = true,
-            _ => self.col3_filter_dirty = true,
+            Column::First => self.col1_filter_dirty = true,
+            Column::Second => self.col2_filter_dirty = true,
+            Column::Third => self.col3_filter_dirty = true,
         }
+    }
+
+    /// Re-arms Column 2 live preview after navigation or typing.
+    fn resume_col2_preview(&mut self) {
+        self.suppress_col2_preview = false;
     }
 
     fn commit_col1_item(&mut self, c1: &MillerItem) {
@@ -986,7 +860,7 @@ impl MillerSession {
         let cur_c1_idx = self.col1_filtered.get(self.sel_idx[0]).map(|f| f.item_idx);
         let cur_c1 = cur_c1_idx.map(|idx| &self.col1_items[idx]);
 
-        let active_param_sets = compute_active_parameter_sets(cur_c1, &self.tokens);
+        let active_param_sets = cur_c1.and_then(|c1| c1.active_parameter_sets(&self.tokens));
         let sorted_param_sets: Option<Vec<String>> = active_param_sets.as_ref().map(|s| {
             let mut v: Vec<String> = s.iter().cloned().collect();
             v.sort();
@@ -1004,7 +878,7 @@ impl MillerSession {
                 .as_ref()
                 .is_some_and(|prev| prev.c1_item_idx == cur_c1_idx);
             let prev_c2_text = if same_c1 {
-                self.selected_item(1).map(|it| it.text.clone())
+                self.selected_item(Column::Second).map(|it| it.text.clone())
             } else {
                 None
             };
@@ -1043,10 +917,10 @@ impl MillerSession {
         if let Some(ref tok2) = self.pending_second_token {
             if !self.col2_items.is_empty() && self.col2_items[0].kind != ItemKind::Loading {
                 if let Some(pos) = self.col2_items.iter().position(|it| {
-                    it.text.eq_ignore_ascii_case(tok2) || parameter_matches_token(it, tok2)
+                    it.text.eq_ignore_ascii_case(tok2) || it.matches_parameter_token(tok2)
                 }) {
                     self.sel_idx[1] = pos;
-                    self.active_col = 2;
+                    self.active_col = Column::Third;
                 }
                 self.pending_second_token = None;
             }
@@ -1096,8 +970,13 @@ impl MillerSession {
     }
 
     fn clamp_scroll(&mut self) {
-        for c in 0..3 {
-            let max_r = viewport_rows(self.term_h, c);
+        for col in Column::ALL {
+            let c = col.index();
+            let max_r = self.viewport.rows(col);
+            if max_r == 0 {
+                self.scroll_idx[c] = 0;
+                continue;
+            }
             if self.sel_idx[c] < self.scroll_idx[c] {
                 self.scroll_idx[c] = self.sel_idx[c];
             }
@@ -1189,8 +1068,7 @@ mod tests {
             vec![get_process],
             introspector,
             "",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::PowerShell,
         );
 
@@ -1198,12 +1076,12 @@ mod tests {
         session.apply(UserAction::StepRight);
         assert_eq!(session.active_col(), 1);
         assert_eq!(session.active_param_set(), None);
-        assert_eq!(session.visible_col_items(1).len(), 5);
+        assert_eq!(session.visible_col_items(Column::Second).len(), 5);
 
         // Move down to `-Id` (index 2: after -InformationAction and -Identity)
         session.apply(UserAction::MoveDown);
         session.apply(UserAction::MoveDown);
-        assert_eq!(session.selected_item(1).unwrap().text, "-Id");
+        assert_eq!(session.selected_item(Column::Second).unwrap().text, "-Id");
 
         // Step right into Col 3 to supply an ID: commits `-Id` and activates {"Id", "IdWithUserName"}
         // Must NOT match `-InformationAction (-ia)` or `-Identity`!
@@ -1212,12 +1090,12 @@ mod tests {
         assert_eq!(session.active_param_set(), Some("Id, IdWithUserName"));
 
         let visible_col2: Vec<&str> = session
-            .visible_col_items(1)
+            .visible_col_items(Column::Second)
             .iter()
             .map(|it| it.text.as_str())
             .collect();
         assert_eq!(visible_col2, vec!["-Id", "-Verbose"]);
-        assert_eq!(session.selected_item(1).unwrap().text, "-Id");
+        assert_eq!(session.selected_item(Column::Second).unwrap().text, "-Id");
 
         // Type custom process ID "4242" in Col 3 and accept via Tab
         for ch in "4242".chars() {
@@ -1238,7 +1116,7 @@ mod tests {
         session.apply(UserAction::Backspace);
         assert_eq!(session.tokens(), &["Get-Process"]);
         assert_eq!(session.active_param_set(), None);
-        assert_eq!(session.visible_col_items(1).len(), 5);
+        assert_eq!(session.visible_col_items(Column::Second).len(), 5);
 
         // Also verify structured alias matching via initial buffer (e.g., `-pid` and `-ia`)
         let introspector2 =
@@ -1247,13 +1125,15 @@ mod tests {
             vec![sample_ps_cmdlet()],
             introspector2,
             "Get-Process -pid",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::PowerShell,
         );
         assert_eq!(session_alias.active_col(), 2);
         assert_eq!(session_alias.active_param_set(), Some("Id, IdWithUserName"));
-        assert_eq!(session_alias.selected_item(1).unwrap().text, "-Id");
+        assert_eq!(
+            session_alias.selected_item(Column::Second).unwrap().text,
+            "-Id"
+        );
 
         let introspector3 =
             CliIntrospector::with_initial_cache(ShellDialect::PowerShell, HashMap::new());
@@ -1261,8 +1141,7 @@ mod tests {
             vec![sample_ps_cmdlet()],
             introspector3,
             "Get-Process -ia",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::PowerShell,
         );
         assert_eq!(session_ia.active_param_set(), Some("InfoSet"));
@@ -1277,15 +1156,17 @@ mod tests {
             vec![get_process],
             introspector,
             "",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::PowerShell,
         );
 
         // Step into Col 2 and move to `-Verbose` (index 4, a Switch parameter)
         session.apply(UserAction::StepRight);
         session.apply(UserAction::MoveEnd);
-        assert_eq!(session.selected_item(1).unwrap().text, "-Verbose");
+        assert_eq!(
+            session.selected_item(Column::Second).unwrap().text,
+            "-Verbose"
+        );
         assert_eq!(session.preview_command(), "Get-Process -Verbose");
 
         // Press Tab (`AcceptToken`) on `-Verbose`:
@@ -1304,7 +1185,10 @@ mod tests {
 
         // Moving down in Col 2 re-enables live preview for the newly highlighted item
         session.apply(UserAction::MoveDown);
-        assert_eq!(session.selected_item(1).unwrap().text, "-Identity");
+        assert_eq!(
+            session.selected_item(Column::Second).unwrap().text,
+            "-Identity"
+        );
         assert_eq!(session.preview_command(), "Get-Process -Verbose -Identity");
     }
 
@@ -1317,8 +1201,7 @@ mod tests {
             vec![get_process],
             introspector,
             "",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::PowerShell,
         );
 
@@ -1340,7 +1223,10 @@ mod tests {
 
         // Navigation re-arms normal acceptance of the highlighted item.
         session.apply(UserAction::MoveDown);
-        assert_eq!(session.selected_item(1).unwrap().text, "-Identity");
+        assert_eq!(
+            session.selected_item(Column::Second).unwrap().text,
+            "-Identity"
+        );
         session.apply(UserAction::AcceptToken);
         assert_eq!(session.active_col(), 2);
         assert_eq!(session.tokens(), &["Get-Process", "-Verbose", "-Identity"]);
@@ -1367,27 +1253,29 @@ mod tests {
             vec![git_item],
             introspector,
             "git commit",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::Posix,
         );
 
         // Drain `git --help` and `git commit --help` so Column 3 is fully loaded.
-        assert!(session.poll_introspector());
-        assert!(session.poll_introspector());
+        assert!(session.poll_introspector_blocking());
+        assert!(session.poll_introspector_blocking());
         assert!(session.active_col() == 2);
         session.apply(UserAction::MoveDown);
         session.apply(UserAction::MoveDown);
-        let selected_col3 = session.selected_item(2).unwrap().text.clone();
+        let selected_col3 = session.selected_item(Column::Third).unwrap().text.clone();
         assert_eq!(session.sel_idx()[2], 2);
 
         // Queue an unrelated background job, then let it complete.
         let _ = session.introspector.query(&["other"]);
-        assert!(session.poll_introspector());
+        assert!(session.poll_introspector_blocking());
 
         // The unrelated completion must not reset Column 3 or shift the preview.
         assert_eq!(session.sel_idx()[2], 2);
-        assert_eq!(session.selected_item(2).unwrap().text, selected_col3);
+        assert_eq!(
+            session.selected_item(Column::Third).unwrap().text,
+            selected_col3
+        );
         assert!(session.preview_command().ends_with(&selected_col3));
     }
 
@@ -1400,8 +1288,7 @@ mod tests {
             vec![get_process],
             introspector,
             "",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::PowerShell,
         );
 
@@ -1412,7 +1299,7 @@ mod tests {
         assert_eq!(session.active_col(), 2);
 
         // Index 0 in Col 3 is `(Switch Flag - No Value Needed)` with empty `.text`
-        let c3 = session.selected_item(2).unwrap();
+        let c3 = session.selected_item(Column::Third).unwrap();
         assert_eq!(c3.kind, ItemKind::Switch);
         assert_eq!(c3.text, "");
         assert_eq!(session.preview_command(), "Get-Process -Verbose");
@@ -1446,26 +1333,34 @@ mod tests {
             vec![git_item],
             introspector,
             "git commit",
-            120,
-            30,
+            Viewport::new(120, 30),
             ShellDialect::Posix,
         );
 
         // Initially Col 2 has the Loading placeholder because `git` hasn't finished introspecting yet
         assert_eq!(session.active_col(), 1);
-        assert_eq!(session.selected_item(1).unwrap().kind, ItemKind::Loading);
+        assert_eq!(
+            session.selected_item(Column::Second).unwrap().kind,
+            ItemKind::Loading
+        );
 
         // Polling drains `git --help`, which resolves `pending_second_token` ("commit"),
         // selects `commit` in Col 2, advances `active_col` to 2, and enqueues `git commit --help`!
-        assert!(session.poll_introspector());
+        assert!(session.poll_introspector_blocking());
         assert_eq!(session.active_col(), 2);
-        assert_eq!(session.selected_item(1).unwrap().text, "commit");
+        assert_eq!(
+            session.selected_item(Column::Second).unwrap().text,
+            "commit"
+        );
 
         // Polling again drains `git commit --help` into Col 3 while keeping `commit` selected in Col 2
-        assert!(session.poll_introspector());
-        assert_eq!(session.selected_item(1).unwrap().text, "commit");
+        assert!(session.poll_introspector_blocking());
+        assert_eq!(
+            session.selected_item(Column::Second).unwrap().text,
+            "commit"
+        );
         let col3_texts: Vec<&str> = session
-            .visible_col_items(2)
+            .visible_col_items(Column::Third)
             .iter()
             .map(|it| it.text.as_str())
             .collect();
@@ -1494,8 +1389,13 @@ mod tests {
             let var_root = build_ps_var_scope_item(dialect);
             let introspector = CliIntrospector::with_initial_cache(dialect, HashMap::new());
 
-            let mut session =
-                MillerSession::new(vec![env_root, var_root], introspector, "", 120, 30, dialect);
+            let mut session = MillerSession::new(
+                vec![env_root, var_root],
+                introspector,
+                "",
+                Viewport::new(120, 30),
+                dialect,
+            );
 
             // Root scope item in Col 1 does not emit "$env:" or "$" into preview
             assert_eq!(session.preview_command(), "");
@@ -1504,7 +1404,10 @@ mod tests {
             session.apply(UserAction::StepRight);
             assert!(session.tokens().is_empty());
             session.apply(UserAction::MoveDown); // USER
-            assert_eq!(session.selected_item(1).unwrap().text, expected_user_tok);
+            assert_eq!(
+                session.selected_item(Column::Second).unwrap().text,
+                expected_user_tok
+            );
             assert_eq!(session.preview_command(), expected_user_tok);
 
             // Step into Col 3 on USER: index 0 is variable reference, index 1 is literal value
@@ -1523,7 +1426,7 @@ mod tests {
             session.apply(UserAction::MoveDown);
             session.apply(UserAction::StepRight);
             let var_texts: Vec<&str> = session
-                .visible_col_items(1)
+                .visible_col_items(Column::Second)
                 .iter()
                 .map(|it| it.text.as_str())
                 .collect();
@@ -1571,24 +1474,29 @@ mod tests {
 
         let introspector = CliIntrospector::with_initial_cache(ShellDialect::Posix, HashMap::new());
         // Small terminal: height = 12 (< 16)
-        // Col 0 & Col 1 viewport_rows = 6; Col 2 viewport_rows = 3 (accounting for 3-row inspector)
-        let mut session =
-            MillerSession::new(initial_items, introspector, "", 90, 12, ShellDialect::Posix)
-                .with_catalog_loader(|_| {
-                    vec![MillerItem::new(
-                        "reloaded-tool",
-                        "reloaded-tool",
-                        ItemKind::Cli,
-                        "Freshly synced tool",
-                    )]
-                });
+        // Col 0 & Col 1 rows = 6; Col 2 rows = 3 (accounting for 3-row inspector)
+        let mut session = MillerSession::new(
+            initial_items,
+            introspector,
+            "",
+            Viewport::new(90, 12),
+            ShellDialect::Posix,
+        )
+        .with_catalog_loader(|_| {
+            vec![MillerItem::new(
+                "reloaded-tool",
+                "reloaded-tool",
+                ItemKind::Cli,
+                "Freshly synced tool",
+            )]
+        });
 
         // PageDown in Col 0 jumps by 6 rows
         session.apply(UserAction::PageDown);
         assert_eq!(session.sel_idx()[0], 6);
         assert_eq!(session.scroll_idx()[0], 1); // visible rows 1..=6
 
-        // Step right into Col 1, then page it by 6 rows (viewport_rows(12, 1) == 6)
+        // Step right into Col 1, then page it by 6 rows (Viewport::rows(12, Col1) == 6)
         session.apply(UserAction::StepRight);
         assert_eq!(session.active_col(), 1);
         session.apply(UserAction::PageDown);
@@ -1599,7 +1507,7 @@ mod tests {
         session.apply(UserAction::StepRight);
         assert_eq!(session.active_col(), 2);
 
-        // PageDown in Col 2 jumps by 3 rows (viewport_rows(12, 2) == 3)
+        // PageDown in Col 2 jumps by 3 rows (Viewport::rows(12, Col3) == 3)
         session.apply(UserAction::PageDown);
         assert_eq!(session.sel_idx()[2], 3);
         assert_eq!(session.scroll_idx()[2], 1); // visible rows 1..=3
@@ -1609,11 +1517,23 @@ mod tests {
         assert!(frame.contains("cmd06"));
         assert!(frame.contains("--opt3"));
 
+        // Left navigation alone must not mutate committed tokens.
+        session.apply(UserAction::StepLeft);
+        assert_eq!(session.active_col(), 1);
+        assert_eq!(session.tokens(), &["cmd06", "sub6"]);
+        session.apply(UserAction::StepLeft);
+        assert_eq!(session.active_col(), 0);
+        assert_eq!(session.tokens(), &["cmd06", "sub6"]);
+
+        // Backspace pops committed tokens (Right/Tab/Backspace/Enter unified).
+        session.apply(UserAction::Backspace);
+        assert_eq!(session.tokens(), &["cmd06"]);
+        session.apply(UserAction::Backspace);
+        assert!(session.tokens().is_empty());
+
         // ReloadCatalog replaces catalog cleanly and updates preview
-        session.apply(UserAction::StepLeft);
-        session.apply(UserAction::StepLeft);
         session.apply(UserAction::ReloadCatalog);
-        assert_eq!(session.visible_col_items(0).len(), 1);
+        assert_eq!(session.visible_col_items(Column::First).len(), 1);
         assert_eq!(session.preview_command(), "reloaded-tool");
     }
 }
