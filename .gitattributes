@@ -1,0 +1,3 @@
+*.sh text eol=lf
+PKGBUILD text eol=lf
+*.spec text eol=lf

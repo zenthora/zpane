@@ -1,12 +1,12 @@
 [package]
-name = "miller-cmd"
+name = "zpane"
 version = "0.1.0"
 edition = "2021"
 authors = ["zenthora <105382125+zenthora@users.noreply.github.com>"]
-description = "Blazing-fast 3-pane Miller Column Command, Subcommand & Variable Explorer for PowerShell"
+description = "Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell, Linux, and Termux"
 readme = "README.md"
 license = "MIT"
-repository = "https://github.com/zenthora/miller-cmd"
+repository = "https://github.com/zenthora/zpane"
 keywords = ["powershell", "tui", "miller-columns", "cli", "autocomplete"]
 categories = ["command-line-utilities", "command-line-interface"]
 
@@ -24,3 +24,25 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[package.metadata.deb]
+maintainer = "zenthora <105382125+zenthora@users.noreply.github.com>"
+copyright = "2026, zenthora <105382125+zenthora@users.noreply.github.com>"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+zpane is a 3-pane Miller column command, subcommand, parameter, and \
+environment variable explorer for PowerShell and POSIX shells (Bash, Zsh, Fish, Termux)."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/zpane", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/zpane/README", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/zpane", dest = "/usr/bin/zpane", mode = "0755" },
+    { source = "README.md", dest = "/usr/share/doc/zpane/README.md", mode = "0644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/zpane/LICENSE", mode = "0644", doc = true },
+]

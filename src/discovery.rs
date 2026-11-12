@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Read;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
@@ -12,13 +11,78 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Which shell syntax zpane emits for variable tokens and which command sources it indexes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellDialect {
+    /// PowerShell (Windows, or `pwsh` on Linux): `$env:X`, cmdlets, parameter sets.
+    PowerShell,
+    /// POSIX shells (bash / zsh / sh / Termux): `$X`, `$?`, `$!`, PATH executables.
+    Posix,
+    /// Fish shell (`fish`): `$X`, `$status`, `$last_pid`, `$fish_pid`, PATH executables.
+    Fish,
+}
 
+/// Resolves the active dialect once: `ZPANE_SHELL=pwsh|posix|fish` overrides; otherwise Windows is
+/// always PowerShell, `PSModulePath` selects PowerShell on Unix, `FISH_VERSION` selects Fish,
+/// and all other Unix environments default to Posix.
+pub fn shell_dialect() -> ShellDialect {
+    static DIALECT: OnceLock<ShellDialect> = OnceLock::new();
+    *DIALECT.get_or_init(|| {
+        match env::var("ZPANE_SHELL")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "pwsh" | "powershell" => return ShellDialect::PowerShell,
+            "fish" => return ShellDialect::Fish,
+            "posix" | "bash" | "zsh" | "sh" => return ShellDialect::Posix,
+            _ => {}
+        }
+        if cfg!(windows) || env::var_os("PSModulePath").is_some() {
+            ShellDialect::PowerShell
+        } else if env::var_os("FISH_VERSION").is_some()
+            || env::var("SHELL")
+                .map(|s| s.ends_with("/fish"))
+                .unwrap_or(false)
+        {
+            ShellDialect::Fish
+        } else {
+            ShellDialect::Posix
+        }
+    })
+}
+
+/// Formats an environment variable reference in the active shell's syntax.
+fn env_token(name: &str) -> String {
+    match shell_dialect() {
+        ShellDialect::PowerShell => format!("$env:{name}"),
+        ShellDialect::Posix | ShellDialect::Fish => format!("${name}"),
+    }
+}
+
+/// Prevents a console window from flashing up for child processes on Windows; no-op elsewhere.
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Per-user cache directory: `%LOCALAPPDATA%\zpane` on Windows,
+/// `$XDG_CACHE_HOME/zpane` or `~/.cache/zpane` on Linux / Termux.
 pub fn cache_dir() -> PathBuf {
-    let base = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join("miller-cmd");
+    let base = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    }
+    .unwrap_or_else(|| PathBuf::from("."));
+    let dir = base.join("zpane");
     let _ = fs::create_dir_all(&dir);
     dir
 }
@@ -54,47 +118,133 @@ pub fn common_var_items() -> &'static [MillerItem] {
         let pwd = env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
-        let home = env::var("USERPROFILE").unwrap_or_default();
-        let temp = env::var("TEMP").unwrap_or_default();
-        let profile = format!(
-            "{}\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1",
-            home
-        );
 
-        vec![
-            MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
-            MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, home),
-            MillerItem::new("$PROFILE", "$PROFILE (PS Profile)", ItemKind::Var, profile),
-            MillerItem::new("$env:TEMP", "$env:TEMP (Temp Dir)", ItemKind::Var, temp),
-            MillerItem::new(
-                "$_",
-                "$_ (Pipeline Item)",
-                ItemKind::Var,
-                "Current object in pipeline",
-            ),
-            MillerItem::new("$true", "$true", ItemKind::Var, "Boolean True"),
-            MillerItem::new("$false", "$false", ItemKind::Var, "Boolean False"),
-            MillerItem::new("$null", "$null", ItemKind::Var, "Null reference"),
-        ]
+        match shell_dialect() {
+            ShellDialect::PowerShell => {
+                let home = env::var("USERPROFILE")
+                    .or_else(|_| env::var("HOME"))
+                    .unwrap_or_default();
+                let temp = env::temp_dir().display().to_string();
+                let profile = if cfg!(windows) {
+                    format!("{home}\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1")
+                } else {
+                    format!("{home}/.config/powershell/Microsoft.PowerShell_profile.ps1")
+                };
+                vec![
+                    MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
+                    MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, home),
+                    MillerItem::new("$PROFILE", "$PROFILE (PS Profile)", ItemKind::Var, profile),
+                    MillerItem::new("$env:TEMP", "$env:TEMP (Temp Dir)", ItemKind::Var, temp),
+                    MillerItem::new(
+                        "$_",
+                        "$_ (Pipeline Item)",
+                        ItemKind::Var,
+                        "Current object in pipeline",
+                    ),
+                    MillerItem::new("$true", "$true", ItemKind::Var, "Boolean True"),
+                    MillerItem::new("$false", "$false", ItemKind::Var, "Boolean False"),
+                    MillerItem::new("$null", "$null", ItemKind::Var, "Null reference"),
+                ]
+            }
+            ShellDialect::Posix => {
+                let var = |k: &str| env::var(k).unwrap_or_default();
+                let tmp = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+                vec![
+                    MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
+                    MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, var("HOME")),
+                    MillerItem::new(
+                        "$OLDPWD",
+                        "$OLDPWD (Previous Dir)",
+                        ItemKind::Var,
+                        var("OLDPWD"),
+                    ),
+                    MillerItem::new("$TMPDIR", "$TMPDIR (Temp Dir)", ItemKind::Var, tmp),
+                    MillerItem::new("$USER", "$USER (User Name)", ItemKind::Var, var("USER")),
+                    MillerItem::new(
+                        "$SHELL",
+                        "$SHELL (Login Shell)",
+                        ItemKind::Var,
+                        var("SHELL"),
+                    ),
+                    MillerItem::new(
+                        "$?",
+                        "$? (Last Exit Code)",
+                        ItemKind::Var,
+                        "Current exit status",
+                    ),
+                    MillerItem::new(
+                        "$!",
+                        "$! (Last Background PID)",
+                        ItemKind::Var,
+                        "Current last background job PID",
+                    ),
+                ]
+            }
+            ShellDialect::Fish => {
+                let var = |k: &str| env::var(k).unwrap_or_default();
+                let tmp = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
+                vec![
+                    MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
+                    MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, var("HOME")),
+                    MillerItem::new(
+                        "$status",
+                        "$status (Last Exit Status)",
+                        ItemKind::Var,
+                        "Current exit status of last command",
+                    ),
+                    MillerItem::new(
+                        "$last_pid",
+                        "$last_pid (Last Background PID)",
+                        ItemKind::Var,
+                        "Current process ID of last background job",
+                    ),
+                    MillerItem::new(
+                        "$fish_pid",
+                        "$fish_pid (Current Fish PID)",
+                        ItemKind::Var,
+                        "Current process ID of this Fish session",
+                    ),
+                    MillerItem::new("$TMPDIR", "$TMPDIR (Temp Dir)", ItemKind::Var, tmp),
+                    MillerItem::new("$USER", "$USER (User Name)", ItemKind::Var, var("USER")),
+                    MillerItem::new(
+                        "$SHELL",
+                        "$SHELL (Login Shell)",
+                        ItemKind::Var,
+                        var("SHELL"),
+                    ),
+                ]
+            }
+        }
     })
+}
+
+/// Whether an environment variable holds a list of paths that should be split into entries.
+fn is_path_list(name: &str, value: &str) -> bool {
+    if cfg!(windows) {
+        value.contains(';')
+    } else {
+        let upper = name.to_ascii_uppercase();
+        value.contains(':') && (upper.contains("PATH") || upper.ends_with("DIRS"))
+    }
 }
 
 fn build_env_scope_item() -> MillerItem {
     let mut vars: Vec<(String, String)> = env::vars().collect();
     vars.sort_by_key(|a| a.0.to_ascii_lowercase());
+    let list_sep = if cfg!(windows) { ';' } else { ':' };
 
     let mut children = Vec::with_capacity(vars.len());
     for (k, v) in vars {
-        let token = format!("$env:{k}");
+        let token = env_token(&k);
         let mut item = MillerItem::new(&token, &k, ItemKind::Env, &v);
 
-        if v.contains(';') {
-            for part in v.split(';').filter(|s| !s.is_empty()) {
+        if is_path_list(&k, &v) {
+            for part in v.split(list_sep).filter(|s| !s.is_empty()) {
                 item.children.push(MillerItem::new(
                     format!("\"{part}\""),
                     part,
                     ItemKind::Value,
-                    format!("Path entry in $env:{k}"),
+                    format!("Path entry in {token}"),
                 ));
             }
         } else {
@@ -116,23 +266,36 @@ fn build_env_scope_item() -> MillerItem {
         children.push(item);
     }
 
+    let (text, label) = match shell_dialect() {
+        ShellDialect::PowerShell => ("$env:", "$env:Variables"),
+        ShellDialect::Posix | ShellDialect::Fish => ("$", "$ENV Variables"),
+    };
     let mut root = MillerItem::new(
-        "$env:",
-        "$env:Variables",
+        text,
+        label,
         ItemKind::Env,
-        "Browse and insert Windows & Shell Environment Variables ($env:*)",
+        "Browse and insert environment variables",
     );
     root.children = children;
     root
 }
 
 fn build_ps_var_scope_item() -> MillerItem {
-    let mut root = MillerItem::new(
-        "$",
-        "$global:Variables",
-        ItemKind::Var,
-        "Browse and insert PowerShell Session & Automatic Variables ($*)",
-    );
+    let (label, desc) = match shell_dialect() {
+        ShellDialect::PowerShell => (
+            "$global:Variables",
+            "Browse and insert PowerShell Session & Automatic Variables ($*)",
+        ),
+        ShellDialect::Posix => (
+            "$shell Variables",
+            "Browse and insert common shell & special parameters ($PWD, $?, ...)",
+        ),
+        ShellDialect::Fish => (
+            "$fish Variables",
+            "Browse and insert Fish shell & special variables ($PWD, $status, $last_pid, ...)",
+        ),
+    };
+    let mut root = MillerItem::new("$", label, ItemKind::Var, desc);
     root.children = common_var_items().to_vec();
     for child in &mut root.children {
         let tok = child.text.clone();
@@ -226,6 +389,32 @@ fn convert_ps_export_to_item(exp: PsCommandExport) -> MillerItem {
     cmd_item
 }
 
+/// Returns the command name for a PATH entry if it is a launchable executable on this platform.
+fn executable_name<'a>(entry: &fs::DirEntry, path: &'a Path) -> Option<&'a str> {
+    #[cfg(windows)]
+    {
+        let _ = entry;
+        let ext = path.extension()?.to_str()?;
+        if ext.eq_ignore_ascii_case("exe")
+            || ext.eq_ignore_ascii_case("cmd")
+            || ext.eq_ignore_ascii_case("bat")
+        {
+            return path.file_stem()?.to_str();
+        }
+        None
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // `metadata()` follows symlinks (most of /usr/bin on Termux & Debian are links).
+        let meta = fs::metadata(entry.path()).ok()?;
+        if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+            return path.file_name()?.to_str();
+        }
+        None
+    }
+}
+
 pub fn load_col1_commands() -> Vec<MillerItem> {
     let mut list = Vec::with_capacity(5000);
     let mut seen = HashSet::new();
@@ -236,10 +425,15 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
     list.push(build_ps_var_scope_item());
     seen.insert("$global:variables".to_string());
 
-    // 2. Load exported PowerShell metadata if available
+    // 2. Load exported PowerShell metadata if available (PowerShell dialect only)
     let mut ps_map: HashMap<String, MillerItem> = HashMap::new();
     let mut ps_order: Vec<String> = Vec::new();
-    if let Ok(bytes) = fs::read(ps_metadata_path()) {
+    let ps_bytes = if shell_dialect() == ShellDialect::PowerShell {
+        fs::read(ps_metadata_path()).ok()
+    } else {
+        None
+    };
+    if let Some(bytes) = ps_bytes {
         if let Ok(exports) = serde_json::from_slice::<Vec<PsCommandExport>>(&bytes) {
             for exp in exports {
                 let key = exp.name.to_ascii_lowercase();
@@ -251,7 +445,8 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
         }
     }
 
-    // 3. Scan PATH directories for CLI executables (.exe, .cmd, .bat)
+    // 3. Scan PATH directories for CLI executables
+    //    (Windows: .exe / .cmd / .bat; Unix: any file with an execute bit)
     let mut cli_map: HashMap<String, MillerItem> = HashMap::new();
     let mut cli_order: Vec<String> = Vec::new();
     if let Some(path_os) = env::var_os("PATH") {
@@ -259,25 +454,18 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
             if let Ok(entries) = fs::read_dir(&dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
-                    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                        if ext.eq_ignore_ascii_case("exe")
-                            || ext.eq_ignore_ascii_case("cmd")
-                            || ext.eq_ignore_ascii_case("bat")
+                    if let Some(name) = executable_name(&entry, &path) {
+                        let key = name.to_ascii_lowercase();
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            cli_map.entry(key.clone())
                         {
-                            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                                let key = stem.to_ascii_lowercase();
-                                if let std::collections::hash_map::Entry::Vacant(e) =
-                                    cli_map.entry(key.clone())
-                                {
-                                    cli_order.push(key);
-                                    e.insert(MillerItem::new(
-                                        stem,
-                                        stem,
-                                        ItemKind::Cli,
-                                        path.display().to_string(),
-                                    ));
-                                }
-                            }
+                            cli_order.push(key);
+                            e.insert(MillerItem::new(
+                                name,
+                                name,
+                                ItemKind::Cli,
+                                path.display().to_string(),
+                            ));
                         }
                     }
                 }
@@ -310,6 +498,11 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
         "npm",
         "pwsh",
         "docker",
+        "dnf",
+        "rpm",
+        "apt",
+        "pacman",
+        "pkg",
         "z",
         "zi",
         "mkcd",
@@ -387,8 +580,8 @@ fn run_command_with_timeout(exe: &str, args: &[&str], timeout_ms: u64) -> String
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .creation_flags(CREATE_NO_WINDOW);
+        .stderr(Stdio::piped());
+    hide_window(&mut cmd);
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -841,13 +1034,12 @@ foreach ($c in $cmds) {
 $out | ConvertTo-Json -Depth 4 -Compress
 "#;
 
-    let output = Command::new("pwsh")
-        .args(["-NoLogo", "-Command", ps_script])
+    let mut cmd = Command::new("pwsh");
+    cmd.args(["-NoLogo", "-NoProfile", "-Command", ps_script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()?;
+        .stderr(Stdio::null());
+    let output = hide_window(&mut cmd).output()?;
 
     let exports: Vec<PsCommandExport> = serde_json::from_slice(&output.stdout)?;
     let count = exports.len();
@@ -857,6 +1049,9 @@ $out | ConvertTo-Json -Depth 4 -Compress
 }
 
 pub fn ensure_ps_metadata_async() {
+    if shell_dialect() != ShellDialect::PowerShell {
+        return;
+    }
     let path: &Path = &ps_metadata_path();
     if !path.exists() {
         thread::spawn(|| {

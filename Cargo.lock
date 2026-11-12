@@ -183,19 +183,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
-name = "miller-cmd"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "crossterm",
- "rayon",
- "regex",
- "serde",
- "serde_json",
- "unicode-width",
-]
-
-[[package]]
 name = "mio"
 version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -508,3 +495,16 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[package]]
+name = "zpane"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "crossterm",
+ "rayon",
+ "regex",
+ "serde",
+ "serde_json",
+ "unicode-width",
+]

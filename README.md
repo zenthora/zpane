@@ -1,8 +1,8 @@
-# `miller-cmd`
+# `zpane`
 
-**Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell and Windows CLI.**
+**Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell, Linux, and Termux.**
 
-`miller-cmd` brings the spatial orientation of 3-column Miller file managers (`yazi`, `ranger`, `lf`) to interactive shell command construction. Instead of cycling through flat 1D tab-completion dropdowns or opening slow GUI dialogs (`Show-Command`), `miller-cmd` lets you visually traverse commands, subcommands, PowerShell parameter sets, enum constraints, and environment variables in a zero-flicker terminal overlay—injecting the assembled command straight back into your active `PSReadLine` prompt buffer.
+`zpane` brings the spatial orientation of 3-column Miller file managers (`yazi`, `ranger`, `lf`) to interactive shell command construction. Instead of cycling through flat 1D tab-completion dropdowns or opening slow GUI dialogs (`Show-Command`), `zpane` lets you visually traverse commands, subcommands, PowerShell parameter sets, enum constraints, and environment variables in a zero-flicker terminal overlay—injecting the assembled command straight back into your active shell prompt buffer.
 
 ```text
 ╭ 1. Command / Scope (4921) ─────┬ 2. Params [Set: Id] (19) ──────────┬ 3. Flags / Values / Info (11) ─────────╮
@@ -21,18 +21,19 @@
 
 ---
 
-## Why `miller-cmd`?
+## Why `zpane`?
 
-Modern Windows terminal workflows straddle two worlds: **PowerShell's rich CLR object/cmdlet ecosystem** (`Verb-Noun`, `[ValidateSet]` enums, mutually exclusive `ParameterSets`, `$env:*` / `$global:*` scopes) and **polyglot native CLI executables** (`git`, `cargo`, `winget`, `gh`, `docker`, `uv`, `prek`). Existing tools only cover one piece of the puzzle:
+Modern terminal workflows straddle two worlds: **PowerShell's rich CLR object/cmdlet ecosystem** (`Verb-Noun`, `[ValidateSet]` enums, mutually exclusive `ParameterSets`, `$env:*` / `$global:*` scopes) and **polyglot native CLI executables** (`git`, `cargo`, `winget`, `gh`, `docker`, `uv`, `prek`, `dnf`, `apt`, `pacman`, `pkg`). Existing tools only cover one piece of the puzzle:
 
-| Capability | `miller-cmd` | `bract` | `inshellisense` | `carapace-bin` | `Show-Command` | `PSReadLine` |
+| Capability | `zpane` | `bract` | `inshellisense` | `carapace-bin` | `Show-Command` | `PSReadLine` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
 | **3-Pane Cascading Miller Layout** | **Yes** | Yes | No (1D Popup) | No (Host Menu) | No (WPF GUI) | No (2D Grid) |
 | **Zero-Config Live CLI `--help` Parsing** | **Yes** | Yes | No (Static Specs) | No (Static Specs) | No | No |
 | **PowerShell Cmdlet & `[ValidateSet]` Reflection** | **Yes** | No | No | Partial | Yes | Yes |
 | **Dynamic `ParameterSet` Exclusivity Pruning** | **Yes** | No | No | No | Yes | No |
-| **Interactive `$env:*` & `$global:*` Inspector** | **Yes** | No | No | No | No | Partial |
-| **In-Place `PSReadLine` Prompt Replacement** | **Yes** | No | Yes | Yes | No | Yes |
+| **Interactive `$env` / `$SHELL` Variable Inspector** | **Yes** | No | No | No | No | Partial |
+| **In-Place Shell Prompt Buffer Replacement** | **Yes** | No | Yes | Yes | No | Yes |
+| **Windows, Arch, Debian, Fedora & Termux** | **Yes** | Unix | Node.js | Yes | Windows GUI | PowerShell |
 
 See [`docs/prior-art-and-alternatives.md`](docs/prior-art-and-alternatives.md) for a deep-dive architectural comparison.
 
@@ -42,41 +43,71 @@ See [`docs/prior-art-and-alternatives.md`](docs/prior-art-and-alternatives.md) f
 
 - **Dual-Engine Hybrid Discovery**:
   - **PowerShell CLR Reflection (`ps_metadata.json`)**: Indexes Cmdlets, Functions, and Aliases along with parameter types, shorthand aliases, `[Switch]` flags, `[ValidateSet]` / `Enum` values, and `ParameterSet` memberships.
-  - **Asynchronous JIT CLI Introspection (`cli_cache.json`)**: Scans `%PATH%` for native executables (`.exe`, `.cmd`, `.bat`) and lazily introspects `--help` / `-h` in a LIFO-prioritized background worker using `CREATE_NO_WINDOW`. Includes section-aware grammar parsers for **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), extracting `[possible values: ...]` and `[default: ...]` automatically.
+  - **Asynchronous JIT CLI Introspection (`cli_cache.json`)**: Scans `PATH` for native executables (`.exe`/`.cmd`/`.bat` on Windows; `+x` binaries and symlinks on Linux & Termux) and lazily introspects `--help` / `-h` in a LIFO-prioritized background worker. Includes section-aware grammar parsers for **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), extracting `[possible values: ...]` and `[default: ...]` automatically.
+- **Automatic Shell Dialect Adaptation (`PowerShell`, `POSIX`, and `Fish`)**:
+  - Emits `$env:VAR` and indexes PowerShell cmdlets when running on Windows or inside `pwsh` on Linux; automatically switches to `$VAR` tokens and `:`-separated `PATH` inspection in `bash`, `zsh`, `fish` (with Fish-native `$status`, `$last_pid`, `$fish_pid` variables), and Android Termux (override anytime with `ZPANE_SHELL=pwsh|posix|fish`).
 - **Dynamic `ParameterSet` Exclusivity Pruning**:
   - Selecting a parameter bound to a specific PowerShell `ParameterSet` (e.g., `Get-Process -Id`) automatically prunes incompatible parameters (such as `-Name`) from Column 2 and displays the active set in the column header (`2. Params [Set: Id]`).
 - **Interactive Value & Argument Prompts**:
   - Typing in Column 3 on any parameter or subcommand dynamically creates an interactive `✏ Use "<value>"` item (inspired by `navi`) and interpolates it into the live command preview.
-- **First-Class Environment & Variable Scopes**:
-  - Browse `$env:Variables` (including individual `;`-delimited `%PATH%` entries) and `$global:Variables` (`$PWD`, `$HOME`, `$PROFILE`, `$_`) directly from Column 1, choosing between inserting the variable token (`$env:TEMP`) or its quoted literal value.
-- **Sub-Millisecond Synchronized Win32 Rendering**:
-  - Directly drives `CONOUT$` via `WriteConsoleW` on the alternate screen buffer with DEC Mode 2026 Synchronized Output (`\x1b[?2026h`…`\x1b[?2026l`), event-burst coalescing, and zero-allocation fuzzy subsequence matching (~85µs per interactive step across 5,000+ commands).
+- **Sub-Millisecond Synchronized Terminal Rendering**:
+  - Renders directly to `CONOUT$` (Windows) or `/dev/tty` (Linux/Termux) on the alternate screen buffer with DEC Mode 2026 Synchronized Output (`\x1b[?2026h`…`\x1b[?2026l`), event-burst coalescing, and zero-allocation fuzzy subsequence matching (~85µs per interactive step across 5,000+ commands).
 
 ---
 
 ## Installation
 
-### Build from Source
-
-Requires Rust 1.80+ and PowerShell 7 (`pwsh`) on Windows:
+### Windows (Cargo)
 
 ```powershell
 cargo install --path .
+zpane --warm
 ```
 
-### Pre-Warm Metadata & Priority CLI Cache (Recommended)
+### Arch Linux (`pacman` / `makepkg`)
 
-Run once after installation to export PowerShell cmdlet metadata and pre-cache `--help` trees for common CLI tools (`git`, `cargo`, `winget`, `rg`, `fd`, `uv`, `prek`, etc.):
+Install the prebuilt `.pkg.tar.zst` release package or build from [`packaging/arch/PKGBUILD`](packaging/arch/PKGBUILD):
 
-```powershell
-miller-cmd --warm
+```bash
+# Install release package directly
+sudo pacman -U dist/zpane-0.1.0-1-x86_64.pkg.tar.zst
+
+# Or build from PKGBUILD
+cd packaging/arch && makepkg -si
+```
+
+### Debian / Ubuntu (`.deb`)
+
+```bash
+sudo dpkg -i dist/zpane_0.1.0-1_amd64.deb
+```
+
+### Fedora / RHEL / openSUSE (`.rpm`)
+
+Install the prebuilt `.rpm` package via `dnf` / `rpm` or build from [`packaging/fedora/zpane.spec`](packaging/fedora/zpane.spec):
+
+```bash
+sudo dnf install ./dist/zpane-0.1.0-1.x86_64.rpm
+# or
+sudo rpm -Uvh dist/zpane-0.1.0-1.x86_64.rpm
+```
+
+### Android Termux (`aarch64`)
+
+Install the Termux `.deb` package (built with the `/data/data/com.termux/files/usr` prefix) or see [`packaging/termux/build.sh`](packaging/termux/build.sh):
+
+```bash
+dpkg -i zpane_0.1.0_aarch64.deb
+zpane --warm
 ```
 
 ---
 
-## PowerShell (`PSReadLine`) Integration
+## Shell Integration
 
-Add the following keybinding to your PowerShell `$PROFILE` (`notepad $PROFILE`) to launch `miller-cmd` with **`Ctrl+M`** (or `Alt+M`), pre-seeded with whatever you have already typed on the command line:
+### PowerShell (`$PROFILE`)
+
+Bind `Alt+M` in `PSReadLine` to open `zpane` seeded with your current prompt line and replace it in place upon pressing `Enter`:
 
 ```powershell
 Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
@@ -86,7 +117,7 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
 
     $tmp = [System.IO.Path]::GetTempFileName()
     try {
-        miller-cmd --initial "$line" --out-file "$tmp"
+        zpane --initial "$line" --out-file "$tmp"
         if (Test-Path $tmp) {
             $accepted = (Get-Content -Path $tmp -Raw -ErrorAction SilentlyContinue)
             if ($accepted) {
@@ -98,6 +129,55 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
         Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
     }
 }
+```
+
+### Zsh (`~/.zshrc`)
+
+```zsh
+_zpane_widget() {
+    local tmp="$(mktemp)"
+    zpane --initial "$BUFFER" --out-file "$tmp"
+    if [[ -s "$tmp" ]]; then
+        BUFFER="$(<"$tmp")"
+        CURSOR=${#BUFFER}
+    fi
+    rm -f "$tmp"
+    zle redisplay
+}
+zle -N _zpane_widget
+bindkey '^[m' _zpane_widget
+```
+
+### Bash (`~/.bashrc`)
+
+```bash
+_zpane_readline() {
+    local tmp
+    tmp="$(mktemp)"
+    zpane --initial "$READLINE_LINE" --out-file "$tmp"
+    if [[ -s "$tmp" ]]; then
+        READLINE_LINE="$(<"$tmp")"
+        READLINE_POINT=${#READLINE_LINE}
+    fi
+    rm -f "$tmp"
+}
+bind -x '"\em": _zpane_readline'
+```
+
+### Fish (`~/.config/fish/config.fish`)
+
+```fish
+function _zpane_fish
+    set -l tmp (mktemp)
+    zpane --initial (commandline -b) --out-file "$tmp"
+    if test -s "$tmp"
+        commandline -r (string trim (cat "$tmp"))
+        commandline -C (string length (commandline -b))
+    end
+    rm -f "$tmp"
+    commandline -f repaint
+end
+bind \em _zpane_fish
 ```
 
 ---
@@ -122,20 +202,27 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
 ## CLI Options
 
 ```text
-miller-cmd [OPTIONS] [INITIAL_TOKENS]...
+zpane - 3-pane Miller column command, parameter & variable explorer
+
+Usage: zpane [OPTIONS] [INITIAL_TOKENS]...
 
 Options:
-  --initial <TEXT>     Seed the command builder with an existing command buffer
-  --out-file <PATH>    Write the accepted command to <PATH> instead of stdout
-  --width <COLS>       Fallback terminal width (default: 120)
-  --height <ROWS>      Fallback terminal height (default: 30)
-  --sync-ps            Synchronize PowerShell cmdlet & parameter metadata and exit
-  --warm               Synchronize PowerShell metadata + pre-warm priority CLI cache and exit
+      --initial <TEXT>   Seed the command builder with an existing command buffer
+      --out-file <PATH>  Write the accepted command to <PATH> instead of stdout
+      --width <COLS>     Fallback terminal width (default: 120)
+      --height <ROWS>    Fallback terminal height (default: 30)
+      --sync-ps          Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
+      --warm             Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
+  -h, --help             Print help
+  -V, --version          Print version
+
+Environment:
+  ZPANE_SHELL            Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($X, $status)
 ```
 
 ---
 
-## Development
+## Development & Release Packaging
 
 This repository uses [`prek`](https://prek.j178.dev) for pre-commit hooks and [`git-cliff`](https://git-cliff.org) for changelog generation:
 

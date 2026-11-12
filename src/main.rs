@@ -16,87 +16,130 @@ use model::{BgRequest, BgResponse, ItemKind, MillerItem};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io;
-use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
 use ui::{render_frame, RenderState};
 
-#[link(name = "kernel32")]
-extern "system" {
-    fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
-    fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
-    fn WriteConsoleW(
-        hConsoleOutput: *mut std::ffi::c_void,
-        lpBuffer: *const u16,
-        nNumberOfCharsToWrite: u32,
-        lpNumberOfCharsWritten: *mut u32,
-        lpReserved: *mut std::ffi::c_void,
-    ) -> i32;
-}
+/// Windows console output: writes UTF-16 frames straight to `CONOUT$` via `WriteConsoleW`,
+/// so the TUI renders even when stdout is redirected by the shell integration.
+#[cfg(windows)]
+mod conout {
+    use std::fs::{File, OpenOptions};
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
 
-const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
-const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
-const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
-
-struct ConOut {
-    file: fs::File,
-    utf16_buf: Vec<u16>,
-    last_frame: String,
-}
-
-impl ConOut {
-    fn open() -> io::Result<Self> {
-        let file = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
-        let s = Self {
-            file,
-            utf16_buf: Vec::with_capacity(32768),
-            last_frame: String::new(),
-        };
-        s.enable_vt();
-        Ok(s)
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+        fn WriteConsoleW(
+            hConsoleOutput: *mut std::ffi::c_void,
+            lpBuffer: *const u16,
+            nNumberOfCharsToWrite: u32,
+            lpNumberOfCharsWritten: *mut u32,
+            lpReserved: *mut std::ffi::c_void,
+        ) -> i32;
     }
 
-    fn handle(&self) -> *mut std::ffi::c_void {
-        self.file.as_raw_handle()
+    const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+    const ENABLE_WRAP_AT_EOL_OUTPUT: u32 = 0x0002;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    pub struct ConOut {
+        file: File,
+        utf16_buf: Vec<u16>,
+        last_frame: String,
     }
 
-    fn enable_vt(&self) {
-        unsafe {
-            let h = self.handle();
-            let mut mode: u32 = 0;
-            if GetConsoleMode(h, &mut mode) != 0 {
-                let new_mode = mode
-                    | ENABLE_PROCESSED_OUTPUT
-                    | ENABLE_WRAP_AT_EOL_OUTPUT
-                    | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-                SetConsoleMode(h, new_mode);
+    impl ConOut {
+        pub fn open() -> io::Result<Self> {
+            let file = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
+            let s = Self {
+                file,
+                utf16_buf: Vec::with_capacity(32768),
+                last_frame: String::new(),
+            };
+            s.enable_vt();
+            Ok(s)
+        }
+
+        fn handle(&self) -> *mut std::ffi::c_void {
+            self.file.as_raw_handle()
+        }
+
+        fn enable_vt(&self) {
+            unsafe {
+                let h = self.handle();
+                let mut mode: u32 = 0;
+                if GetConsoleMode(h, &mut mode) != 0 {
+                    let new_mode = mode
+                        | ENABLE_PROCESSED_OUTPUT
+                        | ENABLE_WRAP_AT_EOL_OUTPUT
+                        | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+                    SetConsoleMode(h, new_mode);
+                }
+            }
+        }
+
+        pub fn write_str(&mut self, s: &str) {
+            if s == self.last_frame {
+                return;
+            }
+            self.last_frame.clear();
+            self.last_frame.push_str(s);
+            self.utf16_buf.clear();
+            self.utf16_buf.extend(s.encode_utf16());
+            let mut written: u32 = 0;
+            unsafe {
+                WriteConsoleW(
+                    self.handle(),
+                    self.utf16_buf.as_ptr(),
+                    self.utf16_buf.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                );
             }
         }
     }
+}
 
-    fn write_str(&mut self, s: &str) {
-        if s == self.last_frame {
-            return;
+/// Unix (Linux / Termux) output: writes frames to the controlling terminal `/dev/tty`,
+/// so the TUI renders even when stdout is captured by a shell widget (`$(zpane)`).
+#[cfg(unix)]
+mod conout {
+    use std::fs::{File, OpenOptions};
+    use std::io::{self, Write};
+
+    pub struct ConOut {
+        file: File,
+        last_frame: String,
+    }
+
+    impl ConOut {
+        pub fn open() -> io::Result<Self> {
+            let file = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+            Ok(Self {
+                file,
+                last_frame: String::new(),
+            })
         }
-        self.last_frame.clear();
-        self.last_frame.push_str(s);
-        self.utf16_buf.clear();
-        self.utf16_buf.extend(s.encode_utf16());
-        let mut written: u32 = 0;
-        unsafe {
-            WriteConsoleW(
-                self.handle(),
-                self.utf16_buf.as_ptr(),
-                self.utf16_buf.len() as u32,
-                &mut written,
-                std::ptr::null_mut(),
-            );
+
+        pub fn write_str(&mut self, s: &str) {
+            if s == self.last_frame {
+                return;
+            }
+            self.last_frame.clear();
+            self.last_frame.push_str(s);
+            let _ = self.file.write_all(s.as_bytes());
+            let _ = self.file.flush();
         }
     }
 }
+
+use conout::ConOut;
 
 struct TerminalGuard {
     conout: ConOut,
@@ -946,13 +989,48 @@ impl TuiState {
     }
 }
 
+const HELP_TEXT: &str = "\
+zpane - 3-pane Miller column command, parameter & variable explorer
+
+Usage: zpane [OPTIONS] [INITIAL_TOKENS]...
+
+Options:
+      --initial <TEXT>   Seed the command builder with an existing command buffer
+      --out-file <PATH>  Write the accepted command to <PATH> instead of stdout
+      --width <COLS>     Fallback terminal width (default: 120)
+      --height <ROWS>    Fallback terminal height (default: 30)
+      --sync-ps          Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
+      --warm             Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
+  -h, --help             Print help
+  -V, --version          Print version
+
+Environment:
+  ZPANE_SHELL            Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($status)
+";
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
+    if args.iter().any(|a| a == "-V" || a == "--version") {
+        println!("zpane {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{HELP_TEXT}");
+        return Ok(());
+    }
+
     if args.iter().any(|a| a == "--sync-ps" || a == "--warm") {
-        let count = sync_powershell_metadata()?;
-        eprintln!("Synced {count} PowerShell commands & parameter definitions.");
-        if args.iter().any(|a| a == "--warm") {
+        let warm = args.iter().any(|a| a == "--warm");
+        match sync_powershell_metadata() {
+            Ok(count) => eprintln!("Synced {count} PowerShell commands & parameter definitions."),
+            // PowerShell is optional on Linux / Termux: only a hard error when explicitly requested.
+            Err(e) if !warm => {
+                return Err(e.context("PowerShell metadata sync failed (is `pwsh` on PATH?)"))
+            }
+            Err(_) => eprintln!("Skipping PowerShell metadata sync (`pwsh` not available)."),
+        }
+        if warm {
             let mut cache = load_cli_disk_cache();
             let top_tools = [
                 "git",
@@ -972,8 +1050,27 @@ fn main() -> anyhow::Result<()> {
                 "scoop",
                 "tailscale",
                 "caddy",
+                "apt",
+                "dnf",
+                "rpm",
+                "pkg",
+                "pacman",
+                "docker",
+                "gh",
+                "npm",
+                "pip",
             ];
-            let results: Vec<(String, Vec<MillerItem>)> = top_tools
+            let installed: HashSet<String> = load_col1_commands()
+                .into_iter()
+                .filter(|it| it.kind == ItemKind::Cli)
+                .map(|it| it.text.to_ascii_lowercase())
+                .collect();
+            let available: Vec<&str> = top_tools
+                .iter()
+                .copied()
+                .filter(|t| installed.contains(*t))
+                .collect();
+            let results: Vec<(String, Vec<MillerItem>)> = available
                 .par_iter()
                 .map(|&t| {
                     let items = introspect_cli_chain(&[t.to_string()]);
@@ -987,8 +1084,8 @@ fn main() -> anyhow::Result<()> {
             }
             save_cli_disk_cache(&cache);
             eprintln!(
-                "Pre-warmed CLI cache for {} priority tools.",
-                top_tools.len()
+                "Pre-warmed CLI cache for {} installed priority tools.",
+                available.len()
             );
         }
         return Ok(());

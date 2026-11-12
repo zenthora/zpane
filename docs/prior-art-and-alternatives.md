@@ -1,6 +1,6 @@
-# Prior Art, Alternatives, and Ecosystem Analysis for `miller-cmd`
+# Prior Art, Alternatives, and Ecosystem Analysis for `zpane`
 
-**Subject:** Landscape analysis of command discovery, CLI introspection, and Miller column terminal user interfaces in relation to `miller-cmd`.
+**Subject:** Landscape analysis of command discovery, CLI introspection, and Miller column terminal user interfaces in relation to `zpane`.
 
 ---
 
@@ -11,13 +11,13 @@ Modern command-line environments suffer from a severe discoverability and cognit
 - PowerShell introduces a rich, object-oriented cmdlet model (`Verb-Noun`, parameter sets, dynamic parameters, `[ValidateSet]` enums, and live session variables), yet interacting with these capabilities typically requires memorizing syntax, spamming `Get-Help`, or falling back to single-line completion menus.
 - Standard tab completion (such as PSReadLine's inline `MenuComplete` or Zsh completion) presents flat, 1-dimensional lists or simple 2D grids under the cursor line. These models lack multi-level contextual hierarchy: selecting an option immediately obscures its parent context, flag documentation, and valid argument choices.
 
-`miller-cmd` addresses this problem by introducing a **blazing-fast, 3-column Miller layout** (cascading horizontal tree hierarchy popularized by macOS Finder, `ranger`, and `yazi`) specifically mapped to command generation:
+`zpane` addresses this problem by introducing a **blazing-fast, 3-column Miller layout** (cascading horizontal tree hierarchy popularized by macOS Finder, `ranger`, and `yazi`) specifically mapped to command generation:
 1. **Column 1 (Root / Scopes):** Scopes (`$env:*`, `$global:*`), Windows `%PATH%` executables, and reflected PowerShell Cmdlets/Functions/Aliases.
 2. **Column 2 (Subcommands / Options):** Subcommands, parameter flags, switches, or variable keys.
 3. **Column 3 (Values / Arguments / Previews):** Valid enum values, switch state toggles, variable contents, path elements, and live help descriptions.
 4. **Shell Integration:** Written in Rust, running directly on Windows console handles (`CONOUT$`), operating in raw VT mode on the alternate screen buffer, and returning the completed string directly into the active **PSReadLine** buffer via `[Microsoft.PowerShell.PSConsoleReadLine]::Replace`.
 
-This research document investigates the existing software landscape, prior art, direct conceptual equivalents, and ecosystem alternatives across primary sources (official GitHub repositories, source code, specifications, and package distributions). It synthesizes comparative metrics, identifies the distinct value proposition of `miller-cmd`, and outlines high-impact architectural opportunities inspired by related projects.
+This research document investigates the existing software landscape, prior art, direct conceptual equivalents, and ecosystem alternatives across primary sources (official GitHub repositories, source code, specifications, and package distributions). It synthesizes comparative metrics, identifies the distinct value proposition of `zpane`, and outlines high-impact architectural opportunities inspired by related projects.
 
 ---
 
@@ -259,7 +259,7 @@ This research document investigates the existing software landscape, prior art, 
   - Communicates directly with the Kubernetes API (`client-go`), dynamically traversing owner-reference trees (e.g. Deployment -> ReplicaSet -> Pod -> Container).
 - **Shell Integration & Execution:**
   - Standalone monitoring and diagnostic application; does not inject commands into a shell.
-- **Relevance to `miller-cmd`:**
+- **Relevance to `zpane`:**
   - Demonstrates that the Miller column UX pattern is vastly superior to flat tabular views (like standard `kubectl` or `k9s`) when navigating deeply nested hierarchical resources in the terminal.
 
 ---
@@ -273,8 +273,8 @@ This research document investigates the existing software landscape, prior art, 
   - **Left Pane (Ancestor / Context):** Shows the parent level, maintaining orientational grounding so the user never feels lost.
   - **Center Pane (Active Focus / Selection):** Displays the current level's items, receiving arrow key navigation and fuzzy filtering.
   - **Right Pane (Descendant / Preview):** Shows the prospective next level or detailed preview of the currently highlighted item before committing.
-- **Relevance to `miller-cmd`:**
-  - `miller-cmd` adopts this exact cognitive model and transposes it from hierarchical filesystem directories onto the hierarchical grammar of shell commands:
+- **Relevance to `zpane`:**
+  - `zpane` adopts this exact cognitive model and transposes it from hierarchical filesystem directories onto the hierarchical grammar of shell commands:
     - *Left:* Binary / Cmdlet / Scope.
     - *Center:* Subcommand / Parameter / Variable Key.
     - *Right:* Value / Enum / Help preview.
@@ -283,11 +283,11 @@ This research document investigates the existing software landscape, prior art, 
 
 ## 3. Comprehensive Comparative Matrix
 
-The following matrix systematically evaluates `miller-cmd` alongside the identified prior art across architectural, interface, introspection, and execution dimensions:
+The following matrix systematically evaluates `zpane` alongside the identified prior art across architectural, interface, introspection, and execution dimensions:
 
 | Tool | UI Paradigm | Implementation Language | Discovery / Introspection Engine | Parameter / Argument Inspection | Shell Handoff / Integration | Target Platform & Ecosystem | Latency & Startup Overhead |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`miller-cmd`** | **3-Pane Miller Columns** + Status/Preview Pane | **Rust** (Crossterm, Rayon) | **Dual Hybrid**: Live `--help` regex JIT + PS CLR Reflection (`ps_metadata.json`) | **Yes**: Enums, switch flags, path segments, variable values | **Direct Buffer Replace** via PSReadLine API (`--out` / `Replace`) | **Windows / PowerShell & Native CLI** | **< 10ms** (Instant compiled binary, VT raw mode) |
+| **`zpane`** | **3-Pane Miller Columns** + Status/Preview Pane | **Rust** (Crossterm, Rayon) | **Dual Hybrid**: Live `--help` regex JIT + PS CLR Reflection (`ps_metadata.json`) | **Yes**: Enums, switch flags, path segments, variable values | **Direct Buffer Replace** via PSReadLine API (`--out` / `Replace`) | **Windows / PowerShell & Native CLI** | **< 10ms** (Instant compiled binary, VT raw mode) |
 | **`bract`** | **Lazy Miller Columns** + Guided Input Forms | **Rust** (Ratatui, Crossterm) | **JIT CLI Help**: Framework grammars (Cobra, Clap, Knack) + `mise` | **Yes**: Guided form fields for flags and arguments | **Clipboard Copy** or direct process execution | **Linux / macOS** (Cloud & dev toolchains) | **Fast** (Compiled binary, background threading) |
 | **`cmdpeek`** | **Single-List Fuzzy Picker** | **TypeScript / Node.js** | **Live JIT Parsing**: Scrapes `--help` / man pages on the fly | **Partial**: Explores flags and options | **Stdout print** / Clipboard copy | **Cross-Platform** (Requires Node.js runtime) | **Moderate** (~80–150ms Node.js VM spin-up) |
 | **`inshellisense`** | **IDE Vertical Dropdown** + Help Popup | **TypeScript / Node.js** (Rust port: `is-rs`) | **Curated Specifications** (600+ Fig autocomplete specs) | **Yes**: Subcommands, flags, predefined option lists | **Prompt Buffer Mutation** via terminal interceptor | **Cross-Platform** (Bash, Zsh, Fish, PowerShell) | **Moderate** (Persistent background wrapper process) |
@@ -303,21 +303,21 @@ The following matrix systematically evaluates `miller-cmd` alongside the identif
 
 ---
 
-## 4. Architectural Differentiation: What Makes `miller-cmd` Unique
+## 4. Architectural Differentiation: What Makes `zpane` Unique
 
-Among all analyzed tools, **no single existing utility matches the exact architecture and scope of `miller-cmd`**. While `bract` shares the Miller column layout, it is tailored for Unix/`mise` toolchains, relies on external command execution or clipboard copying, and completely ignores PowerShell's object model. Conversely, while PowerShell provides deep reflection tools (`Show-Command`, PSReadLine), they either break the terminal flow via desktop GUI popups or compress options into flat 1D/2D menus.
+Among all analyzed tools, **no single existing utility matches the exact architecture and scope of `zpane`**. While `bract` shares the Miller column layout, it is tailored for Unix/`mise` toolchains, relies on external command execution or clipboard copying, and completely ignores PowerShell's object model. Conversely, while PowerShell provides deep reflection tools (`Show-Command`, PSReadLine), they either break the terminal flow via desktop GUI popups or compress options into flat 1D/2D menus.
 
-`miller-cmd` occupies a distinct architectural niche defined by four foundational differentiators:
+`zpane` occupies a distinct architectural niche defined by four foundational differentiators:
 
 ### 1. The Dual-Engine Hybrid Discovery Model
-Unlike purely Unix-focused CLI explorers or purely PowerShell-focused cmdlets, `miller-cmd` reconciles the two fundamentally divergent worlds of modern Windows terminal operations:
+Unlike purely Unix-focused CLI explorers or purely PowerShell-focused cmdlets, `zpane` reconciles the two fundamentally divergent worlds of modern Windows terminal operations:
 - **The PowerShell CLR / AST Universe:** Seamlessly reflects compiled cmdlets, functions, and aliases. It extracts parameter names, aliases, types, switch flags, and `[ValidateSet]` constraints via `ps_metadata.json`—populating Column 2 with parameters and Column 3 with allowed enum values.
 - **The Windows `%PATH%` Native Executable Universe:** Scans system PATH for native binaries (`.exe`, `.cmd`, `.bat`). When navigated, it launches non-blocking asynchronous worker threads that query `<binary> --help` or `-h` with strict timeouts (450ms) and `CREATE_NO_WINDOW` flags (preventing flickering console windows on Windows), parsing subcommands and flags using high-throughput regular expressions.
 - **First-Class Variable and Environment Scopes:** Unifies environment variables (`$env:*`) and session variables (`$global:*`, `$PWD`, `$HOME`, `$PROFILE`) directly into Column 1, expanding path tokens into Column 2 and literal values into Column 3.
 
 ### 2. True 3-Column Cascading Tree for Command Construction
 Traditional autocomplete menus are ephemeral 1D dropdowns: as soon as you type or drill down, parent context disappears.
-- In `miller-cmd`, the user retains continuous visual orientation across the entire syntax tree:
+- In `zpane`, the user retains continuous visual orientation across the entire syntax tree:
   - **Left Pane:** Where you originated (e.g. `git`, `winget`, `Get-Process`, or `$env:PATH`).
   - **Center Pane:** What option or subcommand is currently active (e.g. `remote`, `install`, `-ComputerName`).
   - **Right Pane:** The downstream implications (allowed enum arguments, switch toggles, variable literal values, or flag descriptions).
@@ -327,7 +327,7 @@ Traditional autocomplete menus are ephemeral 1D dropdowns: as soon as you type o
 A major defect of tools like `bract`, `navi`, or standalone TUIs is the handoff barrier:
 - Spawning a child subshell to run the command destroys shell state (environment changes like `cd` or `$env:FOO = 'bar'` are lost when the subshell terminates; PowerShell object pipelines cannot cross process boundaries).
 - Copying to the clipboard forces a manual paste step (`Ctrl+V`).
-- `miller-cmd` bridges directly into PowerShell's prompt buffer:
+- `zpane` bridges directly into PowerShell's prompt buffer:
   ```powershell
   # PSReadLine Keybinding Integration
   Set-PSReadLineKeyHandler -Chord 'Ctrl+m' -ScriptBlock {
@@ -335,7 +335,7 @@ A major defect of tools like `bract`, `navi`, or standalone TUIs is the handoff 
       [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
       $tmp = [System.IO.Path]::GetTempFileName()
       try {
-          miller-cmd --initial "$line" --out-file "$tmp"
+          zpane --initial "$line" --out-file "$tmp"
           if (Test-Path $tmp) {
               $newCmd = (Get-Content $tmp -Raw).Trim()
               if ($newCmd) {
@@ -358,29 +358,29 @@ A major defect of tools like `bract`, `navi`, or standalone TUIs is the handoff 
 
 ## 5. Cross-Pollinated Architecture & Roadmap Opportunities
 
-Analyzing the strengths of prior art directly informed several core capabilities implemented in `miller-cmd`, as well as future roadmap extensions:
+Analyzing the strengths of prior art directly informed several core capabilities implemented in `zpane`, as well as future roadmap extensions:
 
 ### 1. Framework-Specific Help Grammar Parsers (Inspired by `bract` — Implemented)
-- **Architecture:** Rather than relying solely on naive regexes, `miller-cmd` detects section headers (`CORE COMMANDS`, `Commands:`, `Flags:`, `Options:`, Git prose headers) and parses framework-specific CLI patterns across **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), automatically extracting `[possible values: ...]` and `[default: ...]` into Column 3 children.
+- **Architecture:** Rather than relying solely on naive regexes, `zpane` detects section headers (`CORE COMMANDS`, `Commands:`, `Flags:`, `Options:`, Git prose headers) and parses framework-specific CLI patterns across **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), automatically extracting `[possible values: ...]` and `[default: ...]` into Column 3 children.
 
 ### 2. Declarative Specification & Carapace Bridge Fallback (Inspired by `carapace` & Fig — Roadmap)
 - **Opportunity:**
-  - Support loading lightweight declarative JSON/YAML specs (such as `carapace-spec` or simplified Fig specs) from a local directory (`%LOCALAPPDATA%\miller-cmd\specs\`).
-  - If `carapace-bin` is installed on the user's system, allow `miller-cmd` to query `carapace <cmd> export` as a secondary introspection provider, instantly gaining rich, structured completions for 500+ CLI tools without manual maintenance.
+  - Support loading lightweight declarative JSON/YAML specs (such as `carapace-spec` or simplified Fig specs) from a local directory (`%LOCALAPPDATA%\zpane\specs\`).
+  - If `carapace-bin` is installed on the user's system, allow `zpane` to query `carapace <cmd> export` as a secondary introspection provider, instantly gaining rich, structured completions for 500+ CLI tools without manual maintenance.
 
 ### 3. Interactive Argument / Value Prompts (Inspired by `navi` & `intelli-shell` — Implemented)
 - **Architecture:**
-  - When a user selects a parameter or subcommand in Column 2 and types in Column 3, `miller-cmd` dynamically surfaces an interactive `✏ Use "<value>"` item and interpolates the custom argument directly into the live command preview and output buffer.
+  - When a user selects a parameter or subcommand in Column 2 and types in Column 3, `zpane` dynamically surfaces an interactive `✏ Use "<value>"` item and interpolates the custom argument directly into the live command preview and output buffer.
 
 ### 4. ParameterSet Exclusivity Pruning (Inspired by `Show-Command` & PowerShell AST — Implemented)
 - **Architecture:**
   - `ps_metadata.json` records `parameter_sets` for every reflected PowerShell parameter.
-  - Once the user appends a parameter belonging to specific `ParameterSet`s, `miller-cmd` computes the active parameter set intersection and dynamically prunes mutually exclusive parameters from Column 2, displaying `[Set: ...]` in the Column 2 header.
+  - Once the user appends a parameter belonging to specific `ParameterSet`s, `zpane` computes the active parameter set intersection and dynamically prunes mutually exclusive parameters from Column 2, displaying `[Set: ...]` in the Column 2 header.
 
 ### 5. Dynamic Runtime Context Extraction (Inspired by `atuin` & `carapace`)
 - **Current State:** Variable scopes `$env:*` and `$global:*` are loaded once at startup.
 - **Opportunity:**
-  - Allow the PowerShell wrapper function to pass dynamic context into `miller-cmd` via command-line flags or JSON payload:
+  - Allow the PowerShell wrapper function to pass dynamic context into `zpane` via command-line flags or JSON payload:
     - Current Git branch (for `git` commands).
     - Current directory files/folders.
     - Active PowerShell session history (allowing recent commands to appear at the top of Column 1).
