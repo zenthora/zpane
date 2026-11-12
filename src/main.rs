@@ -43,18 +43,24 @@ const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
 
 struct ConOut {
     file: fs::File,
+    utf16_buf: Vec<u16>,
+    last_frame: String,
 }
 
 impl ConOut {
     fn open() -> io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open("CONOUT$")?;
-        let s = Self { file };
+        let s = Self {
+            file,
+            utf16_buf: Vec::with_capacity(32768),
+            last_frame: String::new(),
+        };
         s.enable_vt();
         Ok(s)
     }
 
     fn handle(&self) -> *mut std::ffi::c_void {
-        self.file.as_raw_handle() as *mut std::ffi::c_void
+        self.file.as_raw_handle()
     }
 
     fn enable_vt(&self) {
@@ -71,15 +77,20 @@ impl ConOut {
         }
     }
 
-    fn write_str(&self, s: &str) {
-        self.enable_vt();
-        let wide: Vec<u16> = s.encode_utf16().collect();
+    fn write_str(&mut self, s: &str) {
+        if s == self.last_frame {
+            return;
+        }
+        self.last_frame.clear();
+        self.last_frame.push_str(s);
+        self.utf16_buf.clear();
+        self.utf16_buf.extend(s.encode_utf16());
         let mut written: u32 = 0;
         unsafe {
             WriteConsoleW(
                 self.handle(),
-                wide.as_ptr(),
-                wide.len() as u32,
+                self.utf16_buf.as_ptr(),
+                self.utf16_buf.len() as u32,
                 &mut written,
                 std::ptr::null_mut(),
             );
@@ -93,7 +104,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        let conout = ConOut::open()?;
+        let mut conout = ConOut::open()?;
         enable_raw_mode()?;
         conout.write_str("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
         Ok(Self { conout })
@@ -243,12 +254,18 @@ fn resolve_col3_items(
             "",
             "✏ (Type custom value / path)",
             ItemKind::Value,
-            format!("Type directly in this column to specify an argument for {}", c2.label),
+            format!(
+                "Type directly in this column to specify an argument for {}",
+                c2.label
+            ),
         ));
     }
 
     if !c2.children.is_empty() {
-        items.extend(c2.children.clone());
+        items.extend_from_slice(&c2.children);
+        if matches!(c2.kind, ItemKind::Param | ItemKind::Switch) {
+            items.extend_from_slice(common_var_items());
+        }
         return items;
     }
 
@@ -259,7 +276,7 @@ fn resolve_col3_items(
             c2.text.to_ascii_lowercase()
         );
         if let Some(cached) = cli_cache.get(&key) {
-            items.extend(cached.clone());
+            items.extend_from_slice(cached);
             return items;
         }
 
@@ -277,7 +294,7 @@ fn resolve_col3_items(
         return items;
     }
 
-    items.extend(common_var_items());
+    items.extend_from_slice(common_var_items());
     items
 }
 
@@ -303,10 +320,11 @@ fn build_preview_command(
 
     if active_col == 1 {
         if let Some(c2) = cur_c2 {
-            if c2.kind != ItemKind::Loading && !c2.text.is_empty() {
-                if out.last().map(|s| s.as_str()) != Some(c2.text.as_str()) {
-                    out.push(c2.text.clone());
-                }
+            if c2.kind != ItemKind::Loading
+                && !c2.text.is_empty()
+                && out.last().map(|s| s.as_str()) != Some(c2.text.as_str())
+            {
+                out.push(c2.text.clone());
             }
         }
     } else if active_col == 2 {
@@ -315,10 +333,9 @@ fn build_preview_command(
                 && c2.kind != ItemKind::Loading
                 && !c2.text.is_empty()
                 && out.len() <= 1
+                && out.last().map(|s| s.as_str()) != Some(c2.text.as_str())
             {
-                if out.last().map(|s| s.as_str()) != Some(c2.text.as_str()) {
-                    out.push(c2.text.clone());
-                }
+                out.push(c2.text.clone());
             }
         }
         let val = if let Some(c3) = cur_c3 {
@@ -345,6 +362,590 @@ fn build_preview_command(
     out.join(" ")
 }
 
+enum LoopAction {
+    Continue,
+    Exit(Option<String>),
+}
+
+struct TuiState {
+    col1_items: Vec<MillerItem>,
+    col2_items: Vec<MillerItem>,
+    col3_items: Vec<MillerItem>,
+    col1_filtered: Vec<FilteredItem>,
+    col2_filtered: Vec<FilteredItem>,
+    col3_filtered: Vec<FilteredItem>,
+    col1_filter_dirty: bool,
+    col2_filter_dirty: bool,
+    col3_filter_dirty: bool,
+    cli_cache: HashMap<String, Vec<MillerItem>>,
+    cli_cache_dirty: bool,
+    req_tx: mpsc::Sender<BgRequest>,
+    active_col: usize,
+    filters: [String; 3],
+    sel_idx: [usize; 3],
+    scroll_idx: [usize; 3],
+    tokens: Vec<String>,
+    pending_second_token: Option<String>,
+    last_c1_key: String,
+    last_c2_key: String,
+    last_active_param_key: String,
+    active_param_set_label: Option<String>,
+    term_w: usize,
+    term_h: usize,
+    dirty: bool,
+}
+
+impl TuiState {
+    fn new(
+        col1_items: Vec<MillerItem>,
+        cli_cache: HashMap<String, Vec<MillerItem>>,
+        req_tx: mpsc::Sender<BgRequest>,
+        initial_buffer: &str,
+        fallback_w: usize,
+        fallback_h: usize,
+    ) -> Self {
+        let mut active_col = 0;
+        let mut sel_idx = [0, 0, 0];
+        let tokens: Vec<String> = initial_buffer
+            .split_whitespace()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+
+        if let Some(first_tok) = tokens.first() {
+            if let Some(pos) = col1_items
+                .iter()
+                .position(|it| it.text.eq_ignore_ascii_case(first_tok))
+            {
+                sel_idx[0] = pos;
+                active_col = 1;
+            }
+        }
+
+        let pending_second_token = if tokens.len() >= 2 {
+            Some(tokens[1].clone())
+        } else {
+            None
+        };
+
+        let (tw, th) = size().unwrap_or((fallback_w as u16, fallback_h as u16));
+        let term_w = if tw >= 40 { tw as usize } else { fallback_w }.saturating_sub(1);
+        let term_h = if th >= 12 { th as usize } else { fallback_h }.saturating_sub(1);
+
+        Self {
+            col1_items,
+            col2_items: Vec::new(),
+            col3_items: Vec::new(),
+            col1_filtered: Vec::new(),
+            col2_filtered: Vec::new(),
+            col3_filtered: Vec::new(),
+            col1_filter_dirty: true,
+            col2_filter_dirty: true,
+            col3_filter_dirty: true,
+            cli_cache,
+            cli_cache_dirty: false,
+            req_tx,
+            active_col,
+            filters: [String::new(), String::new(), String::new()],
+            sel_idx,
+            scroll_idx: [0, 0, 0],
+            tokens,
+            pending_second_token,
+            last_c1_key: String::new(),
+            last_c2_key: String::new(),
+            last_active_param_key: String::new(),
+            active_param_set_label: None,
+            term_w,
+            term_h,
+            dirty: true,
+        }
+    }
+
+    fn handle_bg_response(&mut self, resp: BgResponse) {
+        let cur_c1_text = self
+            .col1_filtered
+            .get(self.sel_idx[0])
+            .and_then(|f| self.col1_items.get(f.item_idx))
+            .map(|c| c.text.to_ascii_lowercase())
+            .unwrap_or_default();
+        let cur_c2_text = self
+            .col2_filtered
+            .get(self.sel_idx[1])
+            .and_then(|f| self.col2_items.get(f.item_idx))
+            .map(|c| c.text.to_ascii_lowercase())
+            .unwrap_or_default();
+        let cur_sub_key = format!("{cur_c1_text}::{cur_c2_text}");
+
+        let affects_current_view = resp.cache_key == cur_c1_text || resp.cache_key == cur_sub_key;
+
+        self.cli_cache.insert(resp.cache_key, resp.items);
+        self.cli_cache_dirty = true;
+
+        if affects_current_view {
+            self.last_c1_key.clear();
+            self.last_c2_key.clear();
+            self.last_active_param_key.clear();
+            self.dirty = true;
+        }
+    }
+
+    fn sync_columns(&mut self) {
+        if self.col1_filter_dirty {
+            self.col1_filtered = filter_items(&self.col1_items, &self.filters[0]);
+            self.col1_filter_dirty = false;
+        }
+        if self.sel_idx[0] >= self.col1_filtered.len() {
+            self.sel_idx[0] = self.col1_filtered.len().saturating_sub(1);
+        }
+        let cur_c1_idx = self.col1_filtered.get(self.sel_idx[0]).map(|f| f.item_idx);
+        let cur_c1 = cur_c1_idx.map(|idx| &self.col1_items[idx]);
+        let cur_c1_key = cur_c1.map(|c| c.label.as_str()).unwrap_or("");
+
+        let active_param_sets = compute_active_parameter_sets(cur_c1, &self.tokens);
+        let active_param_key = active_param_sets
+            .as_ref()
+            .map(|s| {
+                let mut v: Vec<_> = s.iter().cloned().collect();
+                v.sort();
+                v.join(",")
+            })
+            .unwrap_or_default();
+
+        if cur_c1_key != self.last_c1_key || active_param_key != self.last_active_param_key {
+            self.col2_items = resolve_col2_items(
+                cur_c1,
+                active_param_sets.as_ref(),
+                &self.cli_cache,
+                &self.req_tx,
+            );
+            self.col2_filter_dirty = true;
+            self.sel_idx[1] = 0;
+            self.scroll_idx[1] = 0;
+            self.last_c1_key.clear();
+            self.last_c1_key.push_str(cur_c1_key);
+            self.last_active_param_key = active_param_key;
+            self.active_param_set_label = active_param_sets.as_ref().map(|s| {
+                let mut v: Vec<_> = s.iter().cloned().collect();
+                v.sort();
+                v.join(", ")
+            });
+            self.last_c2_key.clear();
+        }
+
+        if let Some(ref tok2) = self.pending_second_token {
+            if !self.col2_items.is_empty() && self.col2_items[0].kind != ItemKind::Loading {
+                if let Some(pos) = self
+                    .col2_items
+                    .iter()
+                    .position(|it| it.text.eq_ignore_ascii_case(tok2))
+                {
+                    self.sel_idx[1] = pos;
+                    self.active_col = 2;
+                }
+                self.pending_second_token = None;
+            }
+        }
+
+        if self.col2_filter_dirty {
+            self.col2_filtered = filter_items(&self.col2_items, &self.filters[1]);
+            self.col2_filter_dirty = false;
+        }
+        if self.sel_idx[1] >= self.col2_filtered.len() {
+            self.sel_idx[1] = self.col2_filtered.len().saturating_sub(1);
+        }
+        let cur_c2_idx = self.col2_filtered.get(self.sel_idx[1]).map(|f| f.item_idx);
+        let cur_c1 = cur_c1_idx.map(|idx| &self.col1_items[idx]);
+        let cur_c2 = cur_c2_idx.map(|idx| &self.col2_items[idx]);
+
+        let cur_c2_key = format!(
+            "{}::{}::{}",
+            self.last_c1_key,
+            cur_c2.map(|c| c.label.as_str()).unwrap_or(""),
+            self.filters[2]
+        );
+        if cur_c2_key != self.last_c2_key {
+            self.col3_items = resolve_col3_items(
+                cur_c1,
+                cur_c2,
+                &self.cli_cache,
+                &self.req_tx,
+                &self.filters[2],
+            );
+            self.col3_filter_dirty = true;
+            self.sel_idx[2] = 0;
+            self.scroll_idx[2] = 0;
+            self.last_c2_key = cur_c2_key;
+        }
+
+        if self.col3_filter_dirty {
+            self.col3_filtered = filter_items(&self.col3_items, &self.filters[2]);
+            self.col3_filter_dirty = false;
+        }
+        if self.sel_idx[2] >= self.col3_filtered.len() {
+            self.sel_idx[2] = self.col3_filtered.len().saturating_sub(1);
+        }
+    }
+
+    fn render(&mut self) -> String {
+        self.sync_columns();
+
+        let list_rows = self.term_h.saturating_sub(6).max(4);
+        for c in 0..3 {
+            let max_r = if c == 2 {
+                list_rows.saturating_sub(3).max(1)
+            } else {
+                list_rows
+            };
+            if self.sel_idx[c] < self.scroll_idx[c] {
+                self.scroll_idx[c] = self.sel_idx[c];
+            }
+            if self.sel_idx[c] >= self.scroll_idx[c] + max_r {
+                self.scroll_idx[c] = self.sel_idx[c] + 1 - max_r;
+            }
+        }
+
+        let cur_c1 = self
+            .col1_filtered
+            .get(self.sel_idx[0])
+            .map(|f| &self.col1_items[f.item_idx]);
+        let cur_c2 = self
+            .col2_filtered
+            .get(self.sel_idx[1])
+            .map(|f| &self.col2_items[f.item_idx]);
+        let cur_c3 = self
+            .col3_filtered
+            .get(self.sel_idx[2])
+            .map(|f| &self.col3_items[f.item_idx]);
+
+        let cmd_preview = build_preview_command(
+            &self.tokens,
+            self.active_col,
+            cur_c1,
+            cur_c2,
+            cur_c3,
+            &self.filters[2],
+        );
+
+        let info_item = if self.active_col == 2 {
+            cur_c3.or(cur_c2).or(cur_c1)
+        } else if self.active_col == 1 {
+            cur_c2.or(cur_c1)
+        } else {
+            cur_c1
+        };
+
+        let info_title = info_item
+            .map(|it| format!(" ℹ {} {}", it.label, it.kind.badge()))
+            .unwrap_or_else(|| " ℹ No selection".to_string());
+        let info_desc = info_item
+            .map(|it| format!("   {}", it.desc))
+            .unwrap_or_default();
+
+        let frame = render_frame(&RenderState {
+            term_w: self.term_w,
+            term_h: self.term_h,
+            active_col: self.active_col,
+            filters: &self.filters,
+            sel_idx: &self.sel_idx,
+            scroll_idx: &self.scroll_idx,
+            col1_items: &self.col1_items,
+            col1_filtered: &self.col1_filtered,
+            col2_items: &self.col2_items,
+            col2_filtered: &self.col2_filtered,
+            col3_items: &self.col3_items,
+            col3_filtered: &self.col3_filtered,
+            cmd_preview: &cmd_preview,
+            info_title: &info_title,
+            info_desc: &info_desc,
+            active_param_set: self.active_param_set_label.as_deref(),
+        });
+
+        self.dirty = false;
+        frame
+    }
+
+    fn handle_event(&mut self, ev: Event) -> LoopAction {
+        match ev {
+            Event::Resize(w, h) => {
+                if w >= 40 {
+                    self.term_w = (w as usize).saturating_sub(1);
+                }
+                if h >= 12 {
+                    self.term_h = (h as usize).saturating_sub(1);
+                }
+                self.dirty = true;
+            }
+            Event::Key(key) => {
+                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                    return LoopAction::Continue;
+                }
+
+                // Ensure cached column views are fresh if an earlier coalesced event mutated filters
+                if self.col1_filter_dirty || self.col2_filter_dirty || self.col3_filter_dirty {
+                    self.sync_columns();
+                }
+
+                let cur_c1 = self
+                    .col1_filtered
+                    .get(self.sel_idx[0])
+                    .map(|f| &self.col1_items[f.item_idx]);
+                let cur_c2 = self
+                    .col2_filtered
+                    .get(self.sel_idx[1])
+                    .map(|f| &self.col2_items[f.item_idx]);
+                let cur_c3 = self
+                    .col3_filtered
+                    .get(self.sel_idx[2])
+                    .map(|f| &self.col3_items[f.item_idx]);
+
+                let cur_len = match self.active_col {
+                    0 => self.col1_filtered.len(),
+                    1 => self.col2_filtered.len(),
+                    _ => self.col3_filtered.len(),
+                };
+
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                        return LoopAction::Exit(None);
+                    }
+                    (KeyCode::Enter, _) => {
+                        let cmd = build_preview_command(
+                            &self.tokens,
+                            self.active_col,
+                            cur_c1,
+                            cur_c2,
+                            cur_c3,
+                            &self.filters[2],
+                        );
+                        return LoopAction::Exit(Some(cmd));
+                    }
+                    (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
+                        let _ = sync_powershell_metadata();
+                        self.col1_items = load_col1_commands();
+                        self.col1_filter_dirty = true;
+                        self.last_c1_key.clear();
+                        self.last_c2_key.clear();
+                        self.last_active_param_key.clear();
+                        self.dirty = true;
+                    }
+                    (KeyCode::Up, _) => {
+                        if cur_len > 0 {
+                            self.sel_idx[self.active_col] = if self.sel_idx[self.active_col] > 0 {
+                                self.sel_idx[self.active_col] - 1
+                            } else {
+                                cur_len - 1
+                            };
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::Down, _) => {
+                        if cur_len > 0 {
+                            self.sel_idx[self.active_col] =
+                                if self.sel_idx[self.active_col] + 1 < cur_len {
+                                    self.sel_idx[self.active_col] + 1
+                                } else {
+                                    0
+                                };
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::PageUp, _) => {
+                        if cur_len > 0 {
+                            self.sel_idx[self.active_col] =
+                                self.sel_idx[self.active_col].saturating_sub(12);
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::PageDown, _) => {
+                        if cur_len > 0 {
+                            self.sel_idx[self.active_col] =
+                                (self.sel_idx[self.active_col] + 12).min(cur_len - 1);
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::Home, _) => {
+                        self.sel_idx[self.active_col] = 0;
+                        self.dirty = true;
+                    }
+                    (KeyCode::End, _) => {
+                        if cur_len > 0 {
+                            self.sel_idx[self.active_col] = cur_len - 1;
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::Right, _) => {
+                        if self.active_col == 0 {
+                            if let Some(c1) = cur_c1 {
+                                if !matches!(c1.kind, ItemKind::Env | ItemKind::Var) {
+                                    if self.tokens.is_empty() {
+                                        self.tokens.push(c1.text.clone());
+                                    } else {
+                                        self.tokens[0] = c1.text.clone();
+                                    }
+                                }
+                                self.active_col = 1;
+                                self.dirty = true;
+                            }
+                        } else if self.active_col == 1 {
+                            if let Some(c2) = cur_c2 {
+                                if let Some(c1) = cur_c1 {
+                                    if !matches!(c1.kind, ItemKind::Env | ItemKind::Var)
+                                        && self.tokens.is_empty()
+                                    {
+                                        self.tokens.push(c1.text.clone());
+                                    }
+                                }
+                                if c2.kind != ItemKind::Loading
+                                    && !c2.text.is_empty()
+                                    && self.tokens.last().map(|s| s.as_str())
+                                        != Some(c2.text.as_str())
+                                {
+                                    self.tokens.push(c2.text.clone());
+                                }
+                                self.active_col = 2;
+                                self.dirty = true;
+                            }
+                        }
+                    }
+                    (KeyCode::Left, _) => {
+                        if self.active_col > 0 {
+                            self.active_col -= 1;
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::Tab, _) => {
+                        if self.active_col == 0 {
+                            if let Some(c1) = cur_c1 {
+                                if !matches!(c1.kind, ItemKind::Env | ItemKind::Var) {
+                                    if self.tokens.is_empty() {
+                                        self.tokens.push(c1.text.clone());
+                                    } else {
+                                        self.tokens[0] = c1.text.clone();
+                                    }
+                                }
+                                if !self.filters[0].is_empty() {
+                                    self.filters[0].clear();
+                                    self.col1_filter_dirty = true;
+                                }
+                                self.active_col = 1;
+                                self.dirty = true;
+                            }
+                        } else if self.active_col == 1 {
+                            if let Some(c2) = cur_c2 {
+                                if let Some(c1) = cur_c1 {
+                                    if !matches!(c1.kind, ItemKind::Env | ItemKind::Var)
+                                        && self.tokens.is_empty()
+                                    {
+                                        self.tokens.push(c1.text.clone());
+                                    }
+                                }
+                                if c2.kind != ItemKind::Loading && !c2.text.is_empty() {
+                                    if c2.kind == ItemKind::Switch
+                                        || (c2.kind == ItemKind::Flag && c2.children.is_empty())
+                                    {
+                                        self.tokens.push(c2.text.clone());
+                                        if !self.filters[1].is_empty() {
+                                            self.filters[1].clear();
+                                            self.col2_filter_dirty = true;
+                                        }
+                                        self.sel_idx[1] = 0;
+                                        self.dirty = true;
+                                    } else {
+                                        if self.tokens.last().map(|s| s.as_str())
+                                            != Some(c2.text.as_str())
+                                        {
+                                            self.tokens.push(c2.text.clone());
+                                        }
+                                        self.active_col = 2;
+                                        self.sel_idx[2] = 0;
+                                        self.dirty = true;
+                                    }
+                                }
+                            }
+                        } else if self.active_col == 2 {
+                            let val_to_add = if let Some(c3) = cur_c3 {
+                                if !c3.text.is_empty() {
+                                    Some(c3.text.clone())
+                                } else if !self.filters[2].trim().is_empty() {
+                                    Some(self.filters[2].trim().to_string())
+                                } else {
+                                    None
+                                }
+                            } else if !self.filters[2].trim().is_empty() {
+                                Some(self.filters[2].trim().to_string())
+                            } else {
+                                None
+                            };
+
+                            if let Some(val) = val_to_add {
+                                if let Some(c1) = cur_c1 {
+                                    if !matches!(c1.kind, ItemKind::Env | ItemKind::Var)
+                                        && self.tokens.is_empty()
+                                    {
+                                        self.tokens.push(c1.text.clone());
+                                    }
+                                }
+                                if let Some(c2) = cur_c2 {
+                                    if c2.kind != ItemKind::Loading
+                                        && !c2.text.is_empty()
+                                        && self.tokens.last().map(|s| s.as_str())
+                                            != Some(c2.text.as_str())
+                                    {
+                                        self.tokens.push(c2.text.clone());
+                                    }
+                                }
+                                self.tokens.push(val);
+                                if !self.filters[2].is_empty() {
+                                    self.filters[2].clear();
+                                    self.col3_filter_dirty = true;
+                                }
+                                if !self.filters[1].is_empty() {
+                                    self.filters[1].clear();
+                                    self.col2_filter_dirty = true;
+                                }
+                                self.active_col = 1;
+                                self.sel_idx[1] = 0;
+                                self.dirty = true;
+                            }
+                        }
+                    }
+                    (KeyCode::Backspace, _) => {
+                        if !self.filters[self.active_col].is_empty() {
+                            self.filters[self.active_col].pop();
+                            match self.active_col {
+                                0 => self.col1_filter_dirty = true,
+                                1 => self.col2_filter_dirty = true,
+                                _ => self.col3_filter_dirty = true,
+                            }
+                            self.sel_idx[self.active_col] = 0;
+                            self.dirty = true;
+                        } else if !self.tokens.is_empty() {
+                            self.tokens.pop();
+                            self.dirty = true;
+                        }
+                    }
+                    (KeyCode::Char(ch), mods)
+                        if !mods.contains(KeyModifiers::CONTROL)
+                            && !mods.contains(KeyModifiers::ALT) =>
+                    {
+                        self.filters[self.active_col].push(ch);
+                        match self.active_col {
+                            0 => self.col1_filter_dirty = true,
+                            1 => self.col2_filter_dirty = true,
+                            _ => self.col3_filter_dirty = true,
+                        }
+                        self.sel_idx[self.active_col] = 0;
+                        self.dirty = true;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        LoopAction::Continue
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
@@ -354,8 +955,23 @@ fn main() -> anyhow::Result<()> {
         if args.iter().any(|a| a == "--warm") {
             let mut cache = load_cli_disk_cache();
             let top_tools = [
-                "git", "prek", "zoxide", "winget", "uv", "uvx", "cargo", "rustc", "adb", "fd",
-                "rg", "lsd", "fzf", "starship", "scoop", "tailscale", "caddy",
+                "git",
+                "prek",
+                "zoxide",
+                "winget",
+                "uv",
+                "uvx",
+                "cargo",
+                "rustc",
+                "adb",
+                "fd",
+                "rg",
+                "lsd",
+                "fzf",
+                "starship",
+                "scoop",
+                "tailscale",
+                "caddy",
             ];
             let results: Vec<(String, Vec<MillerItem>)> = top_tools
                 .par_iter()
@@ -370,7 +986,10 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             save_cli_disk_cache(&cache);
-            eprintln!("Pre-warmed CLI cache for {} priority tools.", top_tools.len());
+            eprintln!(
+                "Pre-warmed CLI cache for {} priority tools.",
+                top_tools.len()
+            );
         }
         return Ok(());
     }
@@ -423,446 +1042,57 @@ fn main() -> anyhow::Result<()> {
 
     ensure_ps_metadata_async();
 
-    let mut col1_items = load_col1_commands();
-    let mut cli_cache = load_cli_disk_cache();
+    let col1_items = load_col1_commands();
+    let cli_cache = load_cli_disk_cache();
     let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
     let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
     spawn_background_worker(req_rx, res_tx);
 
-    let mut active_col: usize = 0;
-    let mut filters: [String; 3] = [String::new(), String::new(), String::new()];
-    let mut sel_idx: [usize; 3] = [0, 0, 0];
-    let mut scroll_idx: [usize; 3] = [0, 0, 0];
+    let mut state = TuiState::new(
+        col1_items,
+        cli_cache,
+        req_tx,
+        &initial_buffer,
+        fallback_w,
+        fallback_h,
+    );
+    let mut guard = TerminalGuard::enter()?;
+    let accepted: Option<String>;
 
-    let mut tokens: Vec<String> = initial_buffer
-        .split_whitespace()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect();
-
-    if let Some(first_tok) = tokens.first() {
-        if let Some(pos) = col1_items
-            .iter()
-            .position(|it| it.text.eq_ignore_ascii_case(first_tok))
-        {
-            sel_idx[0] = pos;
-            active_col = 1;
-        }
-    }
-
-    let mut pending_second_token = if tokens.len() >= 2 {
-        Some(tokens[1].clone())
-    } else {
-        None
-    };
-
-    let guard = TerminalGuard::enter()?;
-    let mut accepted: Option<String> = None;
-
-    let mut last_c1_key = String::new();
-    let mut last_c2_key = String::new();
-    let mut last_active_param_key = String::new();
-    let mut col2_items: Vec<MillerItem> = Vec::new();
-    let mut col3_items: Vec<MillerItem> = Vec::new();
-    let mut dirty = true;
-
-    loop {
+    'main_loop: loop {
         // 1. Drain any completed background CLI introspection responses
-        let mut cache_updated = false;
         while let Ok(resp) = res_rx.try_recv() {
-            cli_cache.insert(resp.cache_key, resp.items);
-            cache_updated = true;
-            dirty = true;
-        }
-        if cache_updated {
-            save_cli_disk_cache(&cli_cache);
-            last_c1_key.clear();
-            last_c2_key.clear();
-            last_active_param_key.clear();
+            state.handle_bg_response(resp);
         }
 
         // 2. Recompute filtered views and draw frame when state changed
-        if dirty {
-            let (tw, th) = size().unwrap_or((fallback_w as u16, fallback_h as u16));
-            let term_w = if tw >= 40 { tw as usize } else { fallback_w }.saturating_sub(1);
-            let term_h = if th >= 12 { th as usize } else { fallback_h }.saturating_sub(1);
-            let list_rows = term_h.saturating_sub(6).max(4);
-
-            let col1_filtered: Vec<FilteredItem> = filter_items(&col1_items, &filters[0]);
-            if sel_idx[0] >= col1_filtered.len() {
-                sel_idx[0] = col1_filtered.len().saturating_sub(1);
-            }
-            let cur_c1 = col1_filtered
-                .get(sel_idx[0])
-                .map(|f| &col1_items[f.item_idx]);
-
-            let cur_c1_key = cur_c1.map(|c| c.label.clone()).unwrap_or_default();
-
-            // Compute active parameter sets from tokens and cur_c1
-            let active_param_sets = compute_active_parameter_sets(cur_c1, &tokens);
-            let active_param_key = active_param_sets.as_ref().map(|s| {
-                let mut v: Vec<_> = s.iter().cloned().collect();
-                v.sort();
-                v.join(",")
-            }).unwrap_or_default();
-
-            if cur_c1_key != last_c1_key || active_param_key != last_active_param_key {
-                col2_items = resolve_col2_items(cur_c1, active_param_sets.as_ref(), &cli_cache, &req_tx);
-                sel_idx[1] = 0;
-                scroll_idx[1] = 0;
-                last_c1_key = cur_c1_key;
-                last_active_param_key = active_param_key;
-                last_c2_key.clear();
-            }
-
-            if let Some(ref tok2) = pending_second_token {
-                if !col2_items.is_empty() && col2_items[0].kind != ItemKind::Loading {
-                    if let Some(pos) = col2_items
-                        .iter()
-                        .position(|it| it.text.eq_ignore_ascii_case(tok2))
-                    {
-                        sel_idx[1] = pos;
-                        active_col = 2;
-                    }
-                    pending_second_token = None;
-                }
-            }
-
-            let col2_filtered: Vec<FilteredItem> = filter_items(&col2_items, &filters[1]);
-            if sel_idx[1] >= col2_filtered.len() {
-                sel_idx[1] = col2_filtered.len().saturating_sub(1);
-            }
-            let cur_c2 = col2_filtered
-                .get(sel_idx[1])
-                .map(|f| &col2_items[f.item_idx]);
-
-            let cur_c2_key = format!(
-                "{}::{}::{}",
-                last_c1_key,
-                cur_c2.map(|c| c.label.as_str()).unwrap_or(""),
-                filters[2]
-            );
-            if cur_c2_key != last_c2_key {
-                col3_items = resolve_col3_items(cur_c1, cur_c2, &cli_cache, &req_tx, &filters[2]);
-                sel_idx[2] = 0;
-                scroll_idx[2] = 0;
-                last_c2_key = cur_c2_key;
-            }
-
-            let col3_filtered: Vec<FilteredItem> = filter_items(&col3_items, &filters[2]);
-            if sel_idx[2] >= col3_filtered.len() {
-                sel_idx[2] = col3_filtered.len().saturating_sub(1);
-            }
-            let cur_c3 = col3_filtered
-                .get(sel_idx[2])
-                .map(|f| &col3_items[f.item_idx]);
-
-            for c in 0..3 {
-                let max_r = if c == 2 {
-                    list_rows.saturating_sub(3).max(1)
-                } else {
-                    list_rows
-                };
-                if sel_idx[c] < scroll_idx[c] {
-                    scroll_idx[c] = sel_idx[c];
-                }
-                if sel_idx[c] >= scroll_idx[c] + max_r {
-                    scroll_idx[c] = sel_idx[c] + 1 - max_r;
-                }
-            }
-
-            let cmd_preview = build_preview_command(&tokens, active_col, cur_c1, cur_c2, cur_c3, &filters[2]);
-
-            let active_param_set_label = active_param_sets.as_ref().map(|s| {
-                let mut v: Vec<_> = s.iter().cloned().collect();
-                v.sort();
-                v.join(", ")
-            });
-
-            let info_item = if active_col == 2 {
-                cur_c3.or(cur_c2).or(cur_c1)
-            } else if active_col == 1 {
-                cur_c2.or(cur_c1)
-            } else {
-                cur_c1
-            };
-
-            let info_title = info_item
-                .map(|it| format!(" ℹ {} {}", it.label, it.kind.badge()))
-                .unwrap_or_else(|| " ℹ No selection".to_string());
-            let info_desc = info_item
-                .map(|it| format!("   {}", it.desc))
-                .unwrap_or_default();
-
-            let frame = render_frame(&RenderState {
-                term_w,
-                term_h,
-                active_col,
-                filters: &filters,
-                sel_idx: &sel_idx,
-                scroll_idx: &scroll_idx,
-                col1_items: &col1_items,
-                col1_filtered: &col1_filtered,
-                col2_items: &col2_items,
-                col2_filtered: &col2_filtered,
-                col3_items: &col3_items,
-                col3_filtered: &col3_filtered,
-                cmd_preview: &cmd_preview,
-                info_title: &info_title,
-                info_desc: &info_desc,
-                active_param_set: active_param_set_label.as_deref(),
-            });
-
+        if state.dirty {
+            let frame = state.render();
             guard.conout.write_str(&frame);
-            dirty = false;
         }
 
-        // 3. Poll for keyboard / resize events
-        if !event::poll(Duration::from_millis(25))? {
+        // 3. Poll for keyboard / resize events, then drain any queued burst events before rendering
+        if !event::poll(Duration::from_millis(16))? {
             continue;
         }
 
-        match event::read()? {
-            Event::Resize(w, h) => {
-                if w >= 40 {
-                    fallback_w = w as usize;
-                }
-                if h >= 12 {
-                    fallback_h = h as usize;
-                }
-                dirty = true;
+        loop {
+            let ev = event::read()?;
+            if let LoopAction::Exit(cmd) = state.handle_event(ev) {
+                accepted = cmd;
+                break 'main_loop;
             }
-            Event::Key(key) => {
-                if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
-                }
-
-                let col1_filtered = filter_items(&col1_items, &filters[0]);
-                let col2_filtered = filter_items(&col2_items, &filters[1]);
-                let col3_filtered = filter_items(&col3_items, &filters[2]);
-
-                let cur_c1 = col1_filtered
-                    .get(sel_idx[0])
-                    .map(|f| &col1_items[f.item_idx]);
-                let cur_c2 = col2_filtered
-                    .get(sel_idx[1])
-                    .map(|f| &col2_items[f.item_idx]);
-                let cur_c3 = col3_filtered
-                    .get(sel_idx[2])
-                    .map(|f| &col3_items[f.item_idx]);
-
-                let cur_len = match active_col {
-                    0 => col1_filtered.len(),
-                    1 => col2_filtered.len(),
-                    _ => col3_filtered.len(),
-                };
-
-                match (key.code, key.modifiers) {
-                    (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        break;
-                    }
-                    (KeyCode::Enter, _) => {
-                        accepted = Some(build_preview_command(
-                            &tokens, active_col, cur_c1, cur_c2, cur_c3, &filters[2],
-                        ));
-                        break;
-                    }
-                    (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
-                        let _ = sync_powershell_metadata();
-                        col1_items = load_col1_commands();
-                        last_c1_key.clear();
-                        last_c2_key.clear();
-                        last_active_param_key.clear();
-                        dirty = true;
-                    }
-                    (KeyCode::Up, _) => {
-                        if cur_len > 0 {
-                            sel_idx[active_col] = if sel_idx[active_col] > 0 {
-                                sel_idx[active_col] - 1
-                            } else {
-                                cur_len - 1
-                            };
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::Down, _) => {
-                        if cur_len > 0 {
-                            sel_idx[active_col] = if sel_idx[active_col] + 1 < cur_len {
-                                sel_idx[active_col] + 1
-                            } else {
-                                0
-                            };
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::PageUp, _) => {
-                        if cur_len > 0 {
-                            sel_idx[active_col] = sel_idx[active_col].saturating_sub(12);
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::PageDown, _) => {
-                        if cur_len > 0 {
-                            sel_idx[active_col] = (sel_idx[active_col] + 12).min(cur_len - 1);
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::Home, _) => {
-                        sel_idx[active_col] = 0;
-                        dirty = true;
-                    }
-                    (KeyCode::End, _) => {
-                        if cur_len > 0 {
-                            sel_idx[active_col] = cur_len - 1;
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::Right, _) => {
-                        if active_col == 0 {
-                            if let Some(c1) = cur_c1 {
-                                if !matches!(c1.kind, ItemKind::Env | ItemKind::Var) {
-                                    if tokens.is_empty() {
-                                        tokens.push(c1.text.clone());
-                                    } else {
-                                        tokens[0] = c1.text.clone();
-                                    }
-                                }
-                                active_col = 1;
-                                dirty = true;
-                            }
-                        } else if active_col == 1 {
-                            if let Some(c2) = cur_c2 {
-                                if let Some(c1) = cur_c1 {
-                                    if !matches!(c1.kind, ItemKind::Env | ItemKind::Var)
-                                        && tokens.is_empty()
-                                    {
-                                        tokens.push(c1.text.clone());
-                                    }
-                                }
-                                if c2.kind != ItemKind::Loading
-                                    && !c2.text.is_empty()
-                                    && tokens.last().map(|s| s.as_str()) != Some(c2.text.as_str())
-                                {
-                                    tokens.push(c2.text.clone());
-                                }
-                                active_col = 2;
-                                dirty = true;
-                            }
-                        }
-                    }
-                    (KeyCode::Left, _) => {
-                        if active_col > 0 {
-                            active_col -= 1;
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::Tab, _) => {
-                        if active_col == 0 {
-                            if let Some(c1) = cur_c1 {
-                                if !matches!(c1.kind, ItemKind::Env | ItemKind::Var) {
-                                    if tokens.is_empty() {
-                                        tokens.push(c1.text.clone());
-                                    } else {
-                                        tokens[0] = c1.text.clone();
-                                    }
-                                }
-                                filters[0].clear();
-                                active_col = 1;
-                                dirty = true;
-                            }
-                        } else if active_col == 1 {
-                            if let Some(c2) = cur_c2 {
-                                if let Some(c1) = cur_c1 {
-                                    if !matches!(c1.kind, ItemKind::Env | ItemKind::Var)
-                                        && tokens.is_empty()
-                                    {
-                                        tokens.push(c1.text.clone());
-                                    }
-                                }
-                                if c2.kind != ItemKind::Loading && !c2.text.is_empty() {
-                                    if c2.kind == ItemKind::Switch
-                                        || (c2.kind == ItemKind::Flag && c2.children.is_empty())
-                                    {
-                                        tokens.push(c2.text.clone());
-                                        filters[1].clear();
-                                        sel_idx[1] = 0;
-                                        dirty = true;
-                                    } else {
-                                        if tokens.last().map(|s| s.as_str()) != Some(c2.text.as_str()) {
-                                            tokens.push(c2.text.clone());
-                                        }
-                                        active_col = 2;
-                                        sel_idx[2] = 0;
-                                        dirty = true;
-                                    }
-                                }
-                            }
-                        } else if active_col == 2 {
-                            let val_to_add = if let Some(c3) = cur_c3 {
-                                if !c3.text.is_empty() {
-                                    Some(c3.text.clone())
-                                } else if !filters[2].trim().is_empty() {
-                                    Some(filters[2].trim().to_string())
-                                } else {
-                                    None
-                                }
-                            } else if !filters[2].trim().is_empty() {
-                                Some(filters[2].trim().to_string())
-                            } else {
-                                None
-                            };
-
-                            if let Some(val) = val_to_add {
-                                if let Some(c1) = cur_c1 {
-                                    if !matches!(c1.kind, ItemKind::Env | ItemKind::Var)
-                                        && tokens.is_empty()
-                                    {
-                                        tokens.push(c1.text.clone());
-                                    }
-                                }
-                                if let Some(c2) = cur_c2 {
-                                    if c2.kind != ItemKind::Loading && !c2.text.is_empty() {
-                                        if tokens.last().map(|s| s.as_str()) != Some(c2.text.as_str()) {
-                                            tokens.push(c2.text.clone());
-                                        }
-                                    }
-                                }
-                                tokens.push(val);
-                                filters[2].clear();
-                                filters[1].clear();
-                                active_col = 1;
-                                sel_idx[1] = 0;
-                                dirty = true;
-                            }
-                        }
-                    }
-                    (KeyCode::Backspace, _) => {
-                        if !filters[active_col].is_empty() {
-                            filters[active_col].pop();
-                            sel_idx[active_col] = 0;
-                            dirty = true;
-                        } else if !tokens.is_empty() {
-                            tokens.pop();
-                            dirty = true;
-                        }
-                    }
-                    (KeyCode::Char(ch), mods) => {
-                        if !mods.contains(KeyModifiers::CONTROL)
-                            && !mods.contains(KeyModifiers::ALT)
-                        {
-                            filters[active_col].push(ch);
-                            sel_idx[active_col] = 0;
-                            dirty = true;
-                        }
-                    }
-                    _ => {}
-                }
+            if !event::poll(Duration::ZERO)? {
+                break;
             }
-            _ => {}
         }
     }
 
     drop(guard);
+
+    if state.cli_cache_dirty {
+        save_cli_disk_cache(&state.cli_cache);
+    }
 
     if let Some(cmd) = accepted {
         let trimmed = cmd.trim();
@@ -884,15 +1114,21 @@ mod tests {
 
     #[test]
     fn test_parameter_set_exclusivity_filtering() {
-        let mut get_process = MillerItem::new("Get-Process", "Get-Process", ItemKind::Cmdlet, "Gets running processes");
-        
+        let mut get_process = MillerItem::new(
+            "Get-Process",
+            "Get-Process",
+            ItemKind::Cmdlet,
+            "Gets running processes",
+        );
+
         let mut id_param = MillerItem::new("-Id", "-Id", ItemKind::Param, "Process IDs");
         id_param.parameter_sets = vec!["Id".to_string(), "IdWithUserName".to_string()];
 
         let mut name_param = MillerItem::new("-Name", "-Name", ItemKind::Param, "Process Name");
         name_param.parameter_sets = vec!["Name".to_string(), "NameWithUserName".to_string()];
 
-        let mut verbose_param = MillerItem::new("-Verbose", "-Verbose", ItemKind::Switch, "Verbose output");
+        let mut verbose_param =
+            MillerItem::new("-Verbose", "-Verbose", ItemKind::Switch, "Verbose output");
         verbose_param.parameter_sets = vec!["__AllParameterSets".to_string()];
 
         get_process.children = vec![id_param, name_param, verbose_param];
@@ -908,8 +1144,13 @@ mod tests {
         assert_eq!(res_all.len(), 3);
 
         // Case 2: User picked "-Id" -> active sets should be {"Id", "IdWithUserName"}
-        let tokens_with_id = vec!["Get-Process".to_string(), "-Id".to_string(), "1234".to_string()];
-        let sets_id = compute_active_parameter_sets(Some(&get_process), &tokens_with_id).expect("Should compute active sets");
+        let tokens_with_id = vec![
+            "Get-Process".to_string(),
+            "-Id".to_string(),
+            "1234".to_string(),
+        ];
+        let sets_id = compute_active_parameter_sets(Some(&get_process), &tokens_with_id)
+            .expect("Should compute active sets");
         assert!(sets_id.contains("Id"));
         assert!(sets_id.contains("IdWithUserName"));
         assert!(!sets_id.contains("Name"));
@@ -919,7 +1160,10 @@ mod tests {
         let param_names: Vec<&str> = res_filtered.iter().map(|p| p.text.as_str()).collect();
         assert!(param_names.contains(&"-Id"));
         assert!(param_names.contains(&"-Verbose"));
-        assert!(!param_names.contains(&"-Name"), "-Name is incompatible with ParameterSet Id and must be filtered out");
+        assert!(
+            !param_names.contains(&"-Name"),
+            "-Name is incompatible with ParameterSet Id and must be filtered out"
+        );
     }
 
     #[test]
@@ -932,7 +1176,7 @@ mod tests {
         // When user types custom URL in Column 3
         let custom_url = "https://github.com/user/my-repo";
         let col3_items = resolve_col3_items(Some(&col1), Some(&col2), &cache, &req_tx, custom_url);
-        
+
         assert!(!col3_items.is_empty());
         assert_eq!(col3_items[0].text, custom_url);
         assert!(col3_items[0].label.contains(custom_url));
@@ -940,7 +1184,103 @@ mod tests {
 
         // When building preview command, the custom value is interpolated
         let tokens = vec!["git".to_string(), "clone".to_string()];
-        let preview = build_preview_command(&tokens, 2, Some(&col1), Some(&col2), Some(&col3_items[0]), custom_url);
+        let preview = build_preview_command(
+            &tokens,
+            2,
+            Some(&col1),
+            Some(&col2),
+            Some(&col3_items[0]),
+            custom_url,
+        );
         assert_eq!(preview, "git clone https://github.com/user/my-repo");
+    }
+
+    #[test]
+    fn test_tui_stutter_feedback_loop() {
+        use std::time::Instant;
+
+        // Deterministic minimal synthetic dataset matching real scale (5,000 commands, 15 params each)
+        let col1_items: Vec<MillerItem> = (0..5000)
+            .map(|i| {
+                let name = format!("Get-SyntheticResourceItem{i:04}");
+                let desc = format!(
+                    "Retrieves and manages synthetic resource item number {i} from the system provider module"
+                );
+                let mut item = MillerItem::new(&name, &name, ItemKind::Cmdlet, desc);
+                item.children = (0..15)
+                    .map(|p| {
+                        let p_name = format!("-Parameter{p}");
+                        MillerItem::new(
+                            &p_name,
+                            format!("{p_name} (-p{p})"),
+                            ItemKind::Param,
+                            format!("[String] Parameter {p_name}"),
+                        )
+                    })
+                    .collect();
+                item
+            })
+            .collect();
+
+        let cli_cache: HashMap<String, Vec<MillerItem>> = HashMap::new();
+        let (req_tx, _req_rx) = mpsc::channel::<BgRequest>();
+        let mut state = TuiState::new(col1_items, cli_cache, req_tx, "", 120, 30);
+        let _ = state.render(); // initial frame
+
+        let mut max_step_ms = 0.0_f64;
+        let mut total_nav_ms = 0.0_f64;
+
+        // Simulate typing "git" character by character + 30 rapid Down presses
+        let mut sim_events: Vec<Option<char>> = vec![
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some('g'),
+            Some('i'),
+            Some('t'),
+        ];
+        sim_events.extend(std::iter::repeat_n(None, 30));
+
+        for ev in sim_events {
+            let step_start = Instant::now();
+
+            let key_code = match ev {
+                Some(ch) => KeyCode::Char(ch),
+                None => KeyCode::Down,
+            };
+            let key_ev = Event::Key(crossterm::event::KeyEvent::new(
+                key_code,
+                KeyModifiers::NONE,
+            ));
+            let _ = state.handle_event(key_ev);
+            if state.dirty {
+                let _frame = state.render();
+            }
+
+            let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+            max_step_ms = max_step_ms.max(step_ms);
+            total_nav_ms += step_ms;
+        }
+
+        // Tight interactive budgets (both debug and release fail by >6x without the fix):
+        let (total_budget_ms, step_budget_ms) = if cfg!(debug_assertions) {
+            (35.0, 5.0)
+        } else {
+            (12.0, 1.5)
+        };
+        assert!(
+            total_nav_ms < total_budget_ms,
+            "Interactive navigation/filtering is too slow: {:.2}ms for 38 steps (budget < {:.1}ms)",
+            total_nav_ms,
+            total_budget_ms
+        );
+        assert!(
+            max_step_ms < step_budget_ms,
+            "Worst-case single interactive step is too slow: {:.2}ms (budget < {:.1}ms)",
+            max_step_ms,
+            step_budget_ms
+        );
     }
 }

@@ -7,77 +7,140 @@ pub struct FilteredItem {
     pub match_positions: Vec<usize>,
 }
 
+/// Zero-allocation case-insensitive ASCII substring search.
+#[inline]
+fn contains_ignore_ascii_case(haystack: &str, needle_lower: &[u8]) -> bool {
+    let n_len = needle_lower.len();
+    if n_len == 0 {
+        return true;
+    }
+    let h_bytes = haystack.as_bytes();
+    if h_bytes.len() < n_len {
+        return false;
+    }
+    let first = needle_lower[0];
+    let max_start = h_bytes.len() - n_len;
+    for i in 0..=max_start {
+        if h_bytes[i].to_ascii_lowercase() == first
+            && h_bytes[i + 1..i + n_len]
+                .iter()
+                .zip(&needle_lower[1..])
+                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Computes fuzzy subsequence match score and matched char indices on `label`,
-/// with fallback to substring match on `desc`.
-pub fn fuzzy_match(label: &str, desc: &str, query: &str) -> Option<(i32, Vec<usize>)> {
-    if query.is_empty() {
+/// with fallback to substring match on `desc`, using pre-lowercased query chars.
+fn fuzzy_match_precomputed(
+    label: &str,
+    desc: &str,
+    q_chars: &[char],
+    q_lower_str: &str,
+) -> Option<(i32, Vec<usize>)> {
+    let q_len = q_chars.len();
+    if q_len == 0 {
         return Some((0, Vec::new()));
     }
 
-    let q_chars: Vec<char> = query.chars().map(|c| c.to_ascii_lowercase()).collect();
-    let l_chars: Vec<char> = label.chars().collect();
-    let l_lower: Vec<char> = l_chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    // 1. Single-pass subsequence match on label with stack-buffered positions (zero heap allocs unless matched)
+    let mut pos_buf = [0usize; 64];
+    let mut pos_overflow: Option<Vec<usize>> = if q_len > 64 {
+        Some(Vec::with_capacity(q_len))
+    } else {
+        None
+    };
 
-    // 1. Try subsequence match on label
-    let mut positions = Vec::with_capacity(q_chars.len());
     let mut q_idx = 0;
     let mut score: i32 = 0;
     let mut prev_match_idx: Option<usize> = None;
+    let mut first_char: char = '\0';
+    let mut prev_orig: char = '\0';
+    let mut label_char_len: usize = 0;
 
-    for (i, &lc) in l_lower.iter().enumerate() {
-        if q_idx < q_chars.len() && lc == q_chars[q_idx] {
-            positions.push(i);
-
-            // Base match score
-            score += 10;
-
-            // Prefix bonus
-            if i == 0 {
-                score += 45;
-            } else if i == 1 && (l_chars[0] == '-' || l_chars[0] == '$') {
-                score += 42;
-            }
-
-            // Consecutive match bonus
-            if let Some(prev) = prev_match_idx {
-                if i == prev + 1 {
-                    score += 28;
-                } else {
-                    // Penalty for gap
-                    let gap = (i - prev - 1) as i32;
-                    score -= gap.min(12);
-                }
-            }
-
-            // Word boundary / CamelCase bonus
-            if i > 0 {
-                let prev_orig = l_chars[i - 1];
-                let cur_orig = l_chars[i];
-                if matches!(prev_orig, '-' | '_' | ':' | '.' | ' ' | '/' | '\\' | '$') {
-                    score += 32;
-                } else if prev_orig.is_ascii_lowercase() && cur_orig.is_ascii_uppercase() {
-                    score += 30;
-                }
-            }
-
-            prev_match_idx = Some(i);
-            q_idx += 1;
+    for (i, cur_orig) in label.chars().enumerate() {
+        if i == 0 {
+            first_char = cur_orig;
         }
+        label_char_len = i + 1;
+
+        if q_idx < q_len {
+            let lc = cur_orig.to_ascii_lowercase();
+            if lc == q_chars[q_idx] {
+                if let Some(ref mut vec) = pos_overflow {
+                    vec.push(i);
+                } else {
+                    pos_buf[q_idx] = i;
+                }
+
+                // Base match score
+                score += 10;
+
+                // Prefix bonus
+                if i == 0 {
+                    score += 45;
+                } else if i == 1 && (first_char == '-' || first_char == '$') {
+                    score += 42;
+                }
+
+                // Consecutive match bonus
+                if let Some(prev) = prev_match_idx {
+                    if i == prev + 1 {
+                        score += 28;
+                    } else {
+                        // Penalty for gap
+                        let gap = (i - prev - 1) as i32;
+                        score -= gap.min(12);
+                    }
+                }
+
+                // Word boundary / CamelCase bonus
+                if i > 0 {
+                    if matches!(prev_orig, '-' | '_' | ':' | '.' | ' ' | '/' | '\\' | '$') {
+                        score += 32;
+                    } else if prev_orig.is_ascii_lowercase() && cur_orig.is_ascii_uppercase() {
+                        score += 30;
+                    }
+                }
+
+                prev_match_idx = Some(i);
+                q_idx += 1;
+            }
+        }
+        prev_orig = cur_orig;
     }
 
-    if q_idx == q_chars.len() {
+    if q_idx == q_len {
         // Shorter labels that match completely get a slight tie-break bonus
-        score += (40_i32 - (l_chars.len() as i32)).max(0);
+        score += (40_i32 - (label_char_len as i32)).max(0);
+        let positions = match pos_overflow {
+            Some(vec) => vec,
+            None => pos_buf[..q_len].to_vec(),
+        };
         return Some((score, positions));
     }
 
-    // 2. Fallback: case-insensitive substring match in description
-    let q_lower = query.to_ascii_lowercase();
-    if desc.to_ascii_lowercase().contains(&q_lower) {
+    // 2. Fallback: zero-allocation case-insensitive substring match in description
+    if contains_ignore_ascii_case(desc, q_lower_str.as_bytes()) {
         return Some((5, Vec::new()));
     }
 
     None
+}
+
+/// Computes fuzzy subsequence match score and matched char indices on `label`,
+/// with fallback to substring match on `desc`.
+#[allow(dead_code)]
+pub fn fuzzy_match(label: &str, desc: &str, query: &str) -> Option<(i32, Vec<usize>)> {
+    if query.is_empty() {
+        return Some((0, Vec::new()));
+    }
+    let q_lower = query.to_ascii_lowercase();
+    let q_chars: Vec<char> = q_lower.chars().collect();
+    fuzzy_match_precomputed(label, desc, &q_chars, &q_lower)
 }
 
 pub fn filter_items(items: &[MillerItem], query: &str) -> Vec<FilteredItem> {
@@ -92,18 +155,27 @@ pub fn filter_items(items: &[MillerItem], query: &str) -> Vec<FilteredItem> {
             .collect();
     }
 
+    let q_lower = q.to_ascii_lowercase();
+    let q_chars: Vec<char> = q_lower.chars().collect();
+
     let mut matched: Vec<FilteredItem> = items
         .iter()
         .enumerate()
         .filter_map(|(idx, item)| {
-            fuzzy_match(&item.label, &item.desc, q).map(|(score, match_positions)| FilteredItem {
-                item_idx: idx,
-                score,
-                match_positions,
-            })
+            fuzzy_match_precomputed(&item.label, &item.desc, &q_chars, &q_lower).map(
+                |(score, match_positions)| FilteredItem {
+                    item_idx: idx,
+                    score,
+                    match_positions,
+                },
+            )
         })
         .collect();
 
-    matched.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.item_idx.cmp(&b.item_idx)));
+    matched.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.item_idx.cmp(&b.item_idx))
+    });
     matched
 }

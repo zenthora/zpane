@@ -1,10 +1,6 @@
 # Prior Art, Alternatives, and Ecosystem Analysis for `miller-cmd`
 
-**Author / Maintainer:** Antigravity Research Subagent  
-**Date:** November 2026  
-**Subject:** Landscape analysis of command discovery, CLI introspection, and Miller column terminal user interfaces in relation to `miller-cmd`.  
-**Target Repository:** `miller-cmd`  
-**Output Document:** `docs/prior-art-and-alternatives.md`  
+**Subject:** Landscape analysis of command discovery, CLI introspection, and Miller column terminal user interfaces in relation to `miller-cmd`.
 
 ---
 
@@ -339,7 +335,7 @@ A major defect of tools like `bract`, `navi`, or standalone TUIs is the handoff 
       [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
       $tmp = [System.IO.Path]::GetTempFileName()
       try {
-          miller-cmd --buffer "$line" --out "$tmp"
+          miller-cmd --initial "$line" --out-file "$tmp"
           if (Test-Path $tmp) {
               $newCmd = (Get-Content $tmp -Raw).Trim()
               if ($newCmd) {
@@ -360,34 +356,26 @@ A major defect of tools like `bract`, `navi`, or standalone TUIs is the handoff 
 
 ---
 
-## 5. Concrete Feature Opportunities for `miller-cmd`
+## 5. Cross-Pollinated Architecture & Roadmap Opportunities
 
-Analyzing the strengths of prior art reveals several strategic, high-leverage enhancements that can elevate `miller-cmd` from a prototype into an indispensable shell utility:
+Analyzing the strengths of prior art directly informed several core capabilities implemented in `miller-cmd`, as well as future roadmap extensions:
 
-### 1. Framework-Specific Help Grammar Parsers (Inspired by `bract`)
-- **Current State:** `miller-cmd` uses three generic regular expressions (`re_long`, `re_short`, `re_sub`) to extract flags and subcommands from raw `--help` text. While effective for basic tools, it frequently misses subcommands or misclassifies arguments on complex CLIs.
-- **Opportunity:** Adopt Bract’s approach of detecting common CLI framework fingerprints:
-  - **Go Cobra Grammars:** Recognizes `Available Commands:` and `Flags:` sections, correctly isolating subcommands and their one-line summaries for tools like `gh`, `kubectl`, `helm`, `docker`, and `hugo`.
-  - **Python Knack / Click Grammars:** Parses Azure CLI (`az`) and common Python tools where commands are formatted in bracketed or indented blocks.
-  - **Rust Clap Grammars:** Detects `Commands:` and `Options:` blocks, extracting short options, long options, and default values (`[default: ...]`).
+### 1. Framework-Specific Help Grammar Parsers (Inspired by `bract` — Implemented)
+- **Architecture:** Rather than relying solely on naive regexes, `miller-cmd` detects section headers (`CORE COMMANDS`, `Commands:`, `Flags:`, `Options:`, Git prose headers) and parses framework-specific CLI patterns across **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), automatically extracting `[possible values: ...]` and `[default: ...]` into Column 3 children.
 
-### 2. Declarative Specification & Carapace Bridge Fallback (Inspired by `carapace` & Fig)
-- **Current State:** If a binary does not provide clean `--help` output (or requires complex multi-step flag chaining), dynamic regex introspection yields limited results.
+### 2. Declarative Specification & Carapace Bridge Fallback (Inspired by `carapace` & Fig — Roadmap)
 - **Opportunity:**
   - Support loading lightweight declarative JSON/YAML specs (such as `carapace-spec` or simplified Fig specs) from a local directory (`%LOCALAPPDATA%\miller-cmd\specs\`).
   - If `carapace-bin` is installed on the user's system, allow `miller-cmd` to query `carapace <cmd> export` as a secondary introspection provider, instantly gaining rich, structured completions for 500+ CLI tools without manual maintenance.
 
-### 3. Interactive Argument / Value Prompts (Inspired by `navi` & `intelli-shell`)
-- **Current State:** When selecting a parameter in Column 2 that requires a value (e.g. `-Path` or `--port`), Column 3 displays common shell variables or static help text.
-- **Opportunity:**
-  - When the user presses `Tab` on an item expecting an argument (e.g., marked as `ItemKind::Param` or `<value>` in CLI help), transition focus into Column 3 with an **inline text input prompt** or dynamic filesystem path completion picker.
-  - Allow users to type the argument value directly into Column 3; pressing Enter interpolates the flag and value together into the buffer (e.g., `--port 8080`).
+### 3. Interactive Argument / Value Prompts (Inspired by `navi` & `intelli-shell` — Implemented)
+- **Architecture:**
+  - When a user selects a parameter or subcommand in Column 2 and types in Column 3, `miller-cmd` dynamically surfaces an interactive `✏ Use "<value>"` item and interpolates the custom argument directly into the live command preview and output buffer.
 
-### 4. ParameterSet Exclusivity Pruning (Inspired by `Show-Command` & PowerShell AST)
-- **Current State:** PowerShell cmdlet reflection extracts all parameters into a unified list, separating common parameters to the bottom.
-- **Opportunity:**
-  - Enhance `ps_metadata.json` generation in `discovery.rs` to record the `ParameterSetName` for each parameter.
-  - Once the user selects a parameter in Column 2 that belongs exclusively to `ParameterSet A`, dynamically dim, gray out, or filter out parameters in Column 2 that belong exclusively to `ParameterSet B`. This brings `Show-Command`'s greatest feature directly into the fast keyboard-driven TUI.
+### 4. ParameterSet Exclusivity Pruning (Inspired by `Show-Command` & PowerShell AST — Implemented)
+- **Architecture:**
+  - `ps_metadata.json` records `parameter_sets` for every reflected PowerShell parameter.
+  - Once the user appends a parameter belonging to specific `ParameterSet`s, `miller-cmd` computes the active parameter set intersection and dynamically prunes mutually exclusive parameters from Column 2, displaying `[Set: ...]` in the Column 2 header.
 
 ### 5. Dynamic Runtime Context Extraction (Inspired by `atuin` & `carapace`)
 - **Current State:** Variable scopes `$env:*` and `$global:*` are loaded once at startup.

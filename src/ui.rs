@@ -1,6 +1,5 @@
 use crate::fuzzy::FilteredItem;
 use crate::model::MillerItem;
-use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use unicode_width::UnicodeWidthChar;
 
@@ -18,7 +17,13 @@ const RST: &str = "\x1b[0m";
 
 pub fn clean_single_line(s: &str) -> String {
     s.chars()
-        .map(|c| if matches!(c, '\r' | '\n' | '\t') { ' ' } else { c })
+        .map(|c| {
+            if matches!(c, '\r' | '\n' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -71,7 +76,8 @@ fn render_miller_cell(
     let avail_label_w = col_width.saturating_sub(ptr_w + badge_w + 1).max(2);
     let clean_label = clean_single_line(&item.label);
 
-    let match_set: HashSet<usize> = filtered.match_positions.iter().copied().collect();
+    let match_positions = &filtered.match_positions;
+    let mut match_cursor = 0usize;
     let base_style = if is_selected {
         if is_active_col {
             C_SEL_ACT_BG
@@ -87,8 +93,7 @@ fn render_miller_cell(
     out.push_str(ptr);
 
     let mut cur_w = 0;
-    let chars: Vec<char> = clean_label.chars().collect();
-    for (idx, &ch) in chars.iter().enumerate() {
+    for (idx, ch) in clean_label.chars().enumerate() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w + w > avail_label_w {
             if avail_label_w > 1 && cur_w < avail_label_w {
@@ -97,10 +102,14 @@ fn render_miller_cell(
             }
             break;
         }
-        if match_set.contains(&idx) {
+        while match_cursor < match_positions.len() && match_positions[match_cursor] < idx {
+            match_cursor += 1;
+        }
+        if match_cursor < match_positions.len() && match_positions[match_cursor] == idx {
             out.push_str(C_MATCH_HL);
             out.push(ch);
             out.push_str(base_style);
+            match_cursor += 1;
         } else {
             out.push(ch);
         }
@@ -153,7 +162,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     let w3 = inner_w.saturating_sub(w1 + w2).max(22);
 
     let mut sb = String::with_capacity(32768);
-    sb.push_str("\x1b[H"); // Cursor to home (0,0) for flicker-free overwrite
+    sb.push_str("\x1b[?2026h\x1b[H"); // Begin synchronized update + Cursor to home (0,0) for flicker-free overwrite
 
     // Top Border with Column Headers
     let h1_txt = format!(" 1. Command / Scope ({}) ", st.col1_filtered.len());
@@ -164,9 +173,21 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     };
     let h3_txt = format!(" 3. Flags / Values / Info ({}) ", st.col3_filtered.len());
 
-    let h1_c = if st.active_col == 0 { C_HEADER_ACT } else { C_HEADER_DIM };
-    let h2_c = if st.active_col == 1 { C_HEADER_ACT } else { C_HEADER_DIM };
-    let h3_c = if st.active_col == 2 { C_HEADER_ACT } else { C_HEADER_DIM };
+    let h1_c = if st.active_col == 0 {
+        C_HEADER_ACT
+    } else {
+        C_HEADER_DIM
+    };
+    let h2_c = if st.active_col == 1 {
+        C_HEADER_ACT
+    } else {
+        C_HEADER_DIM
+    };
+    let h3_c = if st.active_col == 2 {
+        C_HEADER_ACT
+    } else {
+        C_HEADER_DIM
+    };
 
     let b1 = "─".repeat(w1.saturating_sub(h1_txt.chars().count()));
     let b2 = "─".repeat(w2.saturating_sub(h2_txt.chars().count()));
@@ -269,7 +290,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     let _ = write!(
         sb,
-        "{C_BORDER_DIM}╰{}╯{RST}",
+        "{C_BORDER_DIM}╰{}╯{RST}\x1b[?2026l",
         "─".repeat(full_inner)
     );
 

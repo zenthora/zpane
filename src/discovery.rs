@@ -1,6 +1,4 @@
-use crate::model::{
-    BgRequest, BgResponse, ItemKind, MillerItem, PsCommandExport,
-};
+use crate::model::{BgRequest, BgResponse, ItemKind, MillerItem, PsCommandExport};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -50,29 +48,40 @@ pub fn save_cli_disk_cache(cache: &HashMap<String, Vec<MillerItem>>) {
     }
 }
 
-pub fn common_var_items() -> Vec<MillerItem> {
-    let pwd = env::current_dir()
-        .map(|p| p.display().to_string())
-        .unwrap_or_default();
-    let home = env::var("USERPROFILE").unwrap_or_default();
-    let temp = env::var("TEMP").unwrap_or_default();
-    let profile = format!("{}\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1", home);
+pub fn common_var_items() -> &'static [MillerItem] {
+    static COMMON_VARS: OnceLock<Vec<MillerItem>> = OnceLock::new();
+    COMMON_VARS.get_or_init(|| {
+        let pwd = env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        let home = env::var("USERPROFILE").unwrap_or_default();
+        let temp = env::var("TEMP").unwrap_or_default();
+        let profile = format!(
+            "{}\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1",
+            home
+        );
 
-    vec![
-        MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
-        MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, home),
-        MillerItem::new("$PROFILE", "$PROFILE (PS Profile)", ItemKind::Var, profile),
-        MillerItem::new("$env:TEMP", "$env:TEMP (Temp Dir)", ItemKind::Var, temp),
-        MillerItem::new("$_", "$_ (Pipeline Item)", ItemKind::Var, "Current object in pipeline"),
-        MillerItem::new("$true", "$true", ItemKind::Var, "Boolean True"),
-        MillerItem::new("$false", "$false", ItemKind::Var, "Boolean False"),
-        MillerItem::new("$null", "$null", ItemKind::Var, "Null reference"),
-    ]
+        vec![
+            MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
+            MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, home),
+            MillerItem::new("$PROFILE", "$PROFILE (PS Profile)", ItemKind::Var, profile),
+            MillerItem::new("$env:TEMP", "$env:TEMP (Temp Dir)", ItemKind::Var, temp),
+            MillerItem::new(
+                "$_",
+                "$_ (Pipeline Item)",
+                ItemKind::Var,
+                "Current object in pipeline",
+            ),
+            MillerItem::new("$true", "$true", ItemKind::Var, "Boolean True"),
+            MillerItem::new("$false", "$false", ItemKind::Var, "Boolean False"),
+            MillerItem::new("$null", "$null", ItemKind::Var, "Null reference"),
+        ]
+    })
 }
 
 fn build_env_scope_item() -> MillerItem {
     let mut vars: Vec<(String, String)> = env::vars().collect();
-    vars.sort_by(|a, b| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()));
+    vars.sort_by_key(|a| a.0.to_ascii_lowercase());
 
     let mut children = Vec::with_capacity(vars.len());
     for (k, v) in vars {
@@ -124,7 +133,7 @@ fn build_ps_var_scope_item() -> MillerItem {
         ItemKind::Var,
         "Browse and insert PowerShell Session & Automatic Variables ($*)",
     );
-    root.children = common_var_items();
+    root.children = common_var_items().to_vec();
     for child in &mut root.children {
         let tok = child.text.clone();
         let val = child.desc.clone();
@@ -157,7 +166,6 @@ fn convert_ps_export_to_item(exp: PsCommandExport) -> MillerItem {
     let mut cmd_item = MillerItem::new(&exp.name, &exp.name, kind, &exp.desc);
     let mut primary = Vec::new();
     let mut common = Vec::new();
-    let v_items = common_var_items();
 
     for p in exp.params {
         let p_flag = format!("-{}", p.name);
@@ -205,9 +213,6 @@ fn convert_ps_export_to_item(exp: PsCommandExport) -> MillerItem {
                 "Explicitly disable switch",
             ));
         }
-        for cv in &v_items {
-            param_item.children.push(cv.clone());
-        }
 
         if p.is_common {
             common.push(param_item);
@@ -238,9 +243,9 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
         if let Ok(exports) = serde_json::from_slice::<Vec<PsCommandExport>>(&bytes) {
             for exp in exports {
                 let key = exp.name.to_ascii_lowercase();
-                if !ps_map.contains_key(&key) {
-                    ps_order.push(key.clone());
-                    ps_map.insert(key, convert_ps_export_to_item(exp));
+                if let std::collections::hash_map::Entry::Vacant(e) = ps_map.entry(key.clone()) {
+                    ps_order.push(key);
+                    e.insert(convert_ps_export_to_item(exp));
                 }
             }
         }
@@ -261,17 +266,16 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
                         {
                             if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
                                 let key = stem.to_ascii_lowercase();
-                                if !cli_map.contains_key(&key) {
-                                    cli_order.push(key.clone());
-                                    cli_map.insert(
-                                        key,
-                                        MillerItem::new(
-                                            stem,
-                                            stem,
-                                            ItemKind::Cli,
-                                            path.display().to_string(),
-                                        ),
-                                    );
+                                if let std::collections::hash_map::Entry::Vacant(e) =
+                                    cli_map.entry(key.clone())
+                                {
+                                    cli_order.push(key);
+                                    e.insert(MillerItem::new(
+                                        stem,
+                                        stem,
+                                        ItemKind::Cli,
+                                        path.display().to_string(),
+                                    ));
                                 }
                             }
                         }
@@ -283,10 +287,45 @@ pub fn load_col1_commands() -> Vec<MillerItem> {
 
     // 4. Priority Favorites at the top
     let priority = [
-        "git", "prek", "zoxide", "winget", "uv", "uvx", "cargo", "rustc", "adb", "fd", "rg", "lsd",
-        "fzf", "starship", "scoop", "tailscale", "caddy", "python", "pip", "node", "npm",
-        "pwsh", "docker", "z", "zi", "mkcd", "ports", "myip", "fkill", "fgs", "fscoop",
-        "extract", "touch", "which", "reload", "ep", "pkr", "pki", "pku",
+        "git",
+        "prek",
+        "zoxide",
+        "winget",
+        "uv",
+        "uvx",
+        "cargo",
+        "rustc",
+        "adb",
+        "fd",
+        "rg",
+        "lsd",
+        "fzf",
+        "starship",
+        "scoop",
+        "tailscale",
+        "caddy",
+        "python",
+        "pip",
+        "node",
+        "npm",
+        "pwsh",
+        "docker",
+        "z",
+        "zi",
+        "mkcd",
+        "ports",
+        "myip",
+        "fkill",
+        "fgs",
+        "fscoop",
+        "extract",
+        "touch",
+        "which",
+        "reload",
+        "ep",
+        "pkr",
+        "pki",
+        "pku",
     ];
 
     for &p in &priority {
@@ -372,7 +411,7 @@ fn run_command_with_timeout(exe: &str, args: &[&str], timeout_ms: u64) -> String
         if let Some(mut p) = stderr_pipe.take() {
             let _ = p.read_to_end(&mut buf);
         }
-        String::from_utf8_lossy(&mut buf).into_owned()
+        String::from_utf8_lossy(&buf).into_owned()
     });
 
     let start = Instant::now();
@@ -493,9 +532,7 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
         Regex::new(r"(?:\[possible values:\s*([^\]]+)\]|Allowed values:\s*([^.\n]+))").unwrap()
     });
 
-    let re_def = RE_DEFAULT_VAL.get_or_init(|| {
-        Regex::new(r"\[default:\s*([^\]]+)\]").unwrap()
-    });
+    let re_def = RE_DEFAULT_VAL.get_or_init(|| Regex::new(r"\[default:\s*([^\]]+)\]").unwrap());
 
     let mut subcmds = Vec::new();
     let mut flags = Vec::new();
@@ -538,7 +575,11 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
 
                     if seen.insert(flag.clone()) {
                         let is_param = !arg_hint.is_empty();
-                        let kind = if is_param { ItemKind::Param } else { ItemKind::Flag };
+                        let kind = if is_param {
+                            ItemKind::Param
+                        } else {
+                            ItemKind::Flag
+                        };
 
                         let label = if !short.is_empty() && short != flag {
                             if !arg_hint.is_empty() {
@@ -556,8 +597,16 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
 
                         // Extract enum values if present in description
                         if let Some(v_caps) = re_vals.captures(desc) {
-                            let raw_vals = v_caps.get(1).or_else(|| v_caps.get(2)).map(|m| m.as_str()).unwrap_or("");
-                            for v in raw_vals.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                            let raw_vals = v_caps
+                                .get(1)
+                                .or_else(|| v_caps.get(2))
+                                .map(|m| m.as_str())
+                                .unwrap_or("");
+                            for v in raw_vals
+                                .split(',')
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                            {
                                 item.children.push(MillerItem::new(
                                     v,
                                     v,
@@ -570,7 +619,9 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
                         // Extract default value if present
                         if let Some(d_caps) = re_def.captures(desc) {
                             let def_val = d_caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
-                            if !def_val.is_empty() && !item.children.iter().any(|c| c.text == def_val) {
+                            if !def_val.is_empty()
+                                && !item.children.iter().any(|c| c.text == def_val)
+                            {
                                 item.children.push(MillerItem::new(
                                     def_val,
                                     format!("{def_val} [default]"),
@@ -594,15 +645,31 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
             Regex::new(r"^\s{1,10}(?:(-[a-zA-Z0-9\?]),?\s+(?:\|\s+)?)?(--(?:\[no-\])?[a-zA-Z0-9_-]+)(?:[=\s\[][^\s\]]*\]?)?(?:\s{2,}(.+))?$").unwrap()
         });
         let re_short = RE_SHORT_FLAG_FALLBACK.get_or_init(|| {
-            Regex::new(r"^\s{1,10}(-[a-zA-Z0-9\?])(?:\s+<[^>]+>|\s+\[[^\]]+\])?\s{2,}(.+)$").unwrap()
+            Regex::new(r"^\s{1,10}(-[a-zA-Z0-9\?])(?:\s+<[^>]+>|\s+\[[^\]]+\])?\s{2,}(.+)$")
+                .unwrap()
         });
         let re_sub = RE_SUBCMD_FALLBACK.get_or_init(|| {
-            Regex::new(r"^\s{2,8}([a-z][a-z0-9_-]{1,24})(?:,\s*[a-z0-9_-]+)?\s{2,}([A-Za-z].+)$").unwrap()
+            Regex::new(r"^\s{2,8}([a-z][a-z0-9_-]{1,24})(?:,\s*[a-z0-9_-]+)?\s{2,}([A-Za-z].+)$")
+                .unwrap()
         });
 
         let ignored_words: HashSet<&'static str> = [
-            "usage", "options", "commands", "arguments", "flags", "examples", "env", "note",
-            "default", "or", "see", "start", "work", "examine", "grow", "collaborate",
+            "usage",
+            "options",
+            "commands",
+            "arguments",
+            "flags",
+            "examples",
+            "env",
+            "note",
+            "default",
+            "or",
+            "see",
+            "start",
+            "work",
+            "examine",
+            "grow",
+            "collaborate",
         ]
         .into_iter()
         .collect();
@@ -612,7 +679,10 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
                 let short = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                 let raw_long = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
                 let long = raw_long.replacen("--[no-]", "--", 1);
-                let desc = caps.get(3).map(|m| m.as_str().trim().to_string()).unwrap_or_else(|| format!("CLI Flag {long}"));
+                let desc = caps
+                    .get(3)
+                    .map(|m| m.as_str().trim().to_string())
+                    .unwrap_or_else(|| format!("CLI Flag {long}"));
 
                 if seen.insert(long.clone()) {
                     let label = if short.is_empty() {
@@ -673,7 +743,7 @@ pub fn introspect_cli_chain(chain: &[String]) -> Vec<MillerItem> {
         let mut existing: HashSet<String> = items.iter().map(|i| i.text.clone()).collect();
         for cv in common_var_items() {
             if existing.insert(cv.text.clone()) {
-                items.push(cv);
+                items.push(cv.clone());
             }
         }
     } else if items.is_empty() {
@@ -683,7 +753,7 @@ pub fn introspect_cli_chain(chain: &[String]) -> Vec<MillerItem> {
             ItemKind::Flag,
             format!("Display help for {exe}"),
         ));
-        items.extend(common_var_items());
+        items.extend_from_slice(common_var_items());
     }
 
     items
@@ -692,15 +762,28 @@ pub fn introspect_cli_chain(chain: &[String]) -> Vec<MillerItem> {
 pub fn spawn_background_worker(rx: Receiver<BgRequest>, tx: Sender<BgResponse>) {
     thread::spawn(move || {
         let mut handled = HashSet::new();
-        while let Ok(req) = rx.recv() {
-            if !handled.insert(req.cache_key.clone()) {
-                continue;
+        let mut stack: Vec<BgRequest> = Vec::new();
+        loop {
+            if stack.is_empty() {
+                match rx.recv() {
+                    Ok(req) => stack.push(req),
+                    Err(_) => break,
+                }
             }
-            let items = introspect_cli_chain(&req.cmd_chain);
-            let _ = tx.send(BgResponse {
-                cache_key: req.cache_key,
-                items,
-            });
+            // Drain any additional queued requests so we always process the latest (LIFO) first
+            while let Ok(newer) = rx.try_recv() {
+                stack.push(newer);
+            }
+            if let Some(req) = stack.pop() {
+                if !handled.insert(req.cache_key.clone()) {
+                    continue;
+                }
+                let items = introspect_cli_chain(&req.cmd_chain);
+                let _ = tx.send(BgResponse {
+                    cache_key: req.cache_key,
+                    items,
+                });
+            }
         }
     });
 }
@@ -809,19 +892,37 @@ FLAGS
             .filter(|i| i.kind == ItemKind::Subcmd)
             .map(|i| i.text.as_str())
             .collect();
-        assert!(subcmds.contains(&"auth"), "Cobra auth command should be parsed");
-        assert!(subcmds.contains(&"issue"), "Cobra issue command should be parsed");
+        assert!(
+            subcmds.contains(&"auth"),
+            "Cobra auth command should be parsed"
+        );
+        assert!(
+            subcmds.contains(&"issue"),
+            "Cobra issue command should be parsed"
+        );
         assert!(subcmds.contains(&"pr"), "Cobra pr command should be parsed");
-        assert!(subcmds.contains(&"repo"), "Cobra repo command should be parsed");
+        assert!(
+            subcmds.contains(&"repo"),
+            "Cobra repo command should be parsed"
+        );
 
         let flags: Vec<&str> = items
             .iter()
             .filter(|i| matches!(i.kind, ItemKind::Flag | ItemKind::Param))
             .map(|i| i.text.as_str())
             .collect();
-        assert!(flags.contains(&"--repo"), "Cobra --repo flag should be parsed");
-        assert!(flags.contains(&"--help"), "Cobra --help flag should be parsed");
-        assert!(flags.contains(&"--version"), "Cobra --version flag should be parsed");
+        assert!(
+            flags.contains(&"--repo"),
+            "Cobra --repo flag should be parsed"
+        );
+        assert!(
+            flags.contains(&"--help"),
+            "Cobra --help flag should be parsed"
+        );
+        assert!(
+            flags.contains(&"--version"),
+            "Cobra --version flag should be parsed"
+        );
     }
 
     #[test]
@@ -849,14 +950,31 @@ Hook selection:
         assert!(subcmds.contains(&"install"));
         assert!(subcmds.contains(&"run"));
 
-        let stage_flag = items.iter().find(|i| i.text == "--stage").expect("stage flag");
+        let stage_flag = items
+            .iter()
+            .find(|i| i.text == "--stage")
+            .expect("stage flag");
         assert_eq!(stage_flag.kind, ItemKind::Param);
-        let enum_vals: Vec<&str> = stage_flag.children.iter().map(|c| c.text.as_str()).collect();
-        assert!(enum_vals.contains(&"manual"), "Enum values extracted from [possible values]");
+        let enum_vals: Vec<&str> = stage_flag
+            .children
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert!(
+            enum_vals.contains(&"manual"),
+            "Enum values extracted from [possible values]"
+        );
         assert!(enum_vals.contains(&"pre-commit"));
 
-        let color_flag = items.iter().find(|i| i.text == "--color").expect("color flag");
-        let color_enums: Vec<&str> = color_flag.children.iter().map(|c| c.text.as_str()).collect();
+        let color_flag = items
+            .iter()
+            .find(|i| i.text == "--color")
+            .expect("color flag");
+        let color_enums: Vec<&str> = color_flag
+            .children
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
         assert!(color_enums.contains(&"auto"));
         assert!(color_enums.contains(&"always"));
     }

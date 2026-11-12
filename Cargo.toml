@@ -2,7 +2,13 @@
 name = "miller-cmd"
 version = "0.1.0"
 edition = "2021"
+authors = ["zenthora <105382125+zenthora@users.noreply.github.com>"]
 description = "Blazing-fast 3-pane Miller Column Command, Subcommand & Variable Explorer for PowerShell"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/zenthora/miller-cmd"
+keywords = ["powershell", "tui", "miller-columns", "cli", "autocomplete"]
+categories = ["command-line-utilities", "command-line-interface"]
 
 [dependencies]
 anyhow = "1.0"
