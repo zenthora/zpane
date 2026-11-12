@@ -32,13 +32,16 @@ impl ItemKind {
     }
 }
 
+/// Rows consumed by Column 3's inspector header (title, description, divider).
+const COL3_INSPECTOR_ROWS: usize = 3;
+
 /// Authoritative visible row count for a given terminal height and Miller column (`0..=2`).
 /// Accounts for the 6 rows of frame chrome (top border, divider, 3 status/footer bars, bottom border)
 /// and Column 3's 3-row inspector header.
 pub fn viewport_rows(term_h: usize, col: usize) -> usize {
     let list_rows = term_h.saturating_sub(6).max(4);
     if col == 2 {
-        list_rows.saturating_sub(3).max(1)
+        list_rows.saturating_sub(COL3_INSPECTOR_ROWS).max(1)
     } else {
         list_rows
     }
@@ -293,7 +296,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         } else if r == 2 {
             format!("{C_BORDER_DIM}{}{RST}", "─".repeat(w3))
         } else {
-            let idx3 = st.scroll_idx[2] + (r - 3);
+            let idx3 = st.scroll_idx[2] + (r - COL3_INSPECTOR_ROWS);
             if let Some(f3) = st.col3_filtered.get(idx3) {
                 let it3 = &st.col3_items[f3.item_idx];
                 render_miller_cell(it3, f3, w3, idx3 == st.sel_idx[2], st.active_col == 2)

@@ -394,7 +394,14 @@ impl MillerSession {
             {
                 self.col2_cache_state = None;
             }
-            self.col3_cache_state = None;
+            // Only refresh Column 3 when it is still waiting on background data.
+            // An unrelated cache completion must not reset the user's Column 3
+            // cursor or shift the live preview.
+            if self.col3_items.is_empty()
+                || self.col3_items.iter().any(|i| i.kind == ItemKind::Loading)
+            {
+                self.col3_cache_state = None;
+            }
             self.sync_columns();
             self.dirty = true;
             true
@@ -603,40 +610,45 @@ impl MillerSession {
                         }
                     }
                 } else if self.active_col == 1 {
-                    let c1_opt = self.selected_item(0).cloned();
-                    let c2_opt = self.selected_item(1).cloned();
-                    if let Some(c2) = c2_opt {
-                        if is_selectable_col2_item(&c2) {
-                            if let Some(ref c1) = c1_opt {
-                                if !is_scope_root(c1) && self.tokens.is_empty() {
-                                    self.tokens.push(c1.text.clone());
+                    // A suppressed Column 2 preview means the reset index-0 item was
+                    // never shown; Tab is a no-op until navigation or typing clears it.
+                    if !self.suppress_col2_preview {
+                        let c1_opt = self.selected_item(0).cloned();
+                        let c2_opt = self.selected_item(1).cloned();
+                        if let Some(c2) = c2_opt {
+                            if is_selectable_col2_item(&c2) {
+                                if let Some(ref c1) = c1_opt {
+                                    if !is_scope_root(c1) && self.tokens.is_empty() {
+                                        self.tokens.push(c1.text.clone());
+                                    }
                                 }
-                            }
-                            if is_childless_col2_flag_or_switch(&c2) {
-                                if self.tokens.last().map(|s| s.as_str()) != Some(c2.text.as_str())
-                                {
-                                    self.tokens.push(c2.text);
-                                }
-                                if !self.filters[1].is_empty() {
-                                    self.filters[1].clear();
-                                    self.col2_filter_dirty = true;
-                                }
-                                self.sel_idx[1] = 0;
-                                self.scroll_idx[1] = 0;
-                                self.suppress_col2_preview = true;
-                                self.dirty = true;
-                            } else {
-                                if !c1_opt.as_ref().is_some_and(is_scope_root)
-                                    && self.tokens.last().map(|s| s.as_str())
+                                if is_childless_col2_flag_or_switch(&c2) {
+                                    if self.tokens.last().map(|s| s.as_str())
                                         != Some(c2.text.as_str())
-                                {
-                                    self.tokens.push(c2.text);
+                                    {
+                                        self.tokens.push(c2.text);
+                                    }
+                                    if !self.filters[1].is_empty() {
+                                        self.filters[1].clear();
+                                        self.col2_filter_dirty = true;
+                                    }
+                                    self.sel_idx[1] = 0;
+                                    self.scroll_idx[1] = 0;
+                                    self.suppress_col2_preview = true;
+                                    self.dirty = true;
+                                } else {
+                                    if !c1_opt.as_ref().is_some_and(is_scope_root)
+                                        && self.tokens.last().map(|s| s.as_str())
+                                            != Some(c2.text.as_str())
+                                    {
+                                        self.tokens.push(c2.text);
+                                    }
+                                    self.active_col = 2;
+                                    self.sel_idx[2] = 0;
+                                    self.scroll_idx[2] = 0;
+                                    self.suppress_col2_preview = false;
+                                    self.dirty = true;
                                 }
-                                self.active_col = 2;
-                                self.sel_idx[2] = 0;
-                                self.scroll_idx[2] = 0;
-                                self.suppress_col2_preview = false;
-                                self.dirty = true;
                             }
                         }
                     }
@@ -1297,6 +1309,89 @@ mod tests {
     }
 
     #[test]
+    fn test_second_tab_after_switch_accept_does_not_commit_unpreviewed_item() {
+        let get_process = sample_ps_cmdlet();
+        let introspector =
+            CliIntrospector::with_initial_cache(ShellDialect::PowerShell, HashMap::new());
+        let mut session = MillerSession::new(
+            vec![get_process],
+            introspector,
+            "",
+            120,
+            30,
+            ShellDialect::PowerShell,
+        );
+
+        // Accept `-Verbose`; the selection resets to index 0 (`-InformationAction`),
+        // which is deliberately excluded from the preview.
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::MoveEnd);
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.sel_idx()[1], 0);
+        assert_eq!(session.tokens(), &["Get-Process", "-Verbose"]);
+        assert_eq!(session.preview_command(), "Get-Process -Verbose");
+
+        // A second Tab without navigation or typing must not commit the
+        // un-previewed index-0 item.
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.active_col(), 1);
+        assert_eq!(session.tokens(), &["Get-Process", "-Verbose"]);
+        assert_eq!(session.preview_command(), "Get-Process -Verbose");
+
+        // Navigation re-arms normal acceptance of the highlighted item.
+        session.apply(UserAction::MoveDown);
+        assert_eq!(session.selected_item(1).unwrap().text, "-Identity");
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.active_col(), 2);
+        assert_eq!(session.tokens(), &["Get-Process", "-Verbose", "-Identity"]);
+    }
+
+    #[test]
+    fn test_unrelated_background_completion_preserves_col3_cursor() {
+        let git_item = MillerItem::new("git", "git", ItemKind::Cli, "Git VCS");
+        let introspector = CliIntrospector::with_runner(ShellDialect::Posix, None, |exe, args| {
+            match (exe, args) {
+                ("git", ["-h"]) => Some(
+                    "Commands:\n  clone      Clone a repository\n  commit     Record changes\n"
+                        .to_string(),
+                ),
+                ("git", ["commit", "-h"]) => Some(
+                    "Options:\n  -a, --all       Commit all changed files\n  -m, --message <MSG>  Commit message\n"
+                        .to_string(),
+                ),
+                ("other", ["--help"]) => Some("Options:\n  --unrelated   Unrelated flag\n".to_string()),
+                _ => None,
+            }
+        });
+        let mut session = MillerSession::new(
+            vec![git_item],
+            introspector,
+            "git commit",
+            120,
+            30,
+            ShellDialect::Posix,
+        );
+
+        // Drain `git --help` and `git commit --help` so Column 3 is fully loaded.
+        assert!(session.poll_introspector());
+        assert!(session.poll_introspector());
+        assert!(session.active_col() == 2);
+        session.apply(UserAction::MoveDown);
+        session.apply(UserAction::MoveDown);
+        let selected_col3 = session.selected_item(2).unwrap().text.clone();
+        assert_eq!(session.sel_idx()[2], 2);
+
+        // Queue an unrelated background job, then let it complete.
+        let _ = session.introspector.query(&["other"]);
+        assert!(session.poll_introspector());
+
+        // The unrelated completion must not reset Column 3 or shift the preview.
+        assert_eq!(session.sel_idx()[2], 2);
+        assert_eq!(session.selected_item(2).unwrap().text, selected_col3);
+        assert!(session.preview_command().ends_with(&selected_col3));
+    }
+
+    #[test]
     fn test_switch_placeholder_in_col3_never_emits_blank_token() {
         let get_process = sample_ps_cmdlet();
         let introspector =
@@ -1493,8 +1588,14 @@ mod tests {
         assert_eq!(session.sel_idx()[0], 6);
         assert_eq!(session.scroll_idx()[0], 1); // visible rows 1..=6
 
-        // Step right into Col 1, then into Col 2 (Column 3)
+        // Step right into Col 1, then page it by 6 rows (viewport_rows(12, 1) == 6)
         session.apply(UserAction::StepRight);
+        assert_eq!(session.active_col(), 1);
+        session.apply(UserAction::PageDown);
+        assert_eq!(session.sel_idx()[1], 6);
+        assert_eq!(session.scroll_idx()[1], 1); // visible rows 1..=6
+
+        // Step right into Col 2 (Column 3)
         session.apply(UserAction::StepRight);
         assert_eq!(session.active_col(), 2);
 
