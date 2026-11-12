@@ -83,15 +83,3 @@ impl MillerItem {
         self
     }
 }
-
-#[derive(Debug, Clone)]
-pub struct BgRequest {
-    pub cache_key: String,
-    pub cmd_chain: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BgResponse {
-    pub cache_key: String,
-    pub items: Vec<MillerItem>,
-}

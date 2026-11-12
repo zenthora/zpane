@@ -8,19 +8,16 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use discovery::{
-    common_var_items, ensure_ps_metadata_async, introspect_cli_chain, load_cli_disk_cache,
-    load_col1_commands, save_cli_disk_cache, spawn_background_worker, sync_powershell_metadata,
-    ShellDialect,
+    common_var_items, ensure_ps_metadata_async, load_col1_commands, sync_powershell_metadata,
+    CliIntrospector, ShellDialect,
 };
 use fuzzy::{filter_items, FilteredItem};
-use model::{BgRequest, BgResponse, ItemKind, MillerItem};
-use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use model::{ItemKind, MillerItem};
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc;
 use std::time::Duration;
 use ui::{render_frame, viewport_rows, RenderState};
 
@@ -219,8 +216,7 @@ fn compute_active_parameter_sets(
 fn resolve_col2_items(
     col1: Option<&MillerItem>,
     active_param_sets: Option<&HashSet<String>>,
-    cli_cache: &HashMap<String, Vec<MillerItem>>,
-    bg_tx: &mpsc::Sender<BgRequest>,
+    introspector: &mut CliIntrospector,
 ) -> Vec<MillerItem> {
     let Some(c1) = col1 else {
         return Vec::new();
@@ -249,29 +245,13 @@ fn resolve_col2_items(
         return c1.children.clone();
     }
 
-    let key = c1.text.to_ascii_lowercase();
-    if let Some(cached) = cli_cache.get(&key) {
-        return cached.clone();
-    }
-
-    let _ = bg_tx.send(BgRequest {
-        cache_key: key,
-        cmd_chain: vec![c1.text.clone()],
-    });
-
-    vec![MillerItem::new(
-        "",
-        format!("⟳ Loading subcommands & flags for '{}'...", c1.label),
-        ItemKind::Loading,
-        format!("Introspecting {} --help in background thread", c1.label),
-    )]
+    introspector.query(&[c1.text.as_str()])
 }
 
 fn resolve_col3_items(
     col1: Option<&MillerItem>,
     col2: Option<&MillerItem>,
-    cli_cache: &HashMap<String, Vec<MillerItem>>,
-    bg_tx: &mpsc::Sender<BgRequest>,
+    introspector: &mut CliIntrospector,
     custom_input: &str,
     dialect: ShellDialect,
 ) -> Vec<MillerItem> {
@@ -315,27 +295,7 @@ fn resolve_col3_items(
     }
 
     if c2.kind == ItemKind::Subcmd {
-        let key = format!(
-            "{}::{}",
-            c1.text.to_ascii_lowercase(),
-            c2.text.to_ascii_lowercase()
-        );
-        if let Some(cached) = cli_cache.get(&key) {
-            items.extend_from_slice(cached);
-            return items;
-        }
-
-        let _ = bg_tx.send(BgRequest {
-            cache_key: key,
-            cmd_chain: vec![c1.text.clone(), c2.text.clone()],
-        });
-
-        items.push(MillerItem::new(
-            "",
-            format!("⟳ Loading options for '{} {}'...", c1.label, c2.label),
-            ItemKind::Loading,
-            c2.desc.clone(),
-        ));
+        items.extend(introspector.query(&[c1.text.as_str(), c2.text.as_str()]));
         return items;
     }
 
@@ -422,9 +382,7 @@ struct TuiState {
     col1_filter_dirty: bool,
     col2_filter_dirty: bool,
     col3_filter_dirty: bool,
-    cli_cache: HashMap<String, Vec<MillerItem>>,
-    cli_cache_dirty: bool,
-    req_tx: mpsc::Sender<BgRequest>,
+    introspector: CliIntrospector,
     active_col: usize,
     filters: [String; 3],
     sel_idx: [usize; 3],
@@ -444,8 +402,7 @@ struct TuiState {
 impl TuiState {
     fn new(
         col1_items: Vec<MillerItem>,
-        cli_cache: HashMap<String, Vec<MillerItem>>,
-        req_tx: mpsc::Sender<BgRequest>,
+        introspector: CliIntrospector,
         initial_buffer: &str,
         fallback_w: usize,
         fallback_h: usize,
@@ -489,9 +446,7 @@ impl TuiState {
             col1_filter_dirty: true,
             col2_filter_dirty: true,
             col3_filter_dirty: true,
-            cli_cache,
-            cli_cache_dirty: false,
-            req_tx,
+            introspector,
             active_col,
             filters: [String::new(), String::new(), String::new()],
             sel_idx,
@@ -509,27 +464,8 @@ impl TuiState {
         }
     }
 
-    fn handle_bg_response(&mut self, resp: BgResponse) {
-        let cur_c1_text = self
-            .col1_filtered
-            .get(self.sel_idx[0])
-            .and_then(|f| self.col1_items.get(f.item_idx))
-            .map(|c| c.text.to_ascii_lowercase())
-            .unwrap_or_default();
-        let cur_c2_text = self
-            .col2_filtered
-            .get(self.sel_idx[1])
-            .and_then(|f| self.col2_items.get(f.item_idx))
-            .map(|c| c.text.to_ascii_lowercase())
-            .unwrap_or_default();
-        let cur_sub_key = format!("{cur_c1_text}::{cur_c2_text}");
-
-        let affects_current_view = resp.cache_key == cur_c1_text || resp.cache_key == cur_sub_key;
-
-        self.cli_cache.insert(resp.cache_key, resp.items);
-        self.cli_cache_dirty = true;
-
-        if affects_current_view {
+    fn poll_introspector(&mut self) {
+        if self.introspector.poll() {
             self.last_c1_key.clear();
             self.last_c2_key.clear();
             self.last_active_param_key.clear();
@@ -560,12 +496,8 @@ impl TuiState {
             .unwrap_or_default();
 
         if cur_c1_key != self.last_c1_key || active_param_key != self.last_active_param_key {
-            self.col2_items = resolve_col2_items(
-                cur_c1,
-                active_param_sets.as_ref(),
-                &self.cli_cache,
-                &self.req_tx,
-            );
+            self.col2_items =
+                resolve_col2_items(cur_c1, active_param_sets.as_ref(), &mut self.introspector);
             self.col2_filter_dirty = true;
             self.sel_idx[1] = 0;
             self.scroll_idx[1] = 0;
@@ -615,8 +547,7 @@ impl TuiState {
             self.col3_items = resolve_col3_items(
                 cur_c1,
                 cur_c2,
-                &self.cli_cache,
-                &self.req_tx,
+                &mut self.introspector,
                 &self.filters[2],
                 self.dialect,
             );
@@ -1019,62 +950,11 @@ fn main() -> anyhow::Result<()> {
             Err(_) => eprintln!("Skipping PowerShell metadata sync (`pwsh` not available)."),
         }
         if warm {
-            let mut cache = load_cli_disk_cache();
-            let top_tools = [
-                "git",
-                "prek",
-                "zoxide",
-                "winget",
-                "uv",
-                "uvx",
-                "cargo",
-                "rustc",
-                "adb",
-                "fd",
-                "rg",
-                "lsd",
-                "fzf",
-                "starship",
-                "scoop",
-                "tailscale",
-                "caddy",
-                "apt",
-                "dnf",
-                "rpm",
-                "pkg",
-                "pacman",
-                "docker",
-                "gh",
-                "npm",
-                "pip",
-            ];
-            let installed: HashSet<String> = load_col1_commands(dialect)
-                .into_iter()
-                .filter(|it| it.kind == ItemKind::Cli)
-                .map(|it| it.text.to_ascii_lowercase())
-                .collect();
-            let available: Vec<&str> = top_tools
-                .iter()
-                .copied()
-                .filter(|t| installed.contains(*t))
-                .collect();
-            let results: Vec<(String, Vec<MillerItem>)> = available
-                .par_iter()
-                .map(|&t| {
-                    let items = introspect_cli_chain(&[t.to_string()], dialect);
-                    (t.to_string(), items)
-                })
-                .collect();
-            for (k, v) in results {
-                if !v.is_empty() {
-                    cache.insert(k, v);
-                }
-            }
-            save_cli_disk_cache(&cache);
-            eprintln!(
-                "Pre-warmed CLI cache for {} installed priority tools.",
-                available.len()
-            );
+            let col1_items = load_col1_commands(dialect);
+            let mut introspector = CliIntrospector::new(dialect);
+            let warmed = introspector.warm_priority_tools(&col1_items);
+            introspector.flush();
+            eprintln!("Pre-warmed CLI cache for {warmed} installed priority tools.");
         }
         return Ok(());
     }
@@ -1128,15 +1008,11 @@ fn main() -> anyhow::Result<()> {
     ensure_ps_metadata_async(dialect);
 
     let col1_items = load_col1_commands(dialect);
-    let cli_cache = load_cli_disk_cache();
-    let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
-    let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
-    spawn_background_worker(req_rx, res_tx, dialect);
+    let introspector = CliIntrospector::new(dialect);
 
     let mut state = TuiState::new(
         col1_items,
-        cli_cache,
-        req_tx,
+        introspector,
         &initial_buffer,
         fallback_w,
         fallback_h,
@@ -1147,9 +1023,7 @@ fn main() -> anyhow::Result<()> {
 
     'main_loop: loop {
         // 1. Drain any completed background CLI introspection responses
-        while let Ok(resp) = res_rx.try_recv() {
-            state.handle_bg_response(resp);
-        }
+        state.poll_introspector();
 
         // 2. Recompute filtered views and draw frame when state changed
         if state.dirty {
@@ -1176,9 +1050,7 @@ fn main() -> anyhow::Result<()> {
 
     drop(guard);
 
-    if state.cli_cache_dirty {
-        save_cli_disk_cache(&state.cli_cache);
-    }
+    state.introspector.flush();
 
     if let Some(cmd) = accepted {
         let trimmed = cmd.trim();
@@ -1224,9 +1096,9 @@ mod tests {
         let sets_none = compute_active_parameter_sets(Some(&get_process), &tokens_empty);
         assert_eq!(sets_none, None);
 
-        let (req_tx, _req_rx) = mpsc::channel();
-        let cache = HashMap::new();
-        let res_all = resolve_col2_items(Some(&get_process), sets_none.as_ref(), &cache, &req_tx);
+        let mut introspector =
+            CliIntrospector::with_initial_cache(ShellDialect::PowerShell, Default::default());
+        let res_all = resolve_col2_items(Some(&get_process), sets_none.as_ref(), &mut introspector);
         assert_eq!(res_all.len(), 3);
 
         // Case 2: User picked "-Id" -> active sets should be {"Id", "IdWithUserName"}
@@ -1242,7 +1114,8 @@ mod tests {
         assert!(!sets_id.contains("Name"));
 
         // When resolving col2 with sets_id, -Name MUST be pruned/filtered out!
-        let res_filtered = resolve_col2_items(Some(&get_process), Some(&sets_id), &cache, &req_tx);
+        let res_filtered =
+            resolve_col2_items(Some(&get_process), Some(&sets_id), &mut introspector);
         let param_names: Vec<&str> = res_filtered.iter().map(|p| p.text.as_str()).collect();
         assert!(param_names.contains(&"-Id"));
         assert!(param_names.contains(&"-Verbose"));
@@ -1254,8 +1127,8 @@ mod tests {
 
     #[test]
     fn test_interactive_value_prompt() {
-        let (req_tx, _req_rx) = mpsc::channel();
-        let cache = HashMap::new();
+        let mut introspector =
+            CliIntrospector::with_initial_cache(ShellDialect::Posix, Default::default());
         let col1 = MillerItem::new("git", "git", ItemKind::Cli, "Git VCS");
         let col2 = MillerItem::new("clone", "clone", ItemKind::Subcmd, "Clone repository");
 
@@ -1264,8 +1137,7 @@ mod tests {
         let col3_items = resolve_col3_items(
             Some(&col1),
             Some(&col2),
-            &cache,
-            &req_tx,
+            &mut introspector,
             custom_url,
             ShellDialect::Posix,
         );
@@ -1315,12 +1187,11 @@ mod tests {
             })
             .collect();
 
-        let cli_cache: HashMap<String, Vec<MillerItem>> = HashMap::new();
-        let (req_tx, _req_rx) = mpsc::channel::<BgRequest>();
+        let introspector =
+            CliIntrospector::with_initial_cache(ShellDialect::PowerShell, Default::default());
         let mut state = TuiState::new(
             col1_items,
-            cli_cache,
-            req_tx,
+            introspector,
             "",
             120,
             30,

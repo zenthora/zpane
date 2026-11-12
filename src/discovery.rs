@@ -1,4 +1,5 @@
-use crate::model::{BgRequest, BgResponse, ItemKind, MillerItem};
+use crate::model::{ItemKind, MillerItem};
+use rayon::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -7,10 +8,71 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::OnceLock;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+struct BgRequest {
+    cache_key: String,
+    cmd_chain: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BgResponse {
+    cache_key: String,
+    items: Vec<MillerItem>,
+}
+
+/// Canonical priority CLI tools list shared by Column 1 catalog ordering and `--warm` batch warming.
+pub const PRIORITY_CLI_TOOLS: &[&str] = &[
+    "git",
+    "gh",
+    "prek",
+    "zoxide",
+    "winget",
+    "uv",
+    "uvx",
+    "cargo",
+    "rustc",
+    "adb",
+    "fd",
+    "rg",
+    "lsd",
+    "fzf",
+    "starship",
+    "scoop",
+    "tailscale",
+    "caddy",
+    "python",
+    "pip",
+    "node",
+    "npm",
+    "pwsh",
+    "docker",
+    "dnf",
+    "rpm",
+    "apt",
+    "pacman",
+    "pkg",
+    "z",
+    "zi",
+    "mkcd",
+    "ports",
+    "myip",
+    "fkill",
+    "fgs",
+    "fscoop",
+    "extract",
+    "touch",
+    "which",
+    "reload",
+    "ep",
+    "pkr",
+    "pki",
+    "pku",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PsParamExport {
@@ -261,9 +323,8 @@ pub fn cli_cache_path() -> PathBuf {
     cache_dir().join("cli_cache.json")
 }
 
-pub fn load_cli_disk_cache() -> HashMap<String, Vec<MillerItem>> {
-    let path = cli_cache_path();
-    if let Ok(bytes) = fs::read(&path) {
+fn load_cli_disk_cache_from(path: &Path) -> HashMap<String, Vec<MillerItem>> {
+    if let Ok(bytes) = fs::read(path) {
         if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<MillerItem>>>(&bytes) {
             return map;
         }
@@ -271,8 +332,7 @@ pub fn load_cli_disk_cache() -> HashMap<String, Vec<MillerItem>> {
     HashMap::new()
 }
 
-pub fn save_cli_disk_cache(cache: &HashMap<String, Vec<MillerItem>>) {
-    let path = cli_cache_path();
+fn save_cli_disk_cache_to(path: &Path, cache: &HashMap<String, Vec<MillerItem>>) {
     if let Ok(json) = serde_json::to_vec(cache) {
         let _ = fs::write(path, json);
     }
@@ -541,54 +601,7 @@ pub fn load_col1_commands(dialect: ShellDialect) -> Vec<MillerItem> {
     }
 
     // 4. Priority Favorites at the top
-    let priority = [
-        "git",
-        "prek",
-        "zoxide",
-        "winget",
-        "uv",
-        "uvx",
-        "cargo",
-        "rustc",
-        "adb",
-        "fd",
-        "rg",
-        "lsd",
-        "fzf",
-        "starship",
-        "scoop",
-        "tailscale",
-        "caddy",
-        "python",
-        "pip",
-        "node",
-        "npm",
-        "pwsh",
-        "docker",
-        "dnf",
-        "rpm",
-        "apt",
-        "pacman",
-        "pkg",
-        "z",
-        "zi",
-        "mkcd",
-        "ports",
-        "myip",
-        "fkill",
-        "fgs",
-        "fscoop",
-        "extract",
-        "touch",
-        "which",
-        "reload",
-        "ep",
-        "pkr",
-        "pki",
-        "pku",
-    ];
-
-    for &p in &priority {
+    for &p in PRIORITY_CLI_TOOLS {
         let key = p.to_ascii_lowercase();
         if seen.contains(&key) {
             continue;
@@ -972,12 +985,33 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
     subcmds
 }
 
-pub fn introspect_cli_chain(chain: &[String], dialect: ShellDialect) -> Vec<MillerItem> {
+/// Adapter signature for running a CLI command (`exe`, `args`) and returning combined help text.
+pub type CommandRunner = dyn Fn(&str, &[&str]) -> Option<String> + Send + Sync;
+
+fn default_command_runner() -> Arc<CommandRunner> {
+    Arc::new(|exe: &str, args: &[&str]| {
+        let out = run_command_with_timeout(exe, args, 450);
+        if out.trim().is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    })
+}
+
+pub fn introspect_cli_chain_with<F>(
+    chain: &[&str],
+    dialect: ShellDialect,
+    run_cmd: &F,
+) -> Vec<MillerItem>
+where
+    F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
+{
     if chain.is_empty() {
         return Vec::new();
     }
-    let exe = &chain[0];
-    let sub_args: Vec<&str> = chain[1..].iter().map(|s| s.as_str()).collect();
+    let exe = chain[0];
+    let sub_args: Vec<&str> = chain[1..].to_vec();
 
     // Note: For git, always prefer `-h` so git never spawns a web browser on Windows!
     let primary_flag = if exe.eq_ignore_ascii_case("git") {
@@ -988,12 +1022,14 @@ pub fn introspect_cli_chain(chain: &[String], dialect: ShellDialect) -> Vec<Mill
 
     let mut args1 = sub_args.clone();
     args1.push(primary_flag);
-    let mut text = run_command_with_timeout(exe, &args1, 450);
+    let mut text = run_cmd(exe, &args1).unwrap_or_default();
 
     if text.trim().len() < 25 && primary_flag != "-h" {
-        let mut args2 = sub_args.clone();
+        let mut args2 = sub_args;
         args2.push("-h");
-        text = run_command_with_timeout(exe, &args2, 450);
+        if let Some(fallback_text) = run_cmd(exe, &args2) {
+            text = fallback_text;
+        }
     }
 
     let mut items = parse_cli_help(&text);
@@ -1020,13 +1056,229 @@ pub fn introspect_cli_chain(chain: &[String], dialect: ShellDialect) -> Vec<Mill
     items
 }
 
-pub fn spawn_background_worker(
+#[allow(dead_code)]
+pub fn introspect_cli_chain(chain: &[&str], dialect: ShellDialect) -> Vec<MillerItem> {
+    let runner = default_command_runner();
+    introspect_cli_chain_with(chain, dialect, &*runner)
+}
+
+/// Deep CLI introspection and caching module owning the in-memory CLI cache map,
+/// dirty tracking, disk persistence, canonical command-chain cache keys, background
+/// worker thread/channels, and priority tool cache warming.
+pub struct CliIntrospector {
+    cache: HashMap<String, Vec<MillerItem>>,
+    pending_keys: HashSet<String>,
+    dirty: bool,
+    dialect: ShellDialect,
+    cache_path: Option<PathBuf>,
+    runner: Arc<CommandRunner>,
+    req_tx: Sender<BgRequest>,
+    res_rx: Receiver<BgResponse>,
+    wait_on_poll: bool,
+}
+
+impl CliIntrospector {
+    /// Creates a production `CliIntrospector` backed by `cli_cache.json` and a background OS worker thread.
+    pub fn new(dialect: ShellDialect) -> Self {
+        let path = cli_cache_path();
+        let cache = load_cli_disk_cache_from(&path);
+        let runner = default_command_runner();
+        Self::build(dialect, cache, Some(path), runner, false)
+    }
+
+    /// Creates a `CliIntrospector` with an injected command-output adapter and optional disk cache path.
+    #[allow(dead_code)]
+    pub fn with_runner<F>(dialect: ShellDialect, cache_path: Option<PathBuf>, runner: F) -> Self
+    where
+        F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
+    {
+        let cache = cache_path
+            .as_deref()
+            .map(load_cli_disk_cache_from)
+            .unwrap_or_default();
+        Self::build(dialect, cache, cache_path, Arc::new(runner), true)
+    }
+
+    /// Creates an in-memory `CliIntrospector` pre-seeded with `cache` that never spawns OS processes.
+    #[allow(dead_code)]
+    pub fn with_initial_cache(
+        dialect: ShellDialect,
+        cache: HashMap<String, Vec<MillerItem>>,
+    ) -> Self {
+        let runner: Arc<CommandRunner> = Arc::new(|_, _| None);
+        Self::build(dialect, cache, None, runner, false)
+    }
+
+    fn build(
+        dialect: ShellDialect,
+        cache: HashMap<String, Vec<MillerItem>>,
+        cache_path: Option<PathBuf>,
+        runner: Arc<CommandRunner>,
+        wait_on_poll: bool,
+    ) -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
+        let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
+        let worker_runner = Arc::clone(&runner);
+        spawn_background_worker(req_rx, res_tx, dialect, worker_runner);
+
+        Self {
+            cache,
+            pending_keys: HashSet::new(),
+            dirty: false,
+            dialect,
+            cache_path,
+            runner,
+            req_tx,
+            res_rx,
+            wait_on_poll,
+        }
+    }
+
+    /// Canonical cache key for a command chain (`&["git"]` -> `"git"`, `&["git", "commit"]` -> `"git::commit"`).
+    pub fn chain_key(chain: &[&str]) -> String {
+        chain
+            .iter()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join("::")
+    }
+
+    /// Queries the cache for `chain`. On cache hit, returns the cached items.
+    /// On cache miss, enqueues a deduplicated background introspection job and returns a loading placeholder item.
+    pub fn query(&mut self, chain: &[&str]) -> Vec<MillerItem> {
+        let key = Self::chain_key(chain);
+        if let Some(cached) = self.cache.get(&key) {
+            return cached.clone();
+        }
+
+        if !chain.is_empty() && self.pending_keys.insert(key.clone()) {
+            let _ = self.req_tx.send(BgRequest {
+                cache_key: key,
+                cmd_chain: chain.iter().map(|s| (*s).to_string()).collect(),
+            });
+        }
+
+        vec![Self::loading_item(chain)]
+    }
+
+    /// Read-only inspection of cached items for `chain`, if present.
+    #[allow(dead_code)]
+    pub fn get(&self, chain: &[&str]) -> Option<&[MillerItem]> {
+        let key = Self::chain_key(chain);
+        self.cache.get(&key).map(|v| v.as_slice())
+    }
+
+    /// Drains completed background introspection responses into the cache.
+    /// Returns `true` if one or more cache entries were added/updated.
+    pub fn poll(&mut self) -> bool {
+        let mut updated = false;
+        while let Ok(resp) = self.res_rx.try_recv() {
+            self.pending_keys.remove(&resp.cache_key);
+            self.cache.insert(resp.cache_key, resp.items);
+            self.dirty = true;
+            updated = true;
+        }
+
+        if self.wait_on_poll {
+            while !self.pending_keys.is_empty() {
+                match self.res_rx.recv_timeout(Duration::from_millis(500)) {
+                    Ok(resp) => {
+                        self.pending_keys.remove(&resp.cache_key);
+                        self.cache.insert(resp.cache_key, resp.items);
+                        self.dirty = true;
+                        updated = true;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        updated
+    }
+
+    /// Whether new cache entries have been recorded since startup or the last `flush()`.
+    #[allow(dead_code)]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Persists the cache to disk if and only if new entries were recorded.
+    pub fn flush(&mut self) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        if let Some(ref path) = self.cache_path {
+            save_cli_disk_cache_to(path, &self.cache);
+        }
+        self.dirty = false;
+        true
+    }
+
+    /// Pre-warms the CLI cache in parallel for all installed tools in `PRIORITY_CLI_TOOLS`
+    /// using the canonical cache key format. Returns the number of installed priority tools warmed.
+    pub fn warm_priority_tools(&mut self, col1_items: &[MillerItem]) -> usize {
+        let installed: HashSet<String> = col1_items
+            .iter()
+            .filter(|it| it.kind == ItemKind::Cli)
+            .map(|it| it.text.to_ascii_lowercase())
+            .collect();
+
+        let available: Vec<&str> = PRIORITY_CLI_TOOLS
+            .iter()
+            .copied()
+            .filter(|t| installed.contains(&t.to_ascii_lowercase()))
+            .collect();
+
+        let dialect = self.dialect;
+        let runner = Arc::clone(&self.runner);
+        let results: Vec<(String, Vec<MillerItem>)> = available
+            .par_iter()
+            .map(|&tool| {
+                let chain = [tool];
+                let items = introspect_cli_chain_with(&chain, dialect, &*runner);
+                (Self::chain_key(&chain), items)
+            })
+            .collect();
+
+        for (key, items) in results {
+            if !items.is_empty() {
+                self.pending_keys.remove(&key);
+                self.cache.insert(key, items);
+                self.dirty = true;
+            }
+        }
+
+        available.len()
+    }
+
+    fn loading_item(chain: &[&str]) -> MillerItem {
+        if chain.len() <= 1 {
+            let cmd = chain.first().copied().unwrap_or("");
+            MillerItem::new(
+                "",
+                format!("⟳ Loading subcommands & flags for '{cmd}'..."),
+                ItemKind::Loading,
+                format!("Introspecting {cmd} --help in background thread"),
+            )
+        } else {
+            let joined = chain.join(" ");
+            MillerItem::new(
+                "",
+                format!("⟳ Loading options for '{joined}'..."),
+                ItemKind::Loading,
+                format!("Introspecting {joined} --help in background thread"),
+            )
+        }
+    }
+}
+
+fn spawn_background_worker(
     rx: Receiver<BgRequest>,
     tx: Sender<BgResponse>,
     dialect: ShellDialect,
+    runner: Arc<CommandRunner>,
 ) {
     thread::spawn(move || {
-        let mut handled = HashSet::new();
         let mut stack: Vec<BgRequest> = Vec::new();
         loop {
             if stack.is_empty() {
@@ -1040,14 +1292,17 @@ pub fn spawn_background_worker(
                 stack.push(newer);
             }
             if let Some(req) = stack.pop() {
-                if !handled.insert(req.cache_key.clone()) {
-                    continue;
+                let chain_refs: Vec<&str> = req.cmd_chain.iter().map(|s| s.as_str()).collect();
+                let items = introspect_cli_chain_with(&chain_refs, dialect, &*runner);
+                if tx
+                    .send(BgResponse {
+                        cache_key: req.cache_key,
+                        items,
+                    })
+                    .is_err()
+                {
+                    break;
                 }
-                let items = introspect_cli_chain(&req.cmd_chain, dialect);
-                let _ = tx.send(BgResponse {
-                    cache_key: req.cache_key,
-                    items,
-                });
             }
         }
     });
@@ -1473,5 +1728,259 @@ work on the current change (see also: git help everyday)
         assert_eq!(ia_param.text, "-InformationAction");
         assert_eq!(ia_param.label, "-InformationAction (-ia)");
         assert_eq!(ia_param.aliases, vec!["ia".to_string()]);
+    }
+
+    #[test]
+    fn test_cli_introspector_cache_miss_background_poll_and_persistence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_path = env::temp_dir().join(format!(
+            "zpane_test_cli_cache_{}_{}.json",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_file(&temp_path);
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_runner = Arc::clone(&call_count);
+
+        let mut introspector = CliIntrospector::with_runner(
+            ShellDialect::Posix,
+            Some(temp_path.clone()),
+            move |exe, args| {
+                call_count_runner.fetch_add(1, Ordering::SeqCst);
+                match (exe.to_ascii_lowercase().as_str(), args) {
+                    ("cargo", ["--help"]) => Some(
+                        "\
+Usage: cargo [OPTIONS] [COMMAND]
+
+Commands:
+  build    Compile the current package
+  test     Execute all unit and integration tests
+
+Options:
+  -V, --version    Print version info and exit
+  -h, --help       Print help
+"
+                        .to_string(),
+                    ),
+                    ("cargo", ["build", "--help"]) => Some(
+                        "\
+Usage: cargo build [OPTIONS]
+
+Options:
+  -r, --release          Build artifacts in release mode, with optimizations
+      --target <TRIPLE>  Build for the target triple
+"
+                        .to_string(),
+                    ),
+                    _ => None,
+                }
+            },
+        );
+
+        assert!(!introspector.is_dirty());
+        assert!(!introspector.flush(), "Clean cache must not write to disk");
+        assert!(!temp_path.exists());
+
+        // 1. First query for top-level command is a cache miss returning a Loading placeholder
+        let miss = introspector.query(&["cargo"]);
+        assert_eq!(miss.len(), 1);
+        assert_eq!(miss[0].kind, ItemKind::Loading);
+
+        // Duplicate query while in-flight remains deduplicated
+        let miss_dup = introspector.query(&["CARGO"]);
+        assert_eq!(miss_dup.len(), 1);
+        assert_eq!(miss_dup[0].kind, ItemKind::Loading);
+
+        // 2. Poll drains background worker completion and marks cache dirty
+        assert!(introspector.poll());
+        assert!(introspector.is_dirty());
+        assert!(
+            !introspector.poll(),
+            "Second poll with no pending jobs returns false"
+        );
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // 3. Subsequent queries (regardless of casing) hit the populated cache
+        let cached = introspector.query(&["Cargo"]);
+        let texts: Vec<&str> = cached.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.contains(&"build"));
+        assert!(texts.contains(&"test"));
+        assert!(texts.contains(&"--version"));
+
+        // 4. Subcommand chain query (`cargo build`)
+        let sub_miss = introspector.query(&["cargo", "build"]);
+        assert_eq!(sub_miss.len(), 1);
+        assert_eq!(sub_miss[0].kind, ItemKind::Loading);
+
+        assert!(introspector.poll());
+        let sub_cached = introspector.query(&["CARGO", "BUILD"]);
+        let sub_texts: Vec<&str> = sub_cached.iter().map(|i| i.text.as_str()).collect();
+        assert!(sub_texts.contains(&"--release"));
+        assert!(sub_texts.contains(&"--target"));
+        assert!(
+            sub_texts.contains(&"$PWD"),
+            "Subcommand level appends dialect common variables"
+        );
+
+        // 5. Flush writes to disk once and clears dirty flag
+        assert!(introspector.flush());
+        assert!(!introspector.is_dirty());
+        assert!(temp_path.exists());
+        assert!(!introspector.flush());
+
+        // 6. New introspector loads persisted cache from disk without invoking command runner
+        let mut reloaded = CliIntrospector::with_runner(
+            ShellDialect::Posix,
+            Some(temp_path.clone()),
+            |_exe, _args| {
+                panic!("Reloaded cache should satisfy queries without invoking runner");
+            },
+        );
+        let from_disk = reloaded.query(&["cargo", "build"]);
+        assert!(from_disk.iter().any(|i| i.text == "--release"));
+
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    #[test]
+    fn test_cli_introspector_help_to_short_h_fallback_and_git_short_h() {
+        use std::sync::Mutex;
+        type RecordedCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
+        let calls: RecordedCalls = Arc::new(Mutex::new(Vec::new()));
+        let calls_runner = Arc::clone(&calls);
+
+        let mut introspector =
+            CliIntrospector::with_runner(ShellDialect::Posix, None, move |exe, args| {
+                calls_runner.lock().unwrap().push((
+                    exe.to_string(),
+                    args.iter().map(|s| (*s).to_string()).collect(),
+                ));
+
+                match (exe, args) {
+                    // Simulates a tool where `--help` fails with a short error and `-h` succeeds
+                    ("legacytool", ["--help"]) => Some("unknown option".to_string()),
+                    ("legacytool", ["-h"]) => Some(
+                        "\
+Options:
+  -v, --verbose    Enable verbose output
+  -f, --file <F>   Specify input file
+"
+                        .to_string(),
+                    ),
+                    // Git must query `-h` directly without trying `--help`
+                    ("git", ["-h"]) => Some(
+                        "\
+start a working area
+   clone      Clone a repository into a new directory
+   init       Create an empty Git repository
+"
+                        .to_string(),
+                    ),
+                    _ => None,
+                }
+            });
+
+        assert_eq!(
+            introspector.query(&["legacytool"])[0].kind,
+            ItemKind::Loading
+        );
+        assert_eq!(introspector.query(&["git"])[0].kind, ItemKind::Loading);
+        assert!(introspector.poll());
+
+        let legacy_items = introspector.query(&["legacytool"]);
+        let legacy_texts: Vec<&str> = legacy_items.iter().map(|i| i.text.as_str()).collect();
+        assert!(legacy_texts.contains(&"--verbose"));
+        assert!(legacy_texts.contains(&"--file"));
+
+        let git_items = introspector.query(&["git"]);
+        let git_texts: Vec<&str> = git_items.iter().map(|i| i.text.as_str()).collect();
+        assert!(git_texts.contains(&"clone"));
+        assert!(git_texts.contains(&"init"));
+
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded.contains(&("legacytool".to_string(), vec!["--help".to_string()])),
+            "legacytool should try --help first"
+        );
+        assert!(
+            recorded.contains(&("legacytool".to_string(), vec!["-h".to_string()])),
+            "legacytool should fall back to -h when --help output is too short"
+        );
+        assert!(
+            recorded.contains(&("git".to_string(), vec!["-h".to_string()])),
+            "git should use -h directly"
+        );
+        assert!(
+            !recorded.contains(&("git".to_string(), vec!["--help".to_string()])),
+            "git must never invoke --help"
+        );
+    }
+
+    #[test]
+    fn test_canonical_priority_tools_and_warm_cache_key_matching() {
+        assert!(
+            PRIORITY_CLI_TOOLS.contains(&"gh"),
+            "Canonical priority tool list must include gh"
+        );
+        assert!(PRIORITY_CLI_TOOLS.contains(&"git"));
+        assert!(PRIORITY_CLI_TOOLS.contains(&"cargo"));
+
+        let col1_items = vec![
+            MillerItem::new("Git", "Git", ItemKind::Cli, "/usr/bin/git"),
+            MillerItem::new("gh", "gh", ItemKind::Cli, "/usr/bin/gh"),
+            MillerItem::new(
+                "unlisted-cli",
+                "unlisted-cli",
+                ItemKind::Cli,
+                "/usr/bin/unlisted-cli",
+            ),
+        ];
+
+        let mut introspector =
+            CliIntrospector::with_runner(ShellDialect::Posix, None, |exe, _args| {
+                match exe.to_ascii_lowercase().as_str() {
+                    "git" => Some(
+                        "\
+start a working area
+   clone      Clone a repository into a new directory
+"
+                        .to_string(),
+                    ),
+                    "gh" => Some(
+                        "\
+CORE COMMANDS
+  pr:            Manage pull requests
+  issue:         Manage issues
+"
+                        .to_string(),
+                    ),
+                    _ => panic!("Unexpected non-priority tool warmed: {exe}"),
+                }
+            });
+
+        let warmed = introspector.warm_priority_tools(&col1_items);
+        assert_eq!(warmed, 2);
+        assert!(introspector.is_dirty());
+
+        // Interactive queries using any casing hit the warmed cache immediately (no Loading state)
+        let git_items = introspector.query(&["git"]);
+        assert!(git_items.iter().all(|i| i.kind != ItemKind::Loading));
+        assert!(git_items.iter().any(|i| i.text == "clone"));
+
+        let git_upper = introspector.query(&["GIT"]);
+        assert!(git_upper.iter().any(|i| i.text == "clone"));
+
+        let gh_items = introspector.query(&["gh"]);
+        assert!(gh_items.iter().all(|i| i.kind != ItemKind::Loading));
+        assert!(gh_items.iter().any(|i| i.text == "pr"));
+        assert!(gh_items.iter().any(|i| i.text == "issue"));
+
+        assert_eq!(
+            CliIntrospector::chain_key(&["Git", "Commit"]),
+            "git::commit"
+        );
     }
 }
