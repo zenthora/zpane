@@ -10,6 +10,7 @@ use crossterm::{
 use discovery::{
     common_var_items, ensure_ps_metadata_async, introspect_cli_chain, load_cli_disk_cache,
     load_col1_commands, save_cli_disk_cache, spawn_background_worker, sync_powershell_metadata,
+    ShellDialect,
 };
 use fuzzy::{filter_items, FilteredItem};
 use model::{BgRequest, BgResponse, ItemKind, MillerItem};
@@ -272,6 +273,7 @@ fn resolve_col3_items(
     cli_cache: &HashMap<String, Vec<MillerItem>>,
     bg_tx: &mpsc::Sender<BgRequest>,
     custom_input: &str,
+    dialect: ShellDialect,
 ) -> Vec<MillerItem> {
     let (Some(c1), Some(c2)) = (col1, col2) else {
         return Vec::new();
@@ -307,7 +309,7 @@ fn resolve_col3_items(
     if !c2.children.is_empty() {
         items.extend_from_slice(&c2.children);
         if matches!(c2.kind, ItemKind::Param | ItemKind::Switch) {
-            items.extend_from_slice(common_var_items());
+            items.extend(common_var_items(dialect));
         }
         return items;
     }
@@ -337,7 +339,7 @@ fn resolve_col3_items(
         return items;
     }
 
-    items.extend_from_slice(common_var_items());
+    items.extend(common_var_items(dialect));
     items
 }
 
@@ -435,6 +437,7 @@ struct TuiState {
     active_param_set_label: Option<String>,
     term_w: usize,
     term_h: usize,
+    dialect: ShellDialect,
     dirty: bool,
 }
 
@@ -446,6 +449,7 @@ impl TuiState {
         initial_buffer: &str,
         fallback_w: usize,
         fallback_h: usize,
+        dialect: ShellDialect,
     ) -> Self {
         let mut active_col = 0;
         let mut sel_idx = [0, 0, 0];
@@ -500,6 +504,7 @@ impl TuiState {
             active_param_set_label: None,
             term_w,
             term_h,
+            dialect,
             dirty: true,
         }
     }
@@ -613,6 +618,7 @@ impl TuiState {
                 &self.cli_cache,
                 &self.req_tx,
                 &self.filters[2],
+                self.dialect,
             );
             self.col3_filter_dirty = true;
             self.sel_idx[2] = 0;
@@ -764,7 +770,7 @@ impl TuiState {
                     }
                     (KeyCode::Char('r'), KeyModifiers::CONTROL) => {
                         let _ = sync_powershell_metadata();
-                        self.col1_items = load_col1_commands();
+                        self.col1_items = load_col1_commands(self.dialect);
                         self.col1_filter_dirty = true;
                         self.last_c1_key.clear();
                         self.last_c2_key.clear();
@@ -1020,6 +1026,8 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let dialect = ShellDialect::detect();
+
     if args.iter().any(|a| a == "--sync-ps" || a == "--warm") {
         let warm = args.iter().any(|a| a == "--warm");
         match sync_powershell_metadata() {
@@ -1060,7 +1068,7 @@ fn main() -> anyhow::Result<()> {
                 "npm",
                 "pip",
             ];
-            let installed: HashSet<String> = load_col1_commands()
+            let installed: HashSet<String> = load_col1_commands(dialect)
                 .into_iter()
                 .filter(|it| it.kind == ItemKind::Cli)
                 .map(|it| it.text.to_ascii_lowercase())
@@ -1073,7 +1081,7 @@ fn main() -> anyhow::Result<()> {
             let results: Vec<(String, Vec<MillerItem>)> = available
                 .par_iter()
                 .map(|&t| {
-                    let items = introspect_cli_chain(&[t.to_string()]);
+                    let items = introspect_cli_chain(&[t.to_string()], dialect);
                     (t.to_string(), items)
                 })
                 .collect();
@@ -1137,13 +1145,13 @@ fn main() -> anyhow::Result<()> {
         let _ = fs::remove_file(f);
     }
 
-    ensure_ps_metadata_async();
+    ensure_ps_metadata_async(dialect);
 
-    let col1_items = load_col1_commands();
+    let col1_items = load_col1_commands(dialect);
     let cli_cache = load_cli_disk_cache();
     let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
     let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
-    spawn_background_worker(req_rx, res_tx);
+    spawn_background_worker(req_rx, res_tx, dialect);
 
     let mut state = TuiState::new(
         col1_items,
@@ -1152,6 +1160,7 @@ fn main() -> anyhow::Result<()> {
         &initial_buffer,
         fallback_w,
         fallback_h,
+        dialect,
     );
     let mut guard = TerminalGuard::enter()?;
     let accepted: Option<String>;
@@ -1272,7 +1281,14 @@ mod tests {
 
         // When user types custom URL in Column 3
         let custom_url = "https://github.com/user/my-repo";
-        let col3_items = resolve_col3_items(Some(&col1), Some(&col2), &cache, &req_tx, custom_url);
+        let col3_items = resolve_col3_items(
+            Some(&col1),
+            Some(&col2),
+            &cache,
+            &req_tx,
+            custom_url,
+            ShellDialect::Posix,
+        );
 
         assert!(!col3_items.is_empty());
         assert_eq!(col3_items[0].text, custom_url);
@@ -1321,7 +1337,15 @@ mod tests {
 
         let cli_cache: HashMap<String, Vec<MillerItem>> = HashMap::new();
         let (req_tx, _req_rx) = mpsc::channel::<BgRequest>();
-        let mut state = TuiState::new(col1_items, cli_cache, req_tx, "", 120, 30);
+        let mut state = TuiState::new(
+            col1_items,
+            cli_cache,
+            req_tx,
+            "",
+            120,
+            30,
+            ShellDialect::PowerShell,
+        );
         let _ = state.render(); // initial frame
 
         let mut max_step_ms = 0.0_f64;
