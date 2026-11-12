@@ -49,6 +49,8 @@ pub struct MillerItem {
     pub children: Vec<MillerItem>,
     #[serde(default)]
     pub parameter_sets: Vec<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
 }
 
 impl MillerItem {
@@ -65,6 +67,7 @@ impl MillerItem {
             desc: desc.into(),
             children: Vec::new(),
             parameter_sets: Vec::new(),
+            aliases: Vec::new(),
         }
     }
 
@@ -73,29 +76,12 @@ impl MillerItem {
         self.parameter_sets = sets;
         self
     }
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PsParamExport {
-    pub name: String,
-    #[serde(default)]
-    pub aliases: Vec<String>,
-    pub type_name: String,
-    pub is_switch: bool,
-    pub is_common: bool,
-    #[serde(default)]
-    pub valid_values: Vec<String>,
-    #[serde(default)]
-    pub parameter_sets: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PsCommandExport {
-    pub name: String,
-    pub kind: String,
-    pub desc: String,
-    #[serde(default)]
-    pub params: Vec<PsParamExport>,
+    #[allow(dead_code)]
+    pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
+        self.aliases = aliases;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]

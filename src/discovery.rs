@@ -1,5 +1,6 @@
-use crate::model::{BgRequest, BgResponse, ItemKind, MillerItem, PsCommandExport};
+use crate::model::{BgRequest, BgResponse, ItemKind, MillerItem};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -10,6 +11,29 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PsParamExport {
+    name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
+    type_name: String,
+    is_switch: bool,
+    is_common: bool,
+    #[serde(default)]
+    valid_values: Vec<String>,
+    #[serde(default)]
+    parameter_sets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PsCommandExport {
+    name: String,
+    kind: String,
+    desc: String,
+    #[serde(default)]
+    params: Vec<PsParamExport>,
+}
 
 /// Which shell syntax zpane emits for variable tokens and which command sources it indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,104 +46,83 @@ pub enum ShellDialect {
     Fish,
 }
 
-/// Resolves the active dialect once: `ZPANE_SHELL=pwsh|posix|fish` overrides; otherwise Windows is
-/// always PowerShell, `PSModulePath` selects PowerShell on Unix, `FISH_VERSION` selects Fish,
-/// and all other Unix environments default to Posix.
-pub fn shell_dialect() -> ShellDialect {
-    static DIALECT: OnceLock<ShellDialect> = OnceLock::new();
-    *DIALECT.get_or_init(|| {
-        match env::var("ZPANE_SHELL")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "pwsh" | "powershell" => return ShellDialect::PowerShell,
-            "fish" => return ShellDialect::Fish,
-            "posix" | "bash" | "zsh" | "sh" => return ShellDialect::Posix,
-            _ => {}
+impl ShellDialect {
+    /// Detects the active shell dialect from environment variables without process-global state:
+    /// `ZPANE_SHELL=pwsh|posix|fish` overrides; otherwise Windows is always PowerShell,
+    /// `PSModulePath` selects PowerShell on Unix, `FISH_VERSION` or `SHELL=*/fish` selects Fish,
+    /// and all other Unix environments default to Posix.
+    pub fn detect() -> Self {
+        let zpane_shell = env::var("ZPANE_SHELL").ok();
+        let ps_module_path = env::var_os("PSModulePath");
+        let fish_version = env::var_os("FISH_VERSION");
+        let shell = env::var("SHELL").ok();
+        Self::from_env(
+            zpane_shell.as_deref(),
+            ps_module_path.is_some(),
+            fish_version.is_some(),
+            shell.as_deref(),
+            cfg!(windows),
+        )
+    }
+
+    pub fn from_env(
+        zpane_shell: Option<&str>,
+        has_ps_module_path: bool,
+        has_fish_version: bool,
+        shell: Option<&str>,
+        is_windows: bool,
+    ) -> Self {
+        if let Some(zs) = zpane_shell {
+            match zs.to_ascii_lowercase().as_str() {
+                "pwsh" | "powershell" => return ShellDialect::PowerShell,
+                "fish" => return ShellDialect::Fish,
+                "posix" | "bash" | "zsh" | "sh" => return ShellDialect::Posix,
+                _ => {}
+            }
         }
-        if cfg!(windows) || env::var_os("PSModulePath").is_some() {
+        if is_windows || has_ps_module_path {
             ShellDialect::PowerShell
-        } else if env::var_os("FISH_VERSION").is_some()
-            || env::var("SHELL")
-                .map(|s| s.ends_with("/fish"))
-                .unwrap_or(false)
-        {
+        } else if has_fish_version || shell.map(|s| s.ends_with("/fish")).unwrap_or(false) {
             ShellDialect::Fish
         } else {
             ShellDialect::Posix
         }
-    })
-}
-
-/// Formats an environment variable reference in the active shell's syntax.
-fn env_token(name: &str) -> String {
-    match shell_dialect() {
-        ShellDialect::PowerShell => format!("$env:{name}"),
-        ShellDialect::Posix | ShellDialect::Fish => format!("${name}"),
     }
-}
 
-/// Prevents a console window from flashing up for child processes on Windows; no-op elsewhere.
-fn hide_window(cmd: &mut Command) -> &mut Command {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
-}
-
-/// Per-user cache directory: `%LOCALAPPDATA%\zpane` on Windows,
-/// `$XDG_CACHE_HOME/zpane` or `~/.cache/zpane` on Linux / Termux.
-pub fn cache_dir() -> PathBuf {
-    let base = if cfg!(windows) {
-        env::var_os("LOCALAPPDATA").map(PathBuf::from)
-    } else {
-        env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-    }
-    .unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join("zpane");
-    let _ = fs::create_dir_all(&dir);
-    dir
-}
-
-pub fn ps_metadata_path() -> PathBuf {
-    cache_dir().join("ps_metadata.json")
-}
-
-pub fn cli_cache_path() -> PathBuf {
-    cache_dir().join("cli_cache.json")
-}
-
-pub fn load_cli_disk_cache() -> HashMap<String, Vec<MillerItem>> {
-    let path = cli_cache_path();
-    if let Ok(bytes) = fs::read(&path) {
-        if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<MillerItem>>>(&bytes) {
-            return map;
+    /// Formats an environment variable reference in this dialect's syntax.
+    pub fn env_token(self, name: &str) -> String {
+        match self {
+            ShellDialect::PowerShell => format!("$env:{name}"),
+            ShellDialect::Posix | ShellDialect::Fish => format!("${name}"),
         }
     }
-    HashMap::new()
-}
 
-pub fn save_cli_disk_cache(cache: &HashMap<String, Vec<MillerItem>>) {
-    let path = cli_cache_path();
-    if let Ok(json) = serde_json::to_vec(cache) {
-        let _ = fs::write(path, json);
+    /// Returns the path-list separator for this dialect.
+    pub fn path_sep(self) -> char {
+        match self {
+            ShellDialect::PowerShell => ';',
+            ShellDialect::Posix | ShellDialect::Fish => ':',
+        }
     }
-}
 
-pub fn common_var_items() -> &'static [MillerItem] {
-    static COMMON_VARS: OnceLock<Vec<MillerItem>> = OnceLock::new();
-    COMMON_VARS.get_or_init(|| {
+    /// Whether an environment variable holds a list of paths that should be split into entries.
+    pub fn is_path_list(self, name: &str, value: &str) -> bool {
+        match self {
+            ShellDialect::PowerShell => value.contains(';'),
+            ShellDialect::Posix | ShellDialect::Fish => {
+                let upper = name.to_ascii_uppercase();
+                value.contains(':') && (upper.contains("PATH") || upper.ends_with("DIRS"))
+            }
+        }
+    }
+
+    /// Returns common built-in and special variable items for this shell dialect.
+    pub fn common_var_items(self) -> Vec<MillerItem> {
         let pwd = env::current_dir()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
 
-        match shell_dialect() {
+        match self {
             ShellDialect::PowerShell => {
                 let home = env::var("USERPROFILE")
                     .or_else(|_| env::var("HOME"))
@@ -215,30 +218,89 @@ pub fn common_var_items() -> &'static [MillerItem] {
                 ]
             }
         }
-    })
-}
-
-/// Whether an environment variable holds a list of paths that should be split into entries.
-fn is_path_list(name: &str, value: &str) -> bool {
-    if cfg!(windows) {
-        value.contains(';')
-    } else {
-        let upper = name.to_ascii_uppercase();
-        value.contains(':') && (upper.contains("PATH") || upper.ends_with("DIRS"))
     }
 }
 
-fn build_env_scope_item() -> MillerItem {
-    let mut vars: Vec<(String, String)> = env::vars().collect();
+/// Formats an environment variable reference in the given shell dialect's syntax.
+pub fn env_token(name: &str, dialect: ShellDialect) -> String {
+    dialect.env_token(name)
+}
+
+/// Prevents a console window from flashing up for child processes on Windows; no-op elsewhere.
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Per-user cache directory: `%LOCALAPPDATA%\zpane` on Windows,
+/// `$XDG_CACHE_HOME/zpane` or `~/.cache/zpane` on Linux / Termux.
+pub fn cache_dir() -> PathBuf {
+    let base = if cfg!(windows) {
+        env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else {
+        env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+    }
+    .unwrap_or_else(|| PathBuf::from("."));
+    let dir = base.join("zpane");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+pub fn ps_metadata_path() -> PathBuf {
+    cache_dir().join("ps_metadata.json")
+}
+
+pub fn cli_cache_path() -> PathBuf {
+    cache_dir().join("cli_cache.json")
+}
+
+pub fn load_cli_disk_cache() -> HashMap<String, Vec<MillerItem>> {
+    let path = cli_cache_path();
+    if let Ok(bytes) = fs::read(&path) {
+        if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<MillerItem>>>(&bytes) {
+            return map;
+        }
+    }
+    HashMap::new()
+}
+
+pub fn save_cli_disk_cache(cache: &HashMap<String, Vec<MillerItem>>) {
+    let path = cli_cache_path();
+    if let Ok(json) = serde_json::to_vec(cache) {
+        let _ = fs::write(path, json);
+    }
+}
+
+pub fn common_var_items(dialect: ShellDialect) -> Vec<MillerItem> {
+    dialect.common_var_items()
+}
+
+/// Whether an environment variable holds a list of paths that should be split into entries.
+pub fn is_path_list(name: &str, value: &str, dialect: ShellDialect) -> bool {
+    dialect.is_path_list(name, value)
+}
+
+pub fn build_env_scope_item_from_vars<I>(dialect: ShellDialect, vars_iter: I) -> MillerItem
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut vars: Vec<(String, String)> = vars_iter.into_iter().collect();
     vars.sort_by_key(|a| a.0.to_ascii_lowercase());
-    let list_sep = if cfg!(windows) { ';' } else { ':' };
+    let list_sep = dialect.path_sep();
 
     let mut children = Vec::with_capacity(vars.len());
     for (k, v) in vars {
-        let token = env_token(&k);
+        let token = env_token(&k, dialect);
         let mut item = MillerItem::new(&token, &k, ItemKind::Env, &v);
 
-        if is_path_list(&k, &v) {
+        if is_path_list(&k, &v, dialect) {
             for part in v.split(list_sep).filter(|s| !s.is_empty()) {
                 item.children.push(MillerItem::new(
                     format!("\"{part}\""),
@@ -266,7 +328,7 @@ fn build_env_scope_item() -> MillerItem {
         children.push(item);
     }
 
-    let (text, label) = match shell_dialect() {
+    let (text, label) = match dialect {
         ShellDialect::PowerShell => ("$env:", "$env:Variables"),
         ShellDialect::Posix | ShellDialect::Fish => ("$", "$ENV Variables"),
     };
@@ -280,8 +342,12 @@ fn build_env_scope_item() -> MillerItem {
     root
 }
 
-fn build_ps_var_scope_item() -> MillerItem {
-    let (label, desc) = match shell_dialect() {
+pub fn build_env_scope_item(dialect: ShellDialect) -> MillerItem {
+    build_env_scope_item_from_vars(dialect, env::vars())
+}
+
+pub fn build_ps_var_scope_item(dialect: ShellDialect) -> MillerItem {
+    let (label, desc) = match dialect {
         ShellDialect::PowerShell => (
             "$global:Variables",
             "Browse and insert PowerShell Session & Automatic Variables ($*)",
@@ -296,7 +362,7 @@ fn build_ps_var_scope_item() -> MillerItem {
         ),
     };
     let mut root = MillerItem::new("$", label, ItemKind::Var, desc);
-    root.children = common_var_items().to_vec();
+    root.children = common_var_items(dialect);
     for child in &mut root.children {
         let tok = child.text.clone();
         let val = child.desc.clone();
@@ -347,6 +413,7 @@ fn convert_ps_export_to_item(exp: PsCommandExport) -> MillerItem {
 
         let mut param_item = MillerItem::new(&p_flag, label, p_kind, desc);
         param_item.parameter_sets = p.parameter_sets;
+        param_item.aliases = p.aliases;
 
         for val in p.valid_values {
             param_item.children.push(MillerItem::new(
@@ -415,20 +482,20 @@ fn executable_name<'a>(entry: &fs::DirEntry, path: &'a Path) -> Option<&'a str> 
     }
 }
 
-pub fn load_col1_commands() -> Vec<MillerItem> {
+pub fn load_col1_commands(dialect: ShellDialect) -> Vec<MillerItem> {
     let mut list = Vec::with_capacity(5000);
     let mut seen = HashSet::new();
 
     // 1. Variable scopes first
-    list.push(build_env_scope_item());
+    list.push(build_env_scope_item(dialect));
     seen.insert("$env:variables".to_string());
-    list.push(build_ps_var_scope_item());
+    list.push(build_ps_var_scope_item(dialect));
     seen.insert("$global:variables".to_string());
 
     // 2. Load exported PowerShell metadata if available (PowerShell dialect only)
     let mut ps_map: HashMap<String, MillerItem> = HashMap::new();
     let mut ps_order: Vec<String> = Vec::new();
-    let ps_bytes = if shell_dialect() == ShellDialect::PowerShell {
+    let ps_bytes = if dialect == ShellDialect::PowerShell {
         fs::read(ps_metadata_path()).ok()
     } else {
         None
@@ -905,7 +972,7 @@ pub fn parse_cli_help(help_text: &str) -> Vec<MillerItem> {
     subcmds
 }
 
-pub fn introspect_cli_chain(chain: &[String]) -> Vec<MillerItem> {
+pub fn introspect_cli_chain(chain: &[String], dialect: ShellDialect) -> Vec<MillerItem> {
     if chain.is_empty() {
         return Vec::new();
     }
@@ -930,13 +997,14 @@ pub fn introspect_cli_chain(chain: &[String]) -> Vec<MillerItem> {
     }
 
     let mut items = parse_cli_help(&text);
+    let vars = common_var_items(dialect);
 
     // If this is a subcommand or leaf level, also append helpful shell variables
     if chain.len() >= 2 {
         let mut existing: HashSet<String> = items.iter().map(|i| i.text.clone()).collect();
-        for cv in common_var_items() {
+        for cv in vars {
             if existing.insert(cv.text.clone()) {
-                items.push(cv.clone());
+                items.push(cv);
             }
         }
     } else if items.is_empty() {
@@ -946,13 +1014,17 @@ pub fn introspect_cli_chain(chain: &[String]) -> Vec<MillerItem> {
             ItemKind::Flag,
             format!("Display help for {exe}"),
         ));
-        items.extend_from_slice(common_var_items());
+        items.extend(vars);
     }
 
     items
 }
 
-pub fn spawn_background_worker(rx: Receiver<BgRequest>, tx: Sender<BgResponse>) {
+pub fn spawn_background_worker(
+    rx: Receiver<BgRequest>,
+    tx: Sender<BgResponse>,
+    dialect: ShellDialect,
+) {
     thread::spawn(move || {
         let mut handled = HashSet::new();
         let mut stack: Vec<BgRequest> = Vec::new();
@@ -971,7 +1043,7 @@ pub fn spawn_background_worker(rx: Receiver<BgRequest>, tx: Sender<BgResponse>) 
                 if !handled.insert(req.cache_key.clone()) {
                     continue;
                 }
-                let items = introspect_cli_chain(&req.cmd_chain);
+                let items = introspect_cli_chain(&req.cmd_chain, dialect);
                 let _ = tx.send(BgResponse {
                     cache_key: req.cache_key,
                     items,
@@ -1048,8 +1120,8 @@ $out | ConvertTo-Json -Depth 4 -Compress
     Ok(count)
 }
 
-pub fn ensure_ps_metadata_async() {
-    if shell_dialect() != ShellDialect::PowerShell {
+pub fn ensure_ps_metadata_async(dialect: ShellDialect) {
+    if dialect != ShellDialect::PowerShell {
         return;
     }
     let path: &Path = &ps_metadata_path();
@@ -1230,5 +1302,176 @@ work on the current change (see also: git help everyday)
         assert!(subcmds.contains(&"init"));
         assert!(subcmds.contains(&"add"));
         assert!(subcmds.contains(&"mv"));
+    }
+
+    #[test]
+    fn test_shell_dialects_side_by_side_in_same_process() {
+        // 1. Variable tokens across all three dialects in the same test run
+        assert_eq!(env_token("PATH", ShellDialect::PowerShell), "$env:PATH");
+        assert_eq!(env_token("PATH", ShellDialect::Posix), "$PATH");
+        assert_eq!(env_token("PATH", ShellDialect::Fish), "$PATH");
+
+        // 2. Built-in common variable items across all three dialects in the same test run
+        let ps_vars = common_var_items(ShellDialect::PowerShell);
+        let posix_vars = common_var_items(ShellDialect::Posix);
+        let fish_vars = common_var_items(ShellDialect::Fish);
+
+        let ps_texts: Vec<&str> = ps_vars.iter().map(|i| i.text.as_str()).collect();
+        assert!(ps_texts.contains(&"$PWD"));
+        assert!(ps_texts.contains(&"$PROFILE"));
+        assert!(ps_texts.contains(&"$env:TEMP"));
+        assert!(ps_texts.contains(&"$_"));
+        assert!(ps_texts.contains(&"$true"));
+        assert!(!ps_texts.contains(&"$?"));
+        assert!(!ps_texts.contains(&"$status"));
+
+        let posix_texts: Vec<&str> = posix_vars.iter().map(|i| i.text.as_str()).collect();
+        assert!(posix_texts.contains(&"$PWD"));
+        assert!(posix_texts.contains(&"$OLDPWD"));
+        assert!(posix_texts.contains(&"$?"));
+        assert!(posix_texts.contains(&"$!"));
+        assert!(!posix_texts.contains(&"$status"));
+        assert!(!posix_texts.contains(&"$PROFILE"));
+
+        let fish_texts: Vec<&str> = fish_vars.iter().map(|i| i.text.as_str()).collect();
+        assert!(fish_texts.contains(&"$PWD"));
+        assert!(fish_texts.contains(&"$status"));
+        assert!(fish_texts.contains(&"$last_pid"));
+        assert!(fish_texts.contains(&"$fish_pid"));
+        assert!(!fish_texts.contains(&"$?"));
+        assert!(!fish_texts.contains(&"$PROFILE"));
+
+        // 3. Path-list splitting and env scope construction across dialects
+        let sample_vars = vec![
+            (
+                "PATH".to_string(),
+                if cfg!(windows) {
+                    "C:\\bin;D:\\tools".to_string()
+                } else {
+                    "/usr/bin:/usr/local/bin".to_string()
+                },
+            ),
+            ("WIN_LIST".to_string(), "C:\\one;C:\\two".to_string()),
+            (
+                "XDG_DATA_DIRS".to_string(),
+                "/usr/share:/var/lib".to_string(),
+            ),
+            ("EDITOR".to_string(), "nvim".to_string()),
+        ];
+
+        let ps_scope =
+            build_env_scope_item_from_vars(ShellDialect::PowerShell, sample_vars.clone());
+        assert_eq!(ps_scope.text, "$env:");
+        assert_eq!(ps_scope.label, "$env:Variables");
+        let ps_win_list = ps_scope
+            .children
+            .iter()
+            .find(|c| c.label == "WIN_LIST")
+            .expect("WIN_LIST in PowerShell scope");
+        assert_eq!(ps_win_list.text, "$env:WIN_LIST");
+        let ps_win_entries: Vec<&str> = ps_win_list
+            .children
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(ps_win_entries, vec!["C:\\one", "C:\\two"]);
+
+        let posix_scope = build_env_scope_item_from_vars(ShellDialect::Posix, sample_vars.clone());
+        assert_eq!(posix_scope.text, "$");
+        assert_eq!(posix_scope.label, "$ENV Variables");
+        let posix_xdg = posix_scope
+            .children
+            .iter()
+            .find(|c| c.label == "XDG_DATA_DIRS")
+            .expect("XDG_DATA_DIRS in Posix scope");
+        assert_eq!(posix_xdg.text, "$XDG_DATA_DIRS");
+        let posix_xdg_entries: Vec<&str> = posix_xdg
+            .children
+            .iter()
+            .map(|c| c.label.as_str())
+            .collect();
+        assert_eq!(posix_xdg_entries, vec!["/usr/share", "/var/lib"]);
+
+        let fish_scope = build_env_scope_item_from_vars(ShellDialect::Fish, sample_vars);
+        assert_eq!(fish_scope.text, "$");
+        assert_eq!(fish_scope.label, "$ENV Variables");
+        let fish_xdg = fish_scope
+            .children
+            .iter()
+            .find(|c| c.label == "XDG_DATA_DIRS")
+            .expect("XDG_DATA_DIRS in Fish scope");
+        assert_eq!(fish_xdg.text, "$XDG_DATA_DIRS");
+        let fish_xdg_entries: Vec<&str> =
+            fish_xdg.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(fish_xdg_entries, vec!["/usr/share", "/var/lib"]);
+
+        // 4. ShellDialect::from_env detection rules
+        assert_eq!(
+            ShellDialect::from_env(Some("fish"), true, false, None, true),
+            ShellDialect::Fish
+        );
+        assert_eq!(
+            ShellDialect::from_env(Some("posix"), true, false, None, true),
+            ShellDialect::Posix
+        );
+        assert_eq!(
+            ShellDialect::from_env(Some("pwsh"), false, true, Some("/usr/bin/fish"), false),
+            ShellDialect::PowerShell
+        );
+        assert_eq!(
+            ShellDialect::from_env(None, false, false, Some("/usr/bin/fish"), false),
+            ShellDialect::Fish
+        );
+        assert_eq!(
+            ShellDialect::from_env(None, false, false, Some("/bin/bash"), false),
+            ShellDialect::Posix
+        );
+    }
+
+    #[test]
+    fn test_convert_ps_export_preserves_structured_aliases_and_label() {
+        let export = PsCommandExport {
+            name: "Get-Process".to_string(),
+            kind: "Cmdlet".to_string(),
+            desc: "Module: Microsoft.PowerShell.Management".to_string(),
+            params: vec![
+                PsParamExport {
+                    name: "Id".to_string(),
+                    aliases: vec!["PID".to_string(), "ProcessId".to_string()],
+                    type_name: "Int32[]".to_string(),
+                    is_switch: false,
+                    is_common: false,
+                    valid_values: Vec::new(),
+                    parameter_sets: vec!["Id".to_string()],
+                },
+                PsParamExport {
+                    name: "InformationAction".to_string(),
+                    aliases: vec!["ia".to_string()],
+                    type_name: "ActionPreference".to_string(),
+                    is_switch: false,
+                    is_common: true,
+                    valid_values: vec!["SilentlyContinue".to_string(), "Continue".to_string()],
+                    parameter_sets: vec!["__AllParameterSets".to_string()],
+                },
+            ],
+        };
+
+        let item = convert_ps_export_to_item(export);
+        assert_eq!(item.text, "Get-Process");
+        assert_eq!(item.children.len(), 2);
+
+        let id_param = &item.children[0];
+        assert_eq!(id_param.text, "-Id");
+        assert_eq!(id_param.label, "-Id (-PID, -ProcessId)");
+        assert_eq!(
+            id_param.aliases,
+            vec!["PID".to_string(), "ProcessId".to_string()]
+        );
+        assert_eq!(id_param.parameter_sets, vec!["Id".to_string()]);
+
+        let ia_param = &item.children[1];
+        assert_eq!(ia_param.text, "-InformationAction");
+        assert_eq!(ia_param.label, "-InformationAction (-ia)");
+        assert_eq!(ia_param.aliases, vec!["ia".to_string()]);
     }
 }

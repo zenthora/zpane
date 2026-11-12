@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `ShellDialect::detect()` detects the active shell once from environment variables, while discovery functions (`env_token`, `common_var_items`, `build_env_scope_item`, `load_col1_commands`, `introspect_cli_chain`) accept an explicit `ShellDialect` value without process-global `OnceLock` state.
-- [ ] `PsParamExport` and `PsCommandExport` are removed from `src/model.rs` and made private to `src/discovery.rs`.
-- [ ] `MillerItem` includes `aliases: Vec<String>` (defaulting to empty where unused) and `convert_ps_export_to_item` populates `aliases` from PowerShell parameter metadata while keeping the human-readable display label.
-- [ ] Unit tests verify `PowerShell`, `Posix`, and `Fish` variable tokens, path-list splitting, and built-in variable items side-by-side within the same test process.
+- [x] `ShellDialect::detect()` detects the active shell once from environment variables, while discovery functions (`env_token`, `common_var_items`, `build_env_scope_item`, `load_col1_commands`, `introspect_cli_chain`) accept an explicit `ShellDialect` value without process-global `OnceLock` state.
+- [x] `PsParamExport` and `PsCommandExport` are removed from `src/model.rs` and made private to `src/discovery.rs`.
+- [x] `MillerItem` includes `aliases: Vec<String>` (defaulting to empty where unused) and `convert_ps_export_to_item` populates `aliases` from PowerShell parameter metadata while keeping the human-readable display label.
+- [x] Unit tests verify `PowerShell`, `Posix`, and `Fish` variable tokens, path-list splitting, and built-in variable items side-by-side within the same test process.
