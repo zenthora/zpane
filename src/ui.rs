@@ -1,5 +1,5 @@
 use crate::fuzzy::FilteredItem;
-use crate::model::MillerItem;
+use crate::model::{ItemKind, MillerItem};
 use std::fmt::Write as FmtWrite;
 use unicode_width::UnicodeWidthChar;
 
@@ -14,6 +14,35 @@ const C_DIM: &str = "\x1b[38;5;244m";
 const C_CMD_BAR: &str = "\x1b[38;5;114;1m";
 const C_FILTER: &str = "\x1b[38;5;223;1m";
 const RST: &str = "\x1b[0m";
+
+impl ItemKind {
+    pub fn ansi_color(self) -> &'static str {
+        match self {
+            ItemKind::Env | ItemKind::Var => "\x1b[38;5;216m", // Peach
+            ItemKind::Cli => "\x1b[38;5;114m",                 // Green
+            ItemKind::Func | ItemKind::Alias => "\x1b[38;5;81m", // Cyan
+            ItemKind::Cmdlet => "\x1b[38;5;75m",               // Blue
+            ItemKind::Subcmd => "\x1b[38;5;141m",              // Purple
+            ItemKind::Flag | ItemKind::Param => "\x1b[38;5;223m", // Soft yellow
+            ItemKind::Switch => "\x1b[38;5;183m",              // Lavender
+            ItemKind::Enum | ItemKind::Value => "\x1b[38;5;150m", // Mint green
+            ItemKind::Arg => "\x1b[38;5;250m",                 // Light gray
+            ItemKind::Loading => "\x1b[38;5;244m",             // Dim gray
+        }
+    }
+}
+
+/// Authoritative visible row count for a given terminal height and Miller column (`0..=2`).
+/// Accounts for the 6 rows of frame chrome (top border, divider, 3 status/footer bars, bottom border)
+/// and Column 3's 3-row inspector header.
+pub fn viewport_rows(term_h: usize, col: usize) -> usize {
+    let list_rows = term_h.saturating_sub(6).max(4);
+    if col == 2 {
+        list_rows.saturating_sub(3).max(1)
+    } else {
+        list_rows
+    }
+}
 
 pub fn clean_single_line(s: &str) -> String {
     s.chars()
@@ -146,15 +175,48 @@ pub struct RenderState<'a> {
     pub col3_items: &'a [MillerItem],
     pub col3_filtered: &'a [FilteredItem],
     pub cmd_preview: &'a str,
-    pub info_title: &'a str,
-    pub info_desc: &'a str,
     pub active_param_set: Option<&'a str>,
+}
+
+/// Resolves the currently inspected item from the active column, falling back to parent columns
+/// when the active column has no selection.
+pub fn selected_info_item<'a>(st: &RenderState<'a>) -> Option<&'a MillerItem> {
+    let cur_c1 = st
+        .col1_filtered
+        .get(st.sel_idx[0])
+        .and_then(|f| st.col1_items.get(f.item_idx));
+    let cur_c2 = st
+        .col2_filtered
+        .get(st.sel_idx[1])
+        .and_then(|f| st.col2_items.get(f.item_idx));
+    let cur_c3 = st
+        .col3_filtered
+        .get(st.sel_idx[2])
+        .and_then(|f| st.col3_items.get(f.item_idx));
+
+    match st.active_col {
+        2 => cur_c3.or(cur_c2).or(cur_c1),
+        1 => cur_c2.or(cur_c1),
+        _ => cur_c1,
+    }
+}
+
+/// Derives the Column 3 inspector header `(info_title, info_desc)` from `RenderState`.
+pub fn inspector_header(st: &RenderState<'_>) -> (String, String) {
+    let info_item = selected_info_item(st);
+    let info_title = info_item
+        .map(|it| format!(" ℹ {} {}", it.label, it.kind.badge()))
+        .unwrap_or_else(|| " ℹ No selection".to_string());
+    let info_desc = info_item
+        .map(|it| format!("   {}", it.desc))
+        .unwrap_or_default();
+    (info_title, info_desc)
 }
 
 pub fn render_frame(st: &RenderState<'_>) -> String {
     let win_w = st.term_w.max(76);
-    let win_h = st.term_h.max(16);
-    let list_rows = win_h.saturating_sub(6); // 1 top border + list_rows + 1 sep + 3 status/footer + 1 bottom border
+    let list_rows = viewport_rows(st.term_h, 0); // 1 top border + list_rows + 1 sep + 3 status/footer + 1 bottom border
+    let (info_title, info_desc) = inspector_header(st);
 
     let inner_w = win_w.saturating_sub(4);
     let w1 = (inner_w * 28 / 100).max(20);
@@ -223,10 +285,10 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
         // --- Column 3 (Top 3 rows = Inspector Header, Rows 3.. = Interactive List) ---
         let cell3 = if r == 0 {
-            let t = pad_or_truncate(st.info_title, w3);
+            let t = pad_or_truncate(&info_title, w3);
             format!("{C_HEADER_ACT}{t}{RST}")
         } else if r == 1 {
-            let t = pad_or_truncate(st.info_desc, w3);
+            let t = pad_or_truncate(&info_desc, w3);
             format!("{C_DIM}{t}{RST}")
         } else if r == 2 {
             format!("{C_BORDER_DIM}{}{RST}", "─".repeat(w3))
@@ -295,4 +357,154 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     );
 
     sb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fuzzy::filter_items;
+
+    #[test]
+    fn test_viewport_rows_standard_and_small_terminals() {
+        // Standard 30-row terminal: 30 - 6 = 24 list rows in Col 1/2, 21 in Col 3
+        assert_eq!(viewport_rows(30, 0), 24);
+        assert_eq!(viewport_rows(30, 1), 24);
+        assert_eq!(viewport_rows(30, 2), 21);
+
+        // Compact terminal (term_h < 16): e.g. 12 rows -> 6 list rows in Col 1/2, 3 in Col 3
+        assert_eq!(viewport_rows(12, 0), 6);
+        assert_eq!(viewport_rows(12, 1), 6);
+        assert_eq!(viewport_rows(12, 2), 3);
+
+        // Very small terminal clamping: minimum 4 list rows in Col 1/2, minimum 1 row in Col 3
+        assert_eq!(viewport_rows(8, 0), 4);
+        assert_eq!(viewport_rows(8, 1), 4);
+        assert_eq!(viewport_rows(8, 2), 1);
+    }
+
+    #[test]
+    fn test_small_terminal_scroll_alignment() {
+        let col1_items: Vec<MillerItem> = (0..10)
+            .map(|i| MillerItem::new(format!("cmd{i}"), format!("cmd{i}"), ItemKind::Cli, ""))
+            .collect();
+        let col1_filtered = filter_items(&col1_items, "");
+
+        let col3_items: Vec<MillerItem> = (0..10)
+            .map(|i| {
+                MillerItem::new(
+                    format!("--flag{i}"),
+                    format!("--flag{i}"),
+                    ItemKind::Flag,
+                    "",
+                )
+            })
+            .collect();
+        let col3_filtered = filter_items(&col3_items, "");
+
+        let term_h = 12; // < 16 rows
+        let max_r_c1 = viewport_rows(term_h, 0); // 6
+        let max_r_c3 = viewport_rows(term_h, 2); // 3
+
+        let sel_c1 = 7;
+        let scroll_c1 = sel_c1 + 1 - max_r_c1; // 2 (visible indices 2..=7)
+        let sel_c3 = 4;
+        let scroll_c3 = sel_c3 + 1 - max_r_c3; // 2 (visible indices 2..=4)
+
+        let filters = [String::new(), String::new(), String::new()];
+        let sel_idx = [sel_c1, 0, sel_c3];
+        let scroll_idx = [scroll_c1, 0, scroll_c3];
+
+        let frame = render_frame(&RenderState {
+            term_w: 100,
+            term_h,
+            active_col: 2,
+            filters: &filters,
+            sel_idx: &sel_idx,
+            scroll_idx: &scroll_idx,
+            col1_items: &col1_items,
+            col1_filtered: &col1_filtered,
+            col2_items: &[],
+            col2_filtered: &[],
+            col3_items: &col3_items,
+            col3_filtered: &col3_filtered,
+            cmd_preview: "cmd7 --flag4",
+            active_param_set: None,
+        });
+
+        // Total rendered lines must equal term_h (6 list rows + 6 chrome lines = 12)
+        assert_eq!(frame.lines().count(), term_h);
+        // Bottom-most visible selections in both Col 1 and Col 3 must appear in the rendered frame
+        assert!(frame.contains("cmd7"));
+        assert!(!frame.contains("cmd1"));
+        assert!(frame.contains("--flag4"));
+        assert!(!frame.contains("--flag1"));
+    }
+
+    #[test]
+    fn test_inspector_header_derivation() {
+        let col1_items = vec![MillerItem::new(
+            "git",
+            "git",
+            ItemKind::Cli,
+            "Distributed version control",
+        )];
+        let col1_filtered = filter_items(&col1_items, "");
+
+        let col2_items = vec![MillerItem::new(
+            "commit",
+            "commit",
+            ItemKind::Subcmd,
+            "Record changes to the repository",
+        )];
+        let col2_filtered = filter_items(&col2_items, "");
+
+        let filters = [String::new(), String::new(), String::new()];
+        let sel_idx = [0, 0, 0];
+        let scroll_idx = [0, 0, 0];
+
+        // Active Col 0 -> inspects col1 item
+        let st_col0 = RenderState {
+            term_w: 100,
+            term_h: 20,
+            active_col: 0,
+            filters: &filters,
+            sel_idx: &sel_idx,
+            scroll_idx: &scroll_idx,
+            col1_items: &col1_items,
+            col1_filtered: &col1_filtered,
+            col2_items: &col2_items,
+            col2_filtered: &col2_filtered,
+            col3_items: &[],
+            col3_filtered: &[],
+            cmd_preview: "git",
+            active_param_set: None,
+        };
+        let (title0, desc0) = inspector_header(&st_col0);
+        assert_eq!(title0, " ℹ git [CLI]");
+        assert_eq!(desc0, "   Distributed version control");
+
+        // Active Col 2 with empty Col 3 -> falls back to Col 2 selected item
+        let st_col2_fallback = RenderState {
+            active_col: 2,
+            ..st_col0
+        };
+        let (title2, desc2) = inspector_header(&st_col2_fallback);
+        assert_eq!(title2, " ℹ commit [Subcmd]");
+        assert_eq!(desc2, "   Record changes to the repository");
+        let frame = render_frame(&st_col2_fallback);
+        assert!(frame.contains("ℹ commit [Subcmd]"));
+        assert!(frame.contains("Record changes to the repository"));
+
+        // Empty selection across all columns -> " ℹ No selection"
+        let st_empty = RenderState {
+            col1_items: &[],
+            col1_filtered: &[],
+            col2_items: &[],
+            col2_filtered: &[],
+            ..st_col0
+        };
+        let (title_empty, desc_empty) = inspector_header(&st_empty);
+        assert_eq!(title_empty, " ℹ No selection");
+        assert_eq!(desc_empty, "");
+    }
 }

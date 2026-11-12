@@ -21,7 +21,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::Duration;
-use ui::{render_frame, RenderState};
+use ui::{render_frame, viewport_rows, RenderState};
 
 /// Windows console output: writes UTF-16 frames straight to `CONOUT$` via `WriteConsoleW`,
 /// so the TUI renders even when stdout is redirected by the shell integration.
@@ -632,13 +632,8 @@ impl TuiState {
     fn render(&mut self) -> String {
         self.sync_columns();
 
-        let list_rows = self.term_h.saturating_sub(6).max(4);
         for c in 0..3 {
-            let max_r = if c == 2 {
-                list_rows.saturating_sub(3).max(1)
-            } else {
-                list_rows
-            };
+            let max_r = viewport_rows(self.term_h, c);
             if self.sel_idx[c] < self.scroll_idx[c] {
                 self.scroll_idx[c] = self.sel_idx[c];
             }
@@ -669,21 +664,6 @@ impl TuiState {
             &self.filters[2],
         );
 
-        let info_item = if self.active_col == 2 {
-            cur_c3.or(cur_c2).or(cur_c1)
-        } else if self.active_col == 1 {
-            cur_c2.or(cur_c1)
-        } else {
-            cur_c1
-        };
-
-        let info_title = info_item
-            .map(|it| format!(" ℹ {} {}", it.label, it.kind.badge()))
-            .unwrap_or_else(|| " ℹ No selection".to_string());
-        let info_desc = info_item
-            .map(|it| format!("   {}", it.desc))
-            .unwrap_or_default();
-
         let frame = render_frame(&RenderState {
             term_w: self.term_w,
             term_h: self.term_h,
@@ -698,8 +678,6 @@ impl TuiState {
             col3_items: &self.col3_items,
             col3_filtered: &self.col3_filtered,
             cmd_preview: &cmd_preview,
-            info_title: &info_title,
-            info_desc: &info_desc,
             active_param_set: self.active_param_set_label.as_deref(),
         });
 
@@ -794,15 +772,17 @@ impl TuiState {
                     }
                     (KeyCode::PageUp, _) => {
                         if cur_len > 0 {
+                            let page_rows = viewport_rows(self.term_h, self.active_col);
                             self.sel_idx[self.active_col] =
-                                self.sel_idx[self.active_col].saturating_sub(12);
+                                self.sel_idx[self.active_col].saturating_sub(page_rows);
                             self.dirty = true;
                         }
                     }
                     (KeyCode::PageDown, _) => {
                         if cur_len > 0 {
+                            let page_rows = viewport_rows(self.term_h, self.active_col);
                             self.sel_idx[self.active_col] =
-                                (self.sel_idx[self.active_col] + 12).min(cur_len - 1);
+                                (self.sel_idx[self.active_col] + page_rows).min(cur_len - 1);
                             self.dirty = true;
                         }
                     }

@@ -37,21 +37,6 @@ impl ItemKind {
             ItemKind::Loading => "[...]",
         }
     }
-
-    pub fn ansi_color(self) -> &'static str {
-        match self {
-            ItemKind::Env | ItemKind::Var => "\x1b[38;5;216m", // Peach
-            ItemKind::Cli => "\x1b[38;5;114m",                 // Green
-            ItemKind::Func | ItemKind::Alias => "\x1b[38;5;81m", // Cyan
-            ItemKind::Cmdlet => "\x1b[38;5;75m",               // Blue
-            ItemKind::Subcmd => "\x1b[38;5;141m",              // Purple
-            ItemKind::Flag | ItemKind::Param => "\x1b[38;5;223m", // Soft yellow
-            ItemKind::Switch => "\x1b[38;5;183m",              // Lavender
-            ItemKind::Enum | ItemKind::Value => "\x1b[38;5;150m", // Mint green
-            ItemKind::Arg => "\x1b[38;5;250m",                 // Light gray
-            ItemKind::Loading => "\x1b[38;5;244m",             // Dim gray
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

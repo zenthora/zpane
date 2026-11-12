@@ -4,9 +4,9 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `ItemKind::ansi_color` is moved from `src/model.rs` to `src/ui.rs`.
-- [ ] `src/ui.rs` exposes a single viewport row-count helper (`viewport_rows(term_h: usize, col: usize) -> usize`) used by scroll clamping, `PageUp`/`PageDown` navigation, and `render_frame` so `main.rs` and `ui.rs` never disagree when `term_h < 16` or in Column 3.
-- [ ] `RenderState` drops pre-formatted `info_title` and `info_desc` fields; `src/ui.rs` derives the inspector header and bottom info bar directly from the active column's selected `MillerItem`.
-- [ ] Unit tests in `src/ui.rs` verify viewport row counts, small-terminal (`term_h < 16`) scroll alignment, and inspector header derivation.
+- [x] `ItemKind::ansi_color` is moved from `src/model.rs` to `src/ui.rs`.
+- [x] `src/ui.rs` exposes a single viewport row-count helper (`viewport_rows(term_h: usize, col: usize) -> usize`) used by scroll clamping, `PageUp`/`PageDown` navigation, and `render_frame` so `main.rs` and `ui.rs` never disagree when `term_h < 16` or in Column 3.
+- [x] `RenderState` drops pre-formatted `info_title` and `info_desc` fields; `src/ui.rs` derives the inspector header and bottom info bar directly from the active column's selected `MillerItem`.
+- [x] Unit tests in `src/ui.rs` verify viewport row counts, small-terminal (`term_h < 16`) scroll alignment, and inspector header derivation.
