@@ -69,7 +69,7 @@ def main() -> int:
     replace_all("README.md", r"zpane[-_]\d+\.\d+\.\d+", lambda m: m.group(0)[:6] + version)
 
     # Refresh Cargo.lock for the workspace package without touching external dependencies.
-    run(["cargo", "metadata", "--format-version=1", "--offline"], capture=True)
+    run(["cargo", "update", "--workspace", "--offline"], capture=True)
     run(["git-cliff", "--config", "cliff.toml", "--tag", f"v{version}", "-o", "CHANGELOG.md"])
     print(f"Updated version files and CHANGELOG.md for v{version}")
     return 0
