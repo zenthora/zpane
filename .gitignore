@@ -1,4 +1,6 @@
 /target
 /dist
+/.scratch/
+/.cargo/
 *.log
 session-*.md
