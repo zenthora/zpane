@@ -217,28 +217,30 @@ fn main() -> anyhow::Result<()> {
 
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--initial" if i + 1 < args.len() => {
-                initial_buffer = args[i + 1].clone();
-                i += 2;
-            }
-            "--out-file" if i + 1 < args.len() => {
-                out_file = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
-            }
-            "--width" if i + 1 < args.len() => {
-                if let Ok(w) = args[i + 1].parse::<usize>() {
-                    if w >= 40 {
-                        fallback_w = w;
+        let flag = args[i].as_str();
+        match flag {
+            "--initial" | "--out-file" | "--width" | "--height" => {
+                let Some(val) = args.get(i + 1) else {
+                    anyhow::bail!("Missing value for option {flag}");
+                };
+                match flag {
+                    "--initial" => initial_buffer = val.clone(),
+                    "--out-file" => out_file = Some(PathBuf::from(val)),
+                    "--width" => {
+                        if let Ok(w) = val.parse::<usize>() {
+                            if w >= 40 {
+                                fallback_w = w;
+                            }
+                        }
                     }
-                }
-                i += 2;
-            }
-            "--height" if i + 1 < args.len() => {
-                if let Ok(h) = args[i + 1].parse::<usize>() {
-                    if h >= 12 {
-                        fallback_h = h;
+                    "--height" => {
+                        if let Ok(h) = val.parse::<usize>() {
+                            if h >= 12 {
+                                fallback_h = h;
+                            }
+                        }
                     }
+                    _ => unreachable!(),
                 }
                 i += 2;
             }
@@ -262,20 +264,16 @@ fn main() -> anyhow::Result<()> {
     let introspector = CliIntrospector::new(dialect);
 
     let (tw, th) = size().unwrap_or((fallback_w as u16, fallback_h as u16));
-    let term_w = if tw >= 40 { tw as usize } else { fallback_w }.saturating_sub(1);
-    let term_h = if th >= 12 { th as usize } else { fallback_h }.saturating_sub(1);
+    let viewport = ui::Viewport::from_terminal_size(tw, th, fallback_w, fallback_h);
 
-    let mut session = MillerSession::new(
-        col1_items,
-        introspector,
-        &initial_buffer,
-        ui::Viewport::new(term_w, term_h),
-        dialect,
-    )
-    .with_catalog_loader(|d| {
-        let _ = sync_powershell_metadata();
-        load_col1_commands(d)
-    });
+    let mut session =
+        MillerSession::new(col1_items, introspector, &initial_buffer, viewport, dialect)
+            .with_catalog_loader(|d| {
+                if d.is_powershell() {
+                    let _ = sync_powershell_metadata();
+                }
+                load_col1_commands(d)
+            });
 
     let mut guard = TerminalGuard::enter()?;
     let accepted: Option<String>;

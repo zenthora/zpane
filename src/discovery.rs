@@ -217,18 +217,12 @@ impl ShellDialect {
                     MillerItem::new("$null", "$null", ItemKind::Var, "Null reference"),
                 ]
             }
-            ShellDialect::Posix => {
+            ShellDialect::Posix | ShellDialect::Fish => {
                 let var = |k: &str| env::var(k).unwrap_or_default();
                 let tmp = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-                vec![
+                let mut vars = vec![
                     MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
                     MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, var("HOME")),
-                    MillerItem::new(
-                        "$OLDPWD",
-                        "$OLDPWD (Previous Dir)",
-                        ItemKind::Var,
-                        var("OLDPWD"),
-                    ),
                     MillerItem::new("$TMPDIR", "$TMPDIR (Temp Dir)", ItemKind::Var, tmp),
                     MillerItem::new("$USER", "$USER (User Name)", ItemKind::Var, var("USER")),
                     MillerItem::new(
@@ -237,53 +231,51 @@ impl ShellDialect {
                         ItemKind::Var,
                         var("SHELL"),
                     ),
-                    MillerItem::new(
-                        "$?",
-                        "$? (Last Exit Code)",
-                        ItemKind::Var,
-                        "Current exit status",
-                    ),
-                    MillerItem::new(
-                        "$!",
-                        "$! (Last Background PID)",
-                        ItemKind::Var,
-                        "Current last background job PID",
-                    ),
-                ]
-            }
-            ShellDialect::Fish => {
-                let var = |k: &str| env::var(k).unwrap_or_default();
-                let tmp = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-                vec![
-                    MillerItem::new("$PWD", "$PWD (Current Dir)", ItemKind::Var, pwd),
-                    MillerItem::new("$HOME", "$HOME (User Home)", ItemKind::Var, var("HOME")),
-                    MillerItem::new(
-                        "$status",
-                        "$status (Last Exit Status)",
-                        ItemKind::Var,
-                        "Current exit status of last command",
-                    ),
-                    MillerItem::new(
-                        "$last_pid",
-                        "$last_pid (Last Background PID)",
-                        ItemKind::Var,
-                        "Current process ID of last background job",
-                    ),
-                    MillerItem::new(
-                        "$fish_pid",
-                        "$fish_pid (Current Fish PID)",
-                        ItemKind::Var,
-                        "Current process ID of this Fish session",
-                    ),
-                    MillerItem::new("$TMPDIR", "$TMPDIR (Temp Dir)", ItemKind::Var, tmp),
-                    MillerItem::new("$USER", "$USER (User Name)", ItemKind::Var, var("USER")),
-                    MillerItem::new(
-                        "$SHELL",
-                        "$SHELL (Login Shell)",
-                        ItemKind::Var,
-                        var("SHELL"),
-                    ),
-                ]
+                ];
+                if self == ShellDialect::Posix {
+                    vars.extend([
+                        MillerItem::new(
+                            "$OLDPWD",
+                            "$OLDPWD (Previous Dir)",
+                            ItemKind::Var,
+                            var("OLDPWD"),
+                        ),
+                        MillerItem::new(
+                            "$?",
+                            "$? (Last Exit Code)",
+                            ItemKind::Var,
+                            "Current exit status",
+                        ),
+                        MillerItem::new(
+                            "$!",
+                            "$! (Last Background PID)",
+                            ItemKind::Var,
+                            "Current last background job PID",
+                        ),
+                    ]);
+                } else {
+                    vars.extend([
+                        MillerItem::new(
+                            "$status",
+                            "$status (Last Exit Status)",
+                            ItemKind::Var,
+                            "Current exit status of last command",
+                        ),
+                        MillerItem::new(
+                            "$last_pid",
+                            "$last_pid (Last Background PID)",
+                            ItemKind::Var,
+                            "Current process ID of last background job",
+                        ),
+                        MillerItem::new(
+                            "$fish_pid",
+                            "$fish_pid (Current Fish PID)",
+                            ItemKind::Var,
+                            "Current process ID of this Fish session",
+                        ),
+                    ]);
+                }
+                vars
             }
         }
     }
@@ -425,7 +417,11 @@ pub fn build_ps_var_scope_item(dialect: ShellDialect) -> MillerItem {
             ItemKind::Var,
             format!("Value: {val}"),
         ));
-        if !val.is_empty() && !val.starts_with("Boolean") && !val.starts_with("Current ") {
+        if !val.is_empty()
+            && !val.starts_with("Boolean")
+            && !val.starts_with("Current ")
+            && !val.starts_with("Null ")
+        {
             child.children.push(MillerItem::new(
                 format!("\"{val}\""),
                 format!("Literal: {val}"),
@@ -613,39 +609,38 @@ pub fn load_col1_commands(dialect: ShellDialect) -> Vec<MillerItem> {
         if seen.contains(key) {
             continue;
         }
-        if let Some(item) = ps_map.get(key) {
-            if matches!(item.kind, ItemKind::Func | ItemKind::Alias) {
-                if let Some(owned) = ps_map.remove(key) {
-                    seen.insert(key.clone());
-                    list.push(owned);
-                }
+        if ps_map
+            .get(key)
+            .is_some_and(|item| matches!(item.kind, ItemKind::Func | ItemKind::Alias))
+        {
+            if let Some(owned) = ps_map.remove(key) {
+                seen.insert(key.clone());
+                list.push(owned);
             }
         }
     }
 
-    // 6. All remaining CLI executables
-    for key in &cli_order {
-        if seen.contains(key) {
-            continue;
-        }
-        if let Some(owned) = cli_map.remove(key) {
-            seen.insert(key.clone());
-            list.push(owned);
-        }
-    }
-
-    // 7. All PowerShell Cmdlets
-    for key in &ps_order {
-        if seen.contains(key) {
-            continue;
-        }
-        if let Some(owned) = ps_map.remove(key) {
-            seen.insert(key.clone());
-            list.push(owned);
-        }
-    }
+    // 6. All remaining CLI executables, then PowerShell Cmdlets
+    drain_ordered(&mut list, &mut seen, &cli_order, &mut cli_map);
+    drain_ordered(&mut list, &mut seen, &ps_order, &mut ps_map);
 
     list
+}
+
+fn drain_ordered(
+    list: &mut Vec<MillerItem>,
+    seen: &mut HashSet<String>,
+    order: &[String],
+    map: &mut HashMap<String, MillerItem>,
+) {
+    for key in order {
+        if !seen.contains(key) {
+            if let Some(owned) = map.remove(key) {
+                seen.insert(key.clone());
+                list.push(owned);
+            }
+        }
+    }
 }
 
 fn run_command_with_timeout(exe: &str, args: &[&str], timeout_ms: u64) -> String {
@@ -688,6 +683,7 @@ fn run_command_with_timeout(exe: &str, args: &[&str], timeout_ms: u64) -> String
             Ok(None) => {
                 if start.elapsed() >= limit {
                     let _ = child.kill();
+                    let _ = child.wait();
                     break;
                 }
                 thread::sleep(Duration::from_millis(8));
@@ -718,9 +714,7 @@ fn classify_section_header(line: &str) -> Option<HelpSection> {
     let lower = trimmed.to_ascii_lowercase();
 
     // Sections that should definitely be ignored
-    if lower.starts_with("usage:")
-        || lower.starts_with("usage")
-        || lower.starts_with("examples:")
+    if lower.starts_with("usage")
         || lower.starts_with("examples")
         || lower.starts_with("learn more")
         || lower.starts_with("see '")
@@ -1130,12 +1124,15 @@ impl CliIntrospector {
     /// Queries the cache for `chain`. On cache hit, returns the cached items.
     /// On cache miss, enqueues a deduplicated background introspection job and returns a loading placeholder item.
     pub fn query(&mut self, chain: &[&str]) -> Vec<MillerItem> {
+        if chain.is_empty() {
+            return Vec::new();
+        }
         let key = Self::chain_key(chain);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
 
-        if !chain.is_empty() && self.pending_keys.insert(key.clone()) {
+        if self.pending_keys.insert(key.clone()) {
             let _ = self.req_tx.send(BgRequest {
                 cache_key: key,
                 cmd_chain: chain.iter().map(|s| (*s).to_string()).collect(),
@@ -1968,5 +1965,21 @@ CORE COMMANDS
             CliIntrospector::chain_key(&["Git", "Commit"]),
             "git::commit"
         );
+    }
+
+    #[test]
+    fn test_empty_chain_query_and_null_var_children() {
+        let mut introspector =
+            CliIntrospector::with_initial_cache(ShellDialect::Posix, HashMap::new());
+        assert!(introspector.query(&[]).is_empty());
+
+        let ps_vars = build_ps_var_scope_item(ShellDialect::PowerShell);
+        let null_item = ps_vars
+            .children
+            .iter()
+            .find(|c| c.text == "$null")
+            .expect("$null in PowerShell var scope");
+        assert_eq!(null_item.children.len(), 1);
+        assert_eq!(null_item.children[0].text, "$null");
     }
 }

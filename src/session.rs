@@ -356,17 +356,8 @@ impl MillerSession {
     pub fn handle_terminal_event(&mut self, ev: Event) -> SessionOutcome {
         match ev {
             Event::Resize(w, h) => {
-                let new_w = if w >= 40 {
-                    (w as usize).saturating_sub(1)
-                } else {
-                    self.viewport.width
-                };
-                let new_h = if h >= 12 {
-                    (h as usize).saturating_sub(1)
-                } else {
-                    self.viewport.height
-                };
-                self.apply(UserAction::Resize(new_w, new_h))
+                let next = self.viewport.resized(w, h);
+                self.apply(UserAction::Resize(next.width, next.height))
             }
             Event::Key(key) => {
                 if let Some(action) = UserAction::from_key_event(key) {
@@ -385,13 +376,9 @@ impl MillerSession {
 
         match action {
             UserAction::Cancel => return SessionOutcome::Canceled,
-            UserAction::Confirm => {
-                let cmd = self.preview_command();
-                return SessionOutcome::Confirmed(cmd);
-            }
+            UserAction::Confirm => return SessionOutcome::Confirmed(self.preview_command()),
             UserAction::Resize(w, h) => {
-                self.viewport.width = w;
-                self.viewport.height = h;
+                self.viewport = Viewport::new(w, h);
                 self.clamp_scroll();
                 self.dirty = true;
                 return SessionOutcome::Continue;
@@ -407,277 +394,24 @@ impl MillerSession {
                 self.dirty = true;
                 return SessionOutcome::Continue;
             }
-            UserAction::MoveUp => {
-                let cur_len = self.active_filtered_len();
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                if cur_len > 0 {
-                    self.sel_idx[self.active_col.index()] =
-                        if self.sel_idx[self.active_col.index()] > 0 {
-                            self.sel_idx[self.active_col.index()] - 1
-                        } else {
-                            cur_len - 1
-                        };
-                    self.dirty = true;
-                }
-            }
-            UserAction::MoveDown => {
-                let cur_len = self.active_filtered_len();
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                if cur_len > 0 {
-                    self.sel_idx[self.active_col.index()] =
-                        if self.sel_idx[self.active_col.index()] + 1 < cur_len {
-                            self.sel_idx[self.active_col.index()] + 1
-                        } else {
-                            0
-                        };
-                    self.dirty = true;
-                }
-            }
-            UserAction::PageUp => {
-                let cur_len = self.active_filtered_len();
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                if cur_len > 0 {
-                    let page_rows = self.viewport.rows(self.active_col);
-                    if page_rows > 0 {
-                        self.sel_idx[self.active_col.index()] =
-                            self.sel_idx[self.active_col.index()].saturating_sub(page_rows);
-                        self.dirty = true;
-                    }
-                }
-            }
-            UserAction::PageDown => {
-                let cur_len = self.active_filtered_len();
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                if cur_len > 0 {
-                    let page_rows = self.viewport.rows(self.active_col);
-                    if page_rows > 0 {
-                        self.sel_idx[self.active_col.index()] =
-                            (self.sel_idx[self.active_col.index()] + page_rows).min(cur_len - 1);
-                        self.dirty = true;
-                    }
-                }
-            }
-            UserAction::MoveHome => {
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                self.sel_idx[self.active_col.index()] = 0;
-                self.dirty = true;
-            }
-            UserAction::MoveEnd => {
-                let cur_len = self.active_filtered_len();
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                if cur_len > 0 {
-                    self.sel_idx[self.active_col.index()] = cur_len - 1;
-                    self.dirty = true;
-                }
-            }
-            UserAction::StepRight => {
-                if self.active_col == Column::First {
-                    if let Some(c1) = self.selected_item(Column::First).cloned() {
-                        if c1.kind != ItemKind::Loading {
-                            self.commit_col1_item(&c1);
-                            self.active_col = Column::Second;
-                            self.resume_col2_preview();
-                            self.dirty = true;
-                        }
-                    }
-                } else if self.active_col == Column::Second {
-                    let c1_opt = self.selected_item(Column::First).cloned();
-                    let c2_opt = self.selected_item(Column::Second).cloned();
-                    if let Some(c2) = c2_opt {
-                        if c2.kind != ItemKind::Loading {
-                            if let Some(ref c1) = c1_opt {
-                                if !is_scope_root(c1) && self.tokens.is_empty() {
-                                    self.tokens.push(c1.text.clone());
-                                }
-                            }
-                            if !c1_opt.as_ref().is_some_and(is_scope_root)
-                                && is_selectable_col2_item(&c2)
-                                && self.tokens.last().map(|s| s.as_str()) != Some(c2.text.as_str())
-                            {
-                                self.tokens.push(c2.text);
-                            }
-                            self.active_col = Column::Third;
-                            self.resume_col2_preview();
-                            self.dirty = true;
-                        }
-                    }
-                }
-            }
-            UserAction::StepLeft => {
-                if self.active_col == Column::Third {
-                    self.active_col = Column::Second;
-                    self.resume_col2_preview();
-                    self.dirty = true;
-                } else if self.active_col == Column::Second {
-                    self.active_col = Column::First;
-                    self.resume_col2_preview();
-                    self.dirty = true;
-                }
-            }
-            UserAction::AcceptToken => {
-                if self.active_col == Column::First {
-                    if let Some(c1) = self.selected_item(Column::First).cloned() {
-                        if c1.kind != ItemKind::Loading {
-                            self.commit_col1_item(&c1);
-                            if !self.filters[0].is_empty() {
-                                self.filters[0].clear();
-                                self.col1_filter_dirty = true;
-                            }
-                            self.active_col = Column::Second;
-                            self.resume_col2_preview();
-                            self.dirty = true;
-                        }
-                    }
-                } else if self.active_col == Column::Second {
-                    // A suppressed Column 2 preview means the reset index-0 item was
-                    // never shown; Tab is a no-op until navigation or typing clears it.
-                    if !self.suppress_col2_preview {
-                        let c1_opt = self.selected_item(Column::First).cloned();
-                        let c2_opt = self.selected_item(Column::Second).cloned();
-                        if let Some(c2) = c2_opt {
-                            if is_selectable_col2_item(&c2) {
-                                if let Some(ref c1) = c1_opt {
-                                    if !is_scope_root(c1) && self.tokens.is_empty() {
-                                        self.tokens.push(c1.text.clone());
-                                    }
-                                }
-                                if is_childless_col2_flag_or_switch(&c2) {
-                                    if self.tokens.last().map(|s| s.as_str())
-                                        != Some(c2.text.as_str())
-                                    {
-                                        self.tokens.push(c2.text);
-                                    }
-                                    if !self.filters[1].is_empty() {
-                                        self.filters[1].clear();
-                                        self.col2_filter_dirty = true;
-                                    }
-                                    self.sel_idx[1] = 0;
-                                    self.scroll_idx[1] = 0;
-                                    self.suppress_col2_preview = true;
-                                    self.dirty = true;
-                                } else {
-                                    if !c1_opt.as_ref().is_some_and(is_scope_root)
-                                        && self.tokens.last().map(|s| s.as_str())
-                                            != Some(c2.text.as_str())
-                                    {
-                                        self.tokens.push(c2.text);
-                                    }
-                                    self.active_col = Column::Third;
-                                    self.sel_idx[2] = 0;
-                                    self.scroll_idx[2] = 0;
-                                    self.resume_col2_preview();
-                                    self.dirty = true;
-                                }
-                            }
-                        }
-                    }
-                } else if self.active_col == Column::Third {
-                    let c1_opt = self.selected_item(Column::First).cloned();
-                    let c2_opt = self.selected_item(Column::Second).cloned();
-                    let c3_opt = self.selected_item(Column::Third).cloned();
-                    let val_to_add = resolve_col3_token(c3_opt.as_ref(), &self.filters[2]);
-                    let is_switch_placeholder = c3_opt
-                        .as_ref()
-                        .is_some_and(|c3| c3.kind == ItemKind::Switch && c3.text.is_empty())
-                        && self.filters[2].trim().is_empty();
-
-                    if val_to_add.is_some() || is_switch_placeholder {
-                        if let Some(ref c1) = c1_opt {
-                            if !is_scope_root(c1) && self.tokens.is_empty() {
-                                self.tokens.push(c1.text.clone());
-                            }
-                        }
-                        if let Some(ref c2) = c2_opt {
-                            if !c1_opt.as_ref().is_some_and(is_scope_root)
-                                && is_selectable_col2_item(c2)
-                                && self.tokens.last().map(|s| s.as_str()) != Some(c2.text.as_str())
-                            {
-                                self.tokens.push(c2.text.clone());
-                            }
-                        }
-                        if let Some(val) = val_to_add {
-                            if self.tokens.last().map(|s| s.as_str()) != Some(val.as_str()) {
-                                self.tokens.push(val);
-                            }
-                        }
-                        if !self.filters[2].is_empty() {
-                            self.filters[2].clear();
-                            self.col3_filter_dirty = true;
-                        }
-                        if !self.filters[1].is_empty() {
-                            self.filters[1].clear();
-                            self.col2_filter_dirty = true;
-                        }
-                        self.active_col = Column::Second;
-                        self.sel_idx[1] = 0;
-                        self.scroll_idx[1] = 0;
-                        self.suppress_col2_preview = true;
-                        self.dirty = true;
-                    }
-                }
-            }
-            UserAction::Backspace => {
-                if !self.filters[self.active_col.index()].is_empty() {
-                    self.filters[self.active_col.index()].pop();
-                    self.mark_active_filter_dirty();
-                    self.sel_idx[self.active_col.index()] = 0;
-                    if self.active_col == Column::Second {
-                        self.resume_col2_preview();
-                    }
-                    self.dirty = true;
-                } else if !self.tokens.is_empty() {
-                    self.tokens.pop();
-                    if self.active_col == Column::Third && self.tokens.len() <= 1 {
-                        self.active_col = Column::Second;
-                        self.resume_col2_preview();
-                    } else if self.active_col == Column::Second {
-                        if self.tokens.is_empty() {
-                            self.active_col = Column::First;
-                            self.resume_col2_preview();
-                        } else {
-                            self.suppress_col2_preview = true;
-                        }
-                    }
-                    self.dirty = true;
-                } else if self.active_col != Column::First {
-                    self.active_col = match self.active_col {
-                        Column::Third => Column::Second,
-                        Column::Second | Column::First => Column::First,
-                    };
-                    self.resume_col2_preview();
-                    self.dirty = true;
-                }
-            }
+            UserAction::MoveUp
+            | UserAction::MoveDown
+            | UserAction::PageUp
+            | UserAction::PageDown
+            | UserAction::MoveHome
+            | UserAction::MoveEnd => self.apply_navigation(&action),
+            UserAction::StepRight => self.step_right(),
+            UserAction::StepLeft => self.step_left(),
+            UserAction::AcceptToken => self.accept_token(),
+            UserAction::Backspace => self.handle_backspace(),
             UserAction::InsertChar(ch) => {
                 self.filters[self.active_col.index()].push(ch);
-                self.mark_active_filter_dirty();
-                self.sel_idx[self.active_col.index()] = 0;
-                if self.active_col == Column::Second {
-                    self.resume_col2_preview();
-                }
-                self.dirty = true;
+                self.finish_filter_edit();
             }
             UserAction::ClearFilter => {
                 if !self.filters[self.active_col.index()].is_empty() {
                     self.filters[self.active_col.index()].clear();
-                    self.mark_active_filter_dirty();
-                    self.sel_idx[self.active_col.index()] = 0;
-                    if self.active_col == Column::Second {
-                        self.resume_col2_preview();
-                    }
-                    self.dirty = true;
+                    self.finish_filter_edit();
                 }
             }
         }
@@ -686,6 +420,200 @@ impl MillerSession {
             self.sync_columns();
         }
         SessionOutcome::Continue
+    }
+
+    fn apply_navigation(&mut self, action: &UserAction) {
+        if self.active_col == Column::Second {
+            self.resume_col2_preview();
+        }
+        let col_idx = self.active_col.index();
+        let cur_len = self.active_filtered_len();
+        match action {
+            UserAction::MoveHome => {
+                self.sel_idx[col_idx] = 0;
+                self.dirty = true;
+            }
+            UserAction::MoveUp if cur_len > 0 => {
+                self.sel_idx[col_idx] = if self.sel_idx[col_idx] > 0 {
+                    self.sel_idx[col_idx] - 1
+                } else {
+                    cur_len - 1
+                };
+                self.dirty = true;
+            }
+            UserAction::MoveDown if cur_len > 0 => {
+                self.sel_idx[col_idx] = if self.sel_idx[col_idx] + 1 < cur_len {
+                    self.sel_idx[col_idx] + 1
+                } else {
+                    0
+                };
+                self.dirty = true;
+            }
+            UserAction::PageUp if cur_len > 0 => {
+                let page_rows = self.viewport.rows(self.active_col);
+                if page_rows > 0 {
+                    self.sel_idx[col_idx] = self.sel_idx[col_idx].saturating_sub(page_rows);
+                    self.dirty = true;
+                }
+            }
+            UserAction::PageDown if cur_len > 0 => {
+                let page_rows = self.viewport.rows(self.active_col);
+                if page_rows > 0 {
+                    self.sel_idx[col_idx] = (self.sel_idx[col_idx] + page_rows).min(cur_len - 1);
+                    self.dirty = true;
+                }
+            }
+            UserAction::MoveEnd if cur_len > 0 => {
+                self.sel_idx[col_idx] = cur_len - 1;
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+
+    fn step_right(&mut self) {
+        match self.active_col {
+            Column::First => {
+                if let Some(c1) = self.selected_item(Column::First).cloned() {
+                    if c1.kind != ItemKind::Loading {
+                        self.commit_col1_item(&c1);
+                        self.active_col = Column::Second;
+                        self.resume_col2_preview();
+                        self.dirty = true;
+                    }
+                }
+            }
+            Column::Second => {
+                let c1_opt = self.selected_item(Column::First).cloned();
+                if let Some(c2) = self.selected_item(Column::Second).cloned() {
+                    if c2.kind != ItemKind::Loading {
+                        self.commit_col2_item(c1_opt.as_ref(), &c2);
+                        self.active_col = Column::Third;
+                        self.resume_col2_preview();
+                        self.dirty = true;
+                    }
+                }
+            }
+            Column::Third => {}
+        }
+    }
+
+    fn step_left(&mut self) {
+        match self.active_col {
+            Column::Third => {
+                self.active_col = Column::Second;
+                self.resume_col2_preview();
+                self.dirty = true;
+            }
+            Column::Second => {
+                self.active_col = Column::First;
+                self.resume_col2_preview();
+                self.dirty = true;
+            }
+            Column::First => {}
+        }
+    }
+
+    fn accept_token(&mut self) {
+        match self.active_col {
+            Column::First => {
+                if let Some(c1) = self.selected_item(Column::First).cloned() {
+                    if c1.kind != ItemKind::Loading {
+                        self.commit_col1_item(&c1);
+                        self.clear_filter(Column::First);
+                        self.active_col = Column::Second;
+                        self.resume_col2_preview();
+                        self.dirty = true;
+                    }
+                }
+            }
+            Column::Second => {
+                // A suppressed Column 2 preview means the reset index-0 item was
+                // never shown; Tab is a no-op until navigation or typing clears it.
+                if self.suppress_col2_preview {
+                    return;
+                }
+                let c1_opt = self.selected_item(Column::First).cloned();
+                let Some(c2) = self.selected_item(Column::Second).cloned() else {
+                    return;
+                };
+                if !is_selectable_col2_item(&c2) {
+                    return;
+                }
+
+                self.commit_col2_item(c1_opt.as_ref(), &c2);
+                if is_childless_col2_flag_or_switch(&c2) {
+                    self.clear_filter(Column::Second);
+                    self.sel_idx[1] = 0;
+                    self.scroll_idx[1] = 0;
+                    self.suppress_col2_preview = true;
+                } else {
+                    self.active_col = Column::Third;
+                    self.sel_idx[2] = 0;
+                    self.scroll_idx[2] = 0;
+                    self.resume_col2_preview();
+                }
+                self.dirty = true;
+            }
+            Column::Third => {
+                let c1_opt = self.selected_item(Column::First).cloned();
+                let c2_opt = self.selected_item(Column::Second).cloned();
+                let c3_opt = self.selected_item(Column::Third).cloned();
+                let val_to_add = resolve_col3_token(c3_opt.as_ref(), &self.filters[2]);
+                let is_switch_placeholder = c3_opt
+                    .as_ref()
+                    .is_some_and(|c3| c3.kind == ItemKind::Switch && c3.text.is_empty())
+                    && self.filters[2].trim().is_empty();
+
+                if val_to_add.is_none() && !is_switch_placeholder {
+                    return;
+                }
+
+                if let Some(ref c2) = c2_opt {
+                    self.commit_col2_item(c1_opt.as_ref(), c2);
+                } else {
+                    self.ensure_col1_token(c1_opt.as_ref());
+                }
+                if let Some(val) = val_to_add {
+                    self.push_token_dedup(val);
+                }
+                self.clear_filter(Column::Third);
+                self.clear_filter(Column::Second);
+                self.active_col = Column::Second;
+                self.sel_idx[1] = 0;
+                self.scroll_idx[1] = 0;
+                self.suppress_col2_preview = true;
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn handle_backspace(&mut self) {
+        if !self.filters[self.active_col.index()].is_empty() {
+            self.filters[self.active_col.index()].pop();
+            self.finish_filter_edit();
+        } else if !self.tokens.is_empty() {
+            self.tokens.pop();
+            if self.active_col == Column::Third && self.tokens.len() <= 1 {
+                self.active_col = Column::Second;
+                self.resume_col2_preview();
+            } else if self.active_col == Column::Second {
+                if self.tokens.is_empty() {
+                    self.active_col = Column::First;
+                    self.resume_col2_preview();
+                } else {
+                    self.suppress_col2_preview = true;
+                }
+            }
+            self.dirty = true;
+        } else if self.active_col != Column::First {
+            self.active_col = match self.active_col {
+                Column::Third => Column::Second,
+                Column::Second | Column::First => Column::First,
+            };
+            self.resume_col2_preview();
+            self.dirty = true;
+        }
     }
 
     /// Builds the live command preview string from the current session state.
@@ -826,6 +754,27 @@ impl MillerSession {
         }
     }
 
+    fn finish_filter_edit(&mut self) {
+        self.mark_active_filter_dirty();
+        self.sel_idx[self.active_col.index()] = 0;
+        if self.active_col == Column::Second {
+            self.resume_col2_preview();
+        }
+        self.dirty = true;
+    }
+
+    fn clear_filter(&mut self, col: Column) {
+        let idx = col.index();
+        if !self.filters[idx].is_empty() {
+            self.filters[idx].clear();
+            match col {
+                Column::First => self.col1_filter_dirty = true,
+                Column::Second => self.col2_filter_dirty = true,
+                Column::Third => self.col3_filter_dirty = true,
+            }
+        }
+    }
+
     fn mark_active_filter_dirty(&mut self) {
         match self.active_col {
             Column::First => self.col1_filter_dirty = true,
@@ -839,17 +788,47 @@ impl MillerSession {
         self.suppress_col2_preview = false;
     }
 
-    fn commit_col1_item(&mut self, c1: &MillerItem) {
-        if !is_scope_root(c1) {
-            if self.tokens.is_empty() {
+    fn push_token_dedup(&mut self, token: String) {
+        if self.tokens.last().map(String::as_str) != Some(token.as_str()) {
+            self.tokens.push(token);
+        }
+    }
+
+    fn ensure_col1_token(&mut self, c1: Option<&MillerItem>) {
+        if let Some(c1) = c1 {
+            if !is_scope_root(c1) && self.tokens.is_empty() {
                 self.tokens.push(c1.text.clone());
-            } else {
-                self.tokens[0] = c1.text.clone();
             }
         }
     }
 
+    fn commit_col1_item(&mut self, c1: &MillerItem) {
+        if is_scope_root(c1) {
+            return;
+        }
+        if self.tokens.is_empty() {
+            self.tokens.push(c1.text.clone());
+        } else if !self.tokens[0].eq_ignore_ascii_case(&c1.text) {
+            self.tokens[0] = c1.text.clone();
+            self.tokens.truncate(1);
+        }
+    }
+
+    fn commit_col2_item(&mut self, c1: Option<&MillerItem>, c2: &MillerItem) {
+        self.ensure_col1_token(c1);
+        if !c1.is_some_and(is_scope_root) && is_selectable_col2_item(c2) {
+            self.push_token_dedup(c2.text.clone());
+        }
+    }
+
     fn sync_columns(&mut self) {
+        let cur_c1_idx = self.sync_col1();
+        let cur_c2_idx = self.sync_col2(cur_c1_idx);
+        self.sync_col3(cur_c1_idx, cur_c2_idx);
+        self.clamp_scroll();
+    }
+
+    fn sync_col1(&mut self) -> Option<usize> {
         if self.col1_filter_dirty {
             self.col1_filtered = filter_items(&self.col1_items, &self.filters[0]);
             self.col1_filter_dirty = false;
@@ -857,9 +836,11 @@ impl MillerSession {
         if self.sel_idx[0] >= self.col1_filtered.len() {
             self.sel_idx[0] = self.col1_filtered.len().saturating_sub(1);
         }
-        let cur_c1_idx = self.col1_filtered.get(self.sel_idx[0]).map(|f| f.item_idx);
-        let cur_c1 = cur_c1_idx.map(|idx| &self.col1_items[idx]);
+        self.col1_filtered.get(self.sel_idx[0]).map(|f| f.item_idx)
+    }
 
+    fn sync_col2(&mut self, cur_c1_idx: Option<usize>) -> Option<usize> {
+        let cur_c1 = cur_c1_idx.map(|idx| &self.col1_items[idx]);
         let active_param_sets = cur_c1.and_then(|c1| c1.active_parameter_sets(&self.tokens));
         let sorted_param_sets: Option<Vec<String>> = active_param_sets.as_ref().map(|s| {
             let mut v: Vec<String> = s.iter().cloned().collect();
@@ -889,17 +870,12 @@ impl MillerSession {
             self.col2_filter_dirty = false;
 
             if same_c1 && !self.suppress_col2_preview {
-                if let Some(ref prev_txt) = prev_c2_text {
-                    if let Some(pos) = self
-                        .col2_filtered
+                if let Some(pos) = prev_c2_text.as_deref().and_then(|prev_txt| {
+                    self.col2_filtered
                         .iter()
-                        .position(|f| self.col2_items[f.item_idx].text == *prev_txt)
-                    {
-                        self.sel_idx[1] = pos;
-                    } else {
-                        self.sel_idx[1] = 0;
-                        self.scroll_idx[1] = 0;
-                    }
+                        .position(|f| self.col2_items[f.item_idx].text == prev_txt)
+                }) {
+                    self.sel_idx[1] = pos;
                 } else {
                     self.sel_idx[1] = 0;
                     self.scroll_idx[1] = 0;
@@ -914,9 +890,15 @@ impl MillerSession {
             self.col3_cache_state = None;
         }
 
+        if self.col2_filter_dirty {
+            self.col2_filtered = filter_items(&self.col2_items, &self.filters[1]);
+            self.col2_filter_dirty = false;
+        }
+
         if let Some(ref tok2) = self.pending_second_token {
             if !self.col2_items.is_empty() && self.col2_items[0].kind != ItemKind::Loading {
-                if let Some(pos) = self.col2_items.iter().position(|it| {
+                if let Some(pos) = self.col2_filtered.iter().position(|f| {
+                    let it = &self.col2_items[f.item_idx];
                     it.text.eq_ignore_ascii_case(tok2) || it.matches_parameter_token(tok2)
                 }) {
                     self.sel_idx[1] = pos;
@@ -926,15 +908,13 @@ impl MillerSession {
             }
         }
 
-        if self.col2_filter_dirty {
-            self.col2_filtered = filter_items(&self.col2_items, &self.filters[1]);
-            self.col2_filter_dirty = false;
-        }
         if self.sel_idx[1] >= self.col2_filtered.len() {
             self.sel_idx[1] = self.col2_filtered.len().saturating_sub(1);
         }
+        self.col2_filtered.get(self.sel_idx[1]).map(|f| f.item_idx)
+    }
 
-        let cur_c2_idx = self.col2_filtered.get(self.sel_idx[1]).map(|f| f.item_idx);
+    fn sync_col3(&mut self, cur_c1_idx: Option<usize>, cur_c2_idx: Option<usize>) {
         let cur_c1 = cur_c1_idx.map(|idx| &self.col1_items[idx]);
         let cur_c2 = cur_c2_idx.map(|idx| &self.col2_items[idx]);
 
@@ -965,8 +945,6 @@ impl MillerSession {
         if self.sel_idx[2] >= self.col3_filtered.len() {
             self.sel_idx[2] = self.col3_filtered.len().saturating_sub(1);
         }
-
-        self.clamp_scroll();
     }
 
     fn clamp_scroll(&mut self) {
@@ -1535,5 +1513,41 @@ mod tests {
         session.apply(UserAction::ReloadCatalog);
         assert_eq!(session.visible_col_items(Column::First).len(), 1);
         assert_eq!(session.preview_command(), "reloaded-tool");
+    }
+
+    #[test]
+    fn test_switching_col1_command_truncates_stale_child_tokens() {
+        let mut git = MillerItem::new("git", "git", ItemKind::Cli, "Git VCS");
+        git.children = vec![MillerItem::new(
+            "commit",
+            "commit",
+            ItemKind::Subcmd,
+            "Commit",
+        )];
+
+        let mut cargo = MillerItem::new("cargo", "cargo", ItemKind::Cli, "Rust Cargo");
+        cargo.children = vec![MillerItem::new("build", "build", ItemKind::Subcmd, "Build")];
+
+        let introspector = CliIntrospector::with_initial_cache(ShellDialect::Posix, HashMap::new());
+        let mut session = MillerSession::new(
+            vec![git, cargo],
+            introspector,
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+
+        // Commit `git commit`
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::StepRight);
+        assert_eq!(session.tokens(), &["git", "commit"]);
+
+        // Step back to Col 1, select `cargo`, and step right: stale `commit` must be dropped.
+        session.apply(UserAction::StepLeft);
+        session.apply(UserAction::StepLeft);
+        session.apply(UserAction::MoveDown);
+        session.apply(UserAction::StepRight);
+        assert_eq!(session.tokens(), &["cargo"]);
+        assert_eq!(session.preview_command(), "cargo build");
     }
 }

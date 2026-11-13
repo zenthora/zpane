@@ -1,7 +1,7 @@
 use crate::fuzzy::{selected_item, FilteredItem};
 use crate::model::{Column, ItemKind, MillerItem};
 use std::fmt::Write as FmtWrite;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const C_BORDER_DIM: &str = "\x1b[38;5;240m";
 const C_HEADER_ACT: &str = "\x1b[38;5;75;1m";
@@ -50,6 +50,29 @@ impl Viewport {
         Self { width, height }
     }
 
+    /// Clamps raw terminal dimensions `(w, h)` to usable frame bounds,
+    /// falling back to `(fallback_w, fallback_h)` when either axis is below minimum.
+    pub const fn from_terminal_size(w: u16, h: u16, fallback_w: usize, fallback_h: usize) -> Self {
+        let width = if w >= 40 { w as usize } else { fallback_w }.saturating_sub(1);
+        let height = if h >= 12 { h as usize } else { fallback_h }.saturating_sub(1);
+        Self { width, height }
+    }
+
+    /// Returns a resized viewport, preserving the previous axis if the new dimension is below minimum.
+    pub const fn resized(self, w: u16, h: u16) -> Self {
+        let width = if w >= 40 {
+            (w as usize).saturating_sub(1)
+        } else {
+            self.width
+        };
+        let height = if h >= 12 {
+            (h as usize).saturating_sub(1)
+        } else {
+            self.height
+        };
+        Self { width, height }
+    }
+
     /// Authoritative visible list-row count for `col`, accounting for frame chrome
     /// and Column 3's inspector header. Never exceeds the terminal height.
     pub fn rows(self, col: Column) -> usize {
@@ -61,58 +84,60 @@ impl Viewport {
     }
 }
 
-pub fn clean_single_line(s: &str) -> String {
-    s.chars()
-        .map(|c| {
-            if matches!(c, '\r' | '\n' | '\t') {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect()
+#[inline]
+fn sanitize_char(c: char) -> char {
+    if matches!(c, '\r' | '\n' | '\t') {
+        ' '
+    } else {
+        c
+    }
 }
 
-/// Truncates or pads plain text to exact terminal display columns (`max_width`).
-pub fn pad_or_truncate(text: &str, max_width: usize) -> String {
+/// Appends plain text truncated or space-padded to exact terminal display columns (`max_width`).
+fn push_padded_text(out: &mut String, text: &str, max_width: usize) {
     if max_width == 0 {
-        return String::new();
+        return;
     }
-    let clean = clean_single_line(text);
-    let mut out = String::with_capacity(max_width + 8);
-    let mut cur_w = 0;
+    let mut cur_w = 0usize;
+    let mut last_w = 0usize;
 
-    for ch in clean.chars() {
+    for raw_ch in text.chars() {
+        let ch = sanitize_char(raw_ch);
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w + w > max_width {
-            if max_width > 1 && cur_w == max_width - 1 {
-                out.push('…');
-                cur_w += 1;
-            } else if max_width > 1 && cur_w == max_width {
-                out.pop();
-                out.push('…');
+            if max_width > 1 {
+                if cur_w == max_width {
+                    out.pop();
+                    cur_w = cur_w.saturating_sub(last_w);
+                }
+                if cur_w < max_width {
+                    out.push('…');
+                    cur_w += 1;
+                }
             }
             break;
         }
         out.push(ch);
         cur_w += w;
+        last_w = w;
     }
 
     while cur_w < max_width {
         out.push(' ');
         cur_w += 1;
     }
-    out
 }
 
-/// Renders a Miller cell with fuzzy-match character highlighting, selection styling, and right-aligned `[Kind]` badge.
-fn render_miller_cell(
+/// Renders a Miller cell directly into `out` with fuzzy-match highlighting, selection styling,
+/// and right-aligned `[Kind]` badge.
+fn push_miller_cell(
+    out: &mut String,
     item: &MillerItem,
     filtered: &FilteredItem,
     col_width: usize,
     is_selected: bool,
     is_active_col: bool,
-) -> String {
+) {
     let badge = item.kind.badge();
     let badge_w = badge.len();
     let ptr = if is_selected { "❯ " } else { "  " };
@@ -120,8 +145,6 @@ fn render_miller_cell(
 
     // Reserve space for: ptr (2) + label + space (1) + badge
     let avail_label_w = col_width.saturating_sub(ptr_w + badge_w + 1).max(2);
-    let clean_label = clean_single_line(&item.label);
-
     let match_positions = &filtered.match_positions;
     let mut match_cursor = 0usize;
     let base_style = if is_selected {
@@ -134,12 +157,12 @@ fn render_miller_cell(
         C_TEXT
     };
 
-    let mut out = String::with_capacity(col_width + 64);
     out.push_str(base_style);
     out.push_str(ptr);
 
-    let mut cur_w = 0;
-    for (idx, ch) in clean_label.chars().enumerate() {
+    let mut cur_w = 0usize;
+    for (idx, raw_ch) in item.label.chars().enumerate() {
+        let ch = sanitize_char(raw_ch);
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w + w > avail_label_w {
             if avail_label_w > 1 && cur_w < avail_label_w {
@@ -168,14 +191,37 @@ fn render_miller_cell(
     }
 
     out.push(' ');
-    if is_selected {
-        out.push_str(badge);
-    } else {
+    if !is_selected {
         out.push_str(item.kind.ansi_color());
-        out.push_str(badge);
     }
+    out.push_str(badge);
     out.push_str(RST);
-    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_column_cell(
+    out: &mut String,
+    items: &[MillerItem],
+    filtered: &[FilteredItem],
+    idx: usize,
+    sel_idx: usize,
+    col_width: usize,
+    is_active_col: bool,
+) {
+    if let Some(f) = filtered.get(idx) {
+        push_miller_cell(
+            out,
+            &items[f.item_idx],
+            f,
+            col_width,
+            idx == sel_idx,
+            is_active_col,
+        );
+    } else {
+        for _ in 0..col_width {
+            out.push(' ');
+        }
+    }
 }
 
 pub struct RenderState<'a> {
@@ -258,79 +304,79 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         C_HEADER_DIM
     };
 
-    let b1 = "─".repeat(w1.saturating_sub(h1_txt.chars().count()));
-    let b2 = "─".repeat(w2.saturating_sub(h2_txt.chars().count()));
-    let b3 = "─".repeat(w3.saturating_sub(h3_txt.chars().count()));
+    let b1 = "─".repeat(w1.saturating_sub(UnicodeWidthStr::width(h1_txt.as_str())));
+    let b2 = "─".repeat(w2.saturating_sub(UnicodeWidthStr::width(h2_txt.as_str())));
+    let b3 = "─".repeat(w3.saturating_sub(UnicodeWidthStr::width(h3_txt.as_str())));
 
     let _ = writeln!(
         sb,
         "{C_BORDER_DIM}╭{h1_c}{h1_txt}{C_BORDER_DIM}{b1}┬{h2_c}{h2_txt}{C_BORDER_DIM}{b2}┬{h3_c}{h3_txt}{C_BORDER_DIM}{b3}╮{RST}\r"
     );
 
-    let empty_c1 = " ".repeat(w1);
-    let empty_c2 = " ".repeat(w2);
-    let empty_c3 = " ".repeat(w3);
-
     for r in 0..list_rows {
-        // --- Column 1 ---
-        let idx1 = st.scroll_idx[0] + r;
-        let cell1 = if let Some(f1) = st.col1_filtered.get(idx1) {
-            let it1 = &st.col1_items[f1.item_idx];
-            render_miller_cell(
-                it1,
-                f1,
-                w1,
-                idx1 == st.sel_idx[0],
-                st.active_col == Column::First,
-            )
-        } else {
-            empty_c1.clone()
-        };
-
-        // --- Column 2 ---
-        let idx2 = st.scroll_idx[1] + r;
-        let cell2 = if let Some(f2) = st.col2_filtered.get(idx2) {
-            let it2 = &st.col2_items[f2.item_idx];
-            render_miller_cell(
-                it2,
-                f2,
-                w2,
-                idx2 == st.sel_idx[1],
-                st.active_col == Column::Second,
-            )
-        } else {
-            empty_c2.clone()
-        };
-
-        // --- Column 3 (Top 3 rows = Inspector Header, Rows 3.. = Interactive List) ---
-        let cell3 = if r == 0 {
-            let t = pad_or_truncate(&info_title, w3);
-            format!("{C_HEADER_ACT}{t}{RST}")
-        } else if r == 1 {
-            let t = pad_or_truncate(&info_desc, w3);
-            format!("{C_DIM}{t}{RST}")
-        } else if r == 2 {
-            format!("{C_BORDER_DIM}{}{RST}", "─".repeat(w3))
-        } else {
-            let idx3 = st.scroll_idx[2] + (r - COL3_INSPECTOR_ROWS);
-            if let Some(f3) = st.col3_filtered.get(idx3) {
-                let it3 = &st.col3_items[f3.item_idx];
-                render_miller_cell(
-                    it3,
-                    f3,
-                    w3,
-                    idx3 == st.sel_idx[2],
-                    st.active_col == Column::Third,
-                )
-            } else {
-                empty_c3.clone()
-            }
-        };
-
-        let _ = writeln!(
-            sb,
-            "{C_BORDER_DIM}│{RST}{cell1}{C_BORDER_DIM}│{RST}{cell2}{C_BORDER_DIM}│{RST}{cell3}{C_BORDER_DIM}│{RST}\r"
+        sb.push_str(C_BORDER_DIM);
+        sb.push('│');
+        sb.push_str(RST);
+        push_column_cell(
+            &mut sb,
+            st.col1_items,
+            st.col1_filtered,
+            st.scroll_idx[0] + r,
+            st.sel_idx[0],
+            w1,
+            st.active_col == Column::First,
         );
+
+        sb.push_str(C_BORDER_DIM);
+        sb.push('│');
+        sb.push_str(RST);
+        push_column_cell(
+            &mut sb,
+            st.col2_items,
+            st.col2_filtered,
+            st.scroll_idx[1] + r,
+            st.sel_idx[1],
+            w2,
+            st.active_col == Column::Second,
+        );
+
+        sb.push_str(C_BORDER_DIM);
+        sb.push('│');
+        sb.push_str(RST);
+        // Column 3: Top 3 rows = Inspector Header, Rows 3.. = Interactive List
+        match r {
+            0 => {
+                sb.push_str(C_HEADER_ACT);
+                push_padded_text(&mut sb, &info_title, w3);
+                sb.push_str(RST);
+            }
+            1 => {
+                sb.push_str(C_DIM);
+                push_padded_text(&mut sb, &info_desc, w3);
+                sb.push_str(RST);
+            }
+            2 => {
+                sb.push_str(C_BORDER_DIM);
+                for _ in 0..w3 {
+                    sb.push('─');
+                }
+                sb.push_str(RST);
+            }
+            _ => push_column_cell(
+                &mut sb,
+                st.col3_items,
+                st.col3_filtered,
+                st.scroll_idx[2] + (r - COL3_INSPECTOR_ROWS),
+                st.sel_idx[2],
+                w3,
+                st.active_col == Column::Third,
+            ),
+        }
+
+        sb.push_str(C_BORDER_DIM);
+        sb.push('│');
+        sb.push_str(RST);
+        sb.push_str("\r\n");
     }
 
     // Divider above status bars
@@ -344,7 +390,6 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     let full_inner = win_w.saturating_sub(2);
 
-    // Filter Bar
     let filter_line = format!(
         " Filter (Col {}): {}█   [Col1: '{}' | Col2: '{}' | Col3: '{}']",
         st.active_col.index() + 1,
@@ -353,27 +398,13 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         st.filters[1],
         st.filters[2]
     );
-    let filter_pad = pad_or_truncate(&filter_line, full_inner);
-    let _ = writeln!(
-        sb,
-        "{C_BORDER_DIM}│{RST}{C_FILTER}{filter_pad}{RST}{C_BORDER_DIM}│{RST}\r"
-    );
+    push_status_row(&mut sb, C_FILTER, &filter_line, full_inner);
 
-    // Command Builder Bar
     let cmd_line = format!(" Command Line  : {}", st.cmd_preview);
-    let cmd_pad = pad_or_truncate(&cmd_line, full_inner);
-    let _ = writeln!(
-        sb,
-        "{C_BORDER_DIM}│{RST}{C_CMD_BAR}{cmd_pad}{RST}{C_BORDER_DIM}│{RST}\r"
-    );
+    push_status_row(&mut sb, C_CMD_BAR, &cmd_line, full_inner);
 
-    // Footer Help Bar
     let footer = " [↑/↓] Move  [←/→] Column  [Type] Fuzzy Filter  [Tab] Append Token  [Ctrl+U] Clear Filter  [Ctrl+R] Sync PS  [Enter] Accept  [Esc] Exit";
-    let footer_pad = pad_or_truncate(footer, full_inner);
-    let _ = writeln!(
-        sb,
-        "{C_BORDER_DIM}│{RST}{C_DIM}{footer_pad}{RST}{C_BORDER_DIM}│{RST}\r"
-    );
+    push_status_row(&mut sb, C_DIM, footer, full_inner);
 
     let _ = write!(
         sb,
@@ -382,6 +413,19 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     );
 
     sb
+}
+
+fn push_status_row(out: &mut String, color: &str, text: &str, inner_width: usize) {
+    out.push_str(C_BORDER_DIM);
+    out.push('│');
+    out.push_str(RST);
+    out.push_str(color);
+    push_padded_text(out, text, inner_width);
+    out.push_str(RST);
+    out.push_str(C_BORDER_DIM);
+    out.push('│');
+    out.push_str(RST);
+    out.push_str("\r\n");
 }
 
 #[cfg(test)]
@@ -558,5 +602,18 @@ mod tests {
         let (title_empty, desc_empty) = inspector_header(&st_empty);
         assert_eq!(title_empty, " ℹ No selection");
         assert_eq!(desc_empty, "");
+    }
+
+    #[test]
+    fn test_push_padded_text_preserves_width_on_wide_chars() {
+        let mut buf = String::new();
+        // '中' and '文' are 2 display columns each (total 4), plus 'a' overflows width 4.
+        push_padded_text(&mut buf, "中文a", 4);
+        assert_eq!(UnicodeWidthStr::width(buf.as_str()), 4);
+        assert_eq!(buf, "中… ");
+
+        buf.clear();
+        push_padded_text(&mut buf, "a\nb\tc", 6);
+        assert_eq!(buf, "a b c ");
     }
 }
