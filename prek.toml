@@ -2,6 +2,9 @@
 # See https://prek.j178.dev for more information.
 #:schema https://www.schemastore.org/prek.json
 
+default_install_hook_types = ["pre-commit", "commit-msg"]
+default_stages = ["pre-commit"]
+
 [[repos]]
 repo = "builtin"
 hooks = [
@@ -18,5 +21,8 @@ repo = "local"
 hooks = [
     { id = "cargo-fmt", name = "cargo fmt", entry = "cargo fmt --all -- --check", language = "system", types = ["rust"], pass_filenames = false },
     { id = "cargo-clippy", name = "cargo clippy", entry = "cargo clippy --all-targets -- -D warnings", language = "system", types = ["rust"], pass_filenames = false },
-    { id = "cargo-test", name = "cargo test", entry = "cargo test", language = "system", types = ["rust"], pass_filenames = false },
+    { id = "cargo-test", name = "cargo test", entry = "cargo test --locked", language = "system", types = ["rust"], pass_filenames = false },
+    { id = "git-cliff-semver", name = "git-cliff semver check", entry = "git-cliff --config cliff.toml --bumped-version", language = "system", files = "^(cliff\\.toml|CHANGELOG\\.md)$", pass_filenames = false },
+    { id = "conventional-commits", name = "conventional commits", entry = "python scripts/check-conventional-commit.py", language = "system", stages = ["commit-msg"], always_run = true },
+    { id = "git-cliff-changelog", name = "update changelog & version (git-cliff)", entry = "python scripts/bump-version.py", language = "system", stages = ["manual"], pass_filenames = false },
 ]

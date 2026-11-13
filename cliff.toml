@@ -34,15 +34,23 @@ conventional_commits = true
 filter_unconventional = false
 split_commits = false
 commit_parsers = [
+    { message = "^Merge ", skip = true },
     { message = "^feat", group = "<!-- 0 -->Features" },
     { message = "^perf", group = "<!-- 1 -->Performance" },
     { message = "^fix", group = "<!-- 2 -->Bug Fixes" },
     { message = "^refactor", group = "<!-- 3 -->Refactoring" },
     { message = "^docs", group = "<!-- 4 -->Documentation" },
     { message = "^test", group = "<!-- 5 -->Testing" },
-    { message = "^chore|^ci|^build", group = "<!-- 6 -->Miscellaneous Tasks" },
-    { message = "^.*", group = "<!-- 7 -->Other" },
+    { message = "^style", group = "<!-- 6 -->Styling" },
+    { message = "^revert", group = "<!-- 7 -->Reverts" },
+    { message = "^chore|^ci|^build", group = "<!-- 8 -->Miscellaneous Tasks" },
+    { message = "^.*", group = "<!-- 9 -->Other" },
 ]
 filter_commits = false
 topo_order = false
 sort_commits = "oldest"
+
+[bump]
+features_always_bump_minor = true
+breaking_always_bump_major = true
+initial_tag = "0.1.0"

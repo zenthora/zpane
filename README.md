@@ -225,17 +225,17 @@ Environment:
 
 ## Development & Release Packaging
 
-This repository uses [`prek`](https://prek.j178.dev) for pre-commit hooks and [`git-cliff`](https://git-cliff.org) for changelog generation:
+This repository uses [`prek`](https://prek.j178.dev) for `pre-commit` / `commit-msg` hooks and [`git-cliff`](https://git-cliff.org) for SemVer calculation and changelog generation:
 
 ```powershell
-# Install git pre-commit hooks
+# Install git pre-commit and commit-msg (Conventional Commits) hooks
 prek install
 
-# Run formatting, clippy, and unit/performance tests across all files
+# Run formatting, clippy, tests, and config checks across all files
 prek run --all-files
 
-# Generate / update CHANGELOG.md
-git-cliff -o CHANGELOG.md
+# Compute next SemVer via git-cliff, sync version manifests, and update CHANGELOG.md
+prek run --stage manual git-cliff-changelog
 ```
 
 ## License
