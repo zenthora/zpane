@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-13
+
+### Features
+
+- *(ui)* Narrow rendering seam and unify viewport geometry
+- *(discovery)* Make ShellDialect explicit, preserve parameter aliases, and internalize PS DTOs
+- *(discovery)* Encapsulate CLI introspection and caching in CliIntrospector
+- *(session)* Extract MillerSession with semantic UserAction interface
+
+### Bug Fixes
+
+- *(session)* Keep preview, Column 3 cursor stable across async updates
+- *(scripts)* Use cargo update --workspace --offline in bump-version
+
+### Refactoring
+
+- *(core)* Deepen session, discovery, and viewport seams
+- *(core)* Simplify session, UI rendering, and discovery helpers
+
+### Documentation
+
+- *(spec)* Add deepen-core-architecture spec and tickets
+
+### Miscellaneous Tasks
+
+- *(hooks)* Configure prek stages, conventional commits, and git-cliff SemVer
+- *(hooks)* Mark manual git-cliff-changelog hook as always_run
+
 ## [0.1.0] - 2026-11-12
 
 ### Features
