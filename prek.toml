@@ -24,5 +24,5 @@ hooks = [
     { id = "cargo-test", name = "cargo test", entry = "cargo test --locked", language = "system", types = ["rust"], pass_filenames = false },
     { id = "git-cliff-semver", name = "git-cliff semver check", entry = "git-cliff --config cliff.toml --bumped-version", language = "system", files = "^(cliff\\.toml|CHANGELOG\\.md)$", pass_filenames = false },
     { id = "conventional-commits", name = "conventional commits", entry = "python scripts/check-conventional-commit.py", language = "system", stages = ["commit-msg"], always_run = true },
-    { id = "git-cliff-changelog", name = "update changelog & version (git-cliff)", entry = "python scripts/bump-version.py", language = "system", stages = ["manual"], pass_filenames = false },
+    { id = "git-cliff-changelog", name = "update changelog & version (git-cliff)", entry = "python scripts/bump-version.py", language = "system", stages = ["manual"], always_run = true, pass_filenames = false },
 ]
