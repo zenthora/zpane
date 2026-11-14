@@ -61,6 +61,7 @@ const MAX_CLI_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CMD_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_CARAPACE_ENTRIES: usize = 1_024;
 const MAX_CHAIN_DEPTH: usize = 8;
+const MAX_INSPECT_INPUT_BYTES: usize = 4_096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedChainRecord {
@@ -94,7 +95,10 @@ fn has_shell_metachar_or_control(s: &str) -> bool {
         c.is_control()
             || matches!(
                 c,
-                '\0' | '\u{200b}'..='\u{200f}'
+                '\0' | '\u{061c}'
+                    | '\u{200b}'..='\u{200f}'
+                    | '\u{2028}'
+                    | '\u{2029}'
                     | '\u{202a}'..='\u{202e}'
                     | '\u{2066}'..='\u{2069}'
                     | '&'
@@ -124,12 +128,26 @@ fn is_safe_exe_token(exe: &str) -> bool {
     if trimmed.is_empty() || trimmed.len() > 260 || trimmed.starts_with('-') {
         return false;
     }
-    if has_shell_metachar_or_control(trimmed) {
+    if has_shell_metachar_or_control(trimmed) || trimmed.contains("..") {
+        return false;
+    }
+    if trimmed.starts_with("\\\\?\\UNC\\")
+        || trimmed.starts_with("//")
+        || (trimmed.starts_with("\\\\") && !trimmed.starts_with("\\\\?\\"))
+    {
         return false;
     }
     let path = Path::new(trimmed);
     if path.is_absolute() {
-        return !path.components().any(|c| matches!(c, Component::ParentDir));
+        return !path.components().any(|c| {
+            matches!(c, Component::ParentDir)
+                || matches!(c, Component::Prefix(p) if matches!(
+                    p.kind(),
+                    std::path::Prefix::UNC(..)
+                        | std::path::Prefix::VerbatimUNC(..)
+                        | std::path::Prefix::DeviceNS(..)
+                ))
+        });
     }
     if trimmed.starts_with('.')
         || trimmed
@@ -140,6 +158,24 @@ fn is_safe_exe_token(exe: &str) -> bool {
     }
     let mut comps = path.components();
     matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+fn is_safe_catalog_command_token(tok: &str) -> bool {
+    let trimmed = tok.trim();
+    let is_windows_drive_prefix = trimmed.as_bytes().get(1) == Some(&b':')
+        && trimmed
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    !trimmed.is_empty()
+        && trimmed.len() <= 260
+        && !is_windows_drive_prefix
+        && !trimmed.starts_with(['-', '.', '/', '\\'])
+        && !trimmed.contains("..")
+        && !trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '\\'))
+        && !has_shell_metachar_or_control(trimmed)
 }
 
 fn is_safe_sub_arg(arg: &str) -> bool {
@@ -1174,6 +1210,259 @@ pub fn warm_cli_cache(dialect: ShellDialect) -> usize {
     warmed
 }
 
+/// Machine- and human-readable snapshot produced by synchronous command inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InspectReport {
+    pub dialect: String,
+    pub chain: Vec<String>,
+    pub command: Option<Entry>,
+    pub entries: Vec<Entry>,
+}
+
+fn entries_eq(a: &Entry, b: &Entry) -> bool {
+    a.text == b.text
+        && a.label == b.label
+        && a.kind == b.kind
+        && a.role == b.role
+        && a.desc == b.desc
+        && a.parameter_sets == b.parameter_sets
+        && a.aliases == b.aliases
+        && a.has_literal == b.has_literal
+        && a.children.len() == b.children.len()
+        && a.children
+            .iter()
+            .zip(&b.children)
+            .all(|(ca, cb)| entries_eq(ca, cb))
+}
+
+impl PartialEq for InspectReport {
+    fn eq(&self, other: &Self) -> bool {
+        self.dialect == other.dialect
+            && self.chain == other.chain
+            && match (&self.command, &other.command) {
+                (Some(a), Some(b)) => entries_eq(a, b),
+                (None, None) => true,
+                _ => false,
+            }
+            && self.entries.len() == other.entries.len()
+            && self
+                .entries
+                .iter()
+                .zip(&other.entries)
+                .all(|(a, b)| entries_eq(a, b))
+    }
+}
+
+impl Eq for InspectReport {}
+
+fn parse_inspect_chain(raw_chain: &[String]) -> anyhow::Result<Vec<String>> {
+    if raw_chain.is_empty() {
+        anyhow::bail!("Command chain must not be empty");
+    }
+
+    let mut total_bytes = 0usize;
+    let mut tokens = Vec::new();
+    for raw in raw_chain {
+        total_bytes = total_bytes.saturating_add(raw.len());
+        if total_bytes > MAX_INSPECT_INPUT_BYTES {
+            anyhow::bail!(
+                "Command chain exceeds maximum input length of {MAX_INSPECT_INPUT_BYTES} bytes"
+            );
+        }
+        if has_shell_metachar_or_control(raw) {
+            anyhow::bail!(
+                "Unsafe command token '{}': contains disallowed shell metacharacters or control characters",
+                sanitize_single_line(raw).trim()
+            );
+        }
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Command chain must not contain empty tokens");
+        }
+        for part in trimmed.split_whitespace() {
+            if tokens.len() >= MAX_CHAIN_DEPTH {
+                anyhow::bail!("Command chain exceeds maximum depth of {MAX_CHAIN_DEPTH} tokens");
+            }
+            tokens.push(part.to_string());
+        }
+    }
+
+    if tokens.is_empty() {
+        anyhow::bail!("Command chain must not be empty");
+    }
+
+    let exe = &tokens[0];
+    if exe.len() > 260
+        || exe.starts_with('-')
+        || exe.starts_with('.')
+        || exe.contains("..")
+        || (!Path::new(exe).is_absolute() && exe.contains(['/', '\\']))
+    {
+        anyhow::bail!(
+            "Unsafe command token '{}'",
+            sanitize_single_line(exe).trim()
+        );
+    }
+
+    for sub in &tokens[1..] {
+        if !is_safe_sub_arg(sub) {
+            anyhow::bail!(
+                "Unsafe subcommand argument '{}'",
+                sanitize_single_line(sub).trim()
+            );
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn find_catalog_root<'a>(catalog: &'a [Entry], root: &str) -> Option<&'a Entry> {
+    catalog
+        .iter()
+        .find(|e| {
+            e.is_emittable() && e.kind != EntryKind::History && e.text.eq_ignore_ascii_case(root)
+        })
+        .or_else(|| {
+            catalog
+                .iter()
+                .find(|e| e.is_emittable() && e.text.eq_ignore_ascii_case(root))
+        })
+}
+
+fn walk_entry_chain<'a>(root: &'a Entry, sub_chain: &[String]) -> Option<&'a Entry> {
+    let mut cur = root;
+    for seg in sub_chain {
+        cur = cur
+            .children
+            .iter()
+            .find(|c| c.text.eq_ignore_ascii_case(seg))
+            .or_else(|| {
+                cur.children.iter().find(|c| {
+                    c.kind == EntryKind::Subcmd
+                        && c.aliases.iter().any(|a| a.eq_ignore_ascii_case(seg))
+                })
+            })?;
+    }
+    Some(cur)
+}
+
+fn has_discovered_cli_entries(chain_len: usize, exe: &str, entries: &[Entry]) -> bool {
+    if entries.is_empty() {
+        return false;
+    }
+    if chain_len >= 2 {
+        return entries.iter().any(|e| e.kind != EntryKind::Var);
+    }
+    !(entries
+        .first()
+        .is_some_and(|e| e.text == "--help" && e.desc == format!("Display help for {exe}"))
+        && entries[1..].iter().all(|e| e.kind == EntryKind::Var))
+}
+
+pub(crate) fn inspect_command_chain_with<F>(
+    dialect: ShellDialect,
+    catalog: &[Entry],
+    raw_chain: &[String],
+    cache_path: Option<&Path>,
+    carapace_enabled: bool,
+    runner: &F,
+) -> anyhow::Result<InspectReport>
+where
+    F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
+{
+    let chain = parse_inspect_chain(raw_chain)?;
+    let root_tok = &chain[0];
+    let matched_root = find_catalog_root(catalog, root_tok);
+
+    let is_catalog_cmd = matched_root.is_some_and(|e| {
+        matches!(
+            e.kind,
+            EntryKind::Cmdlet | EntryKind::Func | EntryKind::Alias
+        )
+    });
+    if !is_safe_exe_token(root_tok) && !(is_catalog_cmd && is_safe_catalog_command_token(root_tok))
+    {
+        anyhow::bail!(
+            "Unsafe command token '{}'",
+            sanitize_single_line(root_tok).trim()
+        );
+    }
+
+    let command = matched_root.map(|entry| {
+        let mut clean = entry.clone();
+        clean.children.clear();
+        clean
+    });
+
+    if let Some(root_entry) = matched_root {
+        let target = if chain.len() == 1 {
+            Some(root_entry)
+        } else {
+            walk_entry_chain(root_entry, &chain[1..])
+        };
+        if let Some(node) = target {
+            if !node.children.is_empty() {
+                return Ok(InspectReport {
+                    dialect: dialect_cache_tag(dialect).to_string(),
+                    chain,
+                    command,
+                    entries: node.children.clone(),
+                });
+            }
+        }
+    }
+
+    let chain_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
+    let key = CliIntrospector::chain_key(&chain_refs);
+    let mut cache = cache_path
+        .map(|p| load_cli_disk_cache_from(p, dialect))
+        .unwrap_or_default();
+
+    let entries = if let Some(cached) = cache.get(&key) {
+        cached.clone()
+    } else if is_safe_exe_token(root_tok) {
+        let discovered = introspect_cli_chain_with(&chain_refs, dialect, carapace_enabled, runner);
+        if has_discovered_cli_entries(chain_refs.len(), chain_refs[0], &discovered) {
+            if let Some(path) = cache_path {
+                cache.insert(key, discovered.clone());
+                save_cli_disk_cache_to(path, dialect, &cache);
+            }
+        }
+        discovered
+    } else {
+        Vec::new()
+    };
+
+    Ok(InspectReport {
+        dialect: dialect_cache_tag(dialect).to_string(),
+        chain,
+        command,
+        entries,
+    })
+}
+
+/// Synchronously inspects a command or subcommand chain against the Command Catalog,
+/// persisted CLI introspection cache, and live `--help`/`-h`/carapace introspection.
+pub fn inspect_command_chain(
+    dialect: ShellDialect,
+    runtime_ctx: &RuntimeContext,
+    raw_chain: &[String],
+) -> anyhow::Result<InspectReport> {
+    let _ = parse_inspect_chain(raw_chain)?;
+    let catalog = load_catalog(dialect, runtime_ctx);
+    let cache_path = cli_cache_path_for(dialect);
+    let carapace_enabled = is_carapace_installed();
+    let runner = default_command_runner();
+    inspect_command_chain_with(
+        dialect,
+        &catalog,
+        raw_chain,
+        Some(&cache_path),
+        carapace_enabled,
+        &*runner,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1961,5 +2250,318 @@ Options:
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_inspect_command_chain_prepopulated_catalog_and_nested_subcommands() {
+        let mut ps_cmd = Entry::new(
+            "Get-Process",
+            "Get-Process",
+            EntryKind::Cmdlet,
+            "Module: Microsoft.PowerShell.Management",
+        );
+        ps_cmd.children = vec![
+            Entry::new(
+                "-Id",
+                "-Id (-PID)",
+                EntryKind::Param,
+                "[Int32[]] Process ID",
+            ),
+            Entry::new(
+                "-Name",
+                "-Name",
+                EntryKind::Param,
+                "[String[]] Process name",
+            ),
+        ];
+
+        let mut deploy_sub = Entry::new("deploy", "deploy", EntryKind::Subcmd, "Deploy app");
+        deploy_sub.children = vec![Entry::new(
+            "--dry-run",
+            "--dry-run",
+            EntryKind::Flag,
+            "Preview changes",
+        )];
+
+        let mut mycli = Entry::new("mycli", "mycli", EntryKind::Cli, "My CLI");
+        mycli.children = vec![
+            deploy_sub,
+            Entry::new("status", "status", EntryKind::Subcmd, "Show status"),
+        ];
+
+        let mut db_migrate = Entry::new(
+            "db:migrate",
+            "db:migrate",
+            EntryKind::Func,
+            "Run DB migrations",
+        );
+        db_migrate.children = vec![Entry::new(
+            "--step",
+            "--step",
+            EntryKind::Param,
+            "Migration step count",
+        )];
+
+        let catalog = vec![
+            Entry::scope_root("$env:", "$env:Variables", EntryKind::Env, "Env scope"),
+            Entry::placeholder("Loading...", EntryKind::Loading, "Loading"),
+            Entry::new("git", "git", EntryKind::History, "Recent shell history"),
+            Entry::new("git", "git", EntryKind::Cli, "/usr/bin/git"),
+            ps_cmd,
+            mycli,
+            db_migrate,
+        ];
+
+        // 1. Pre-populated PowerShell cmdlet matches case-insensitively and skips runner
+        let ps_report = inspect_command_chain_with(
+            ShellDialect::PowerShell,
+            &catalog,
+            &["get-process".to_string()],
+            None,
+            false,
+            &|exe, _| panic!("pre-populated cmdlet should not invoke runner: {exe}"),
+        )
+        .unwrap();
+        assert_eq!(ps_report.dialect, "pwsh");
+        assert_eq!(ps_report.chain, vec!["get-process"]);
+        let cmd = ps_report.command.as_ref().expect("matched root command");
+        assert_eq!(cmd.text, "Get-Process");
+        assert!(
+            cmd.children.is_empty(),
+            "command.children must be cleared to avoid duplicating entries"
+        );
+        let entry_texts: Vec<&str> = ps_report.entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(entry_texts, vec!["-Id", "-Name"]);
+
+        // 2. Nested pre-populated subcommand walks children without spawning runner
+        let deploy_report = inspect_command_chain_with(
+            ShellDialect::Posix,
+            &catalog,
+            &["mycli".to_string(), "deploy".to_string()],
+            None,
+            false,
+            &|exe, _| panic!("pre-populated nested subcmd should not invoke runner: {exe}"),
+        )
+        .unwrap();
+        assert_eq!(deploy_report.dialect, "posix");
+        assert_eq!(deploy_report.chain, vec!["mycli", "deploy"]);
+        assert_eq!(deploy_report.entries.len(), 1);
+        assert_eq!(deploy_report.entries[0].text, "--dry-run");
+        assert!(deploy_report
+            .command
+            .as_ref()
+            .is_some_and(|c| c.children.is_empty() && c.text == "mycli"));
+
+        // 3. Nested subcommand with empty children falls back to CLI introspection
+        let status_report = inspect_command_chain_with(
+            ShellDialect::Posix,
+            &catalog,
+            &["mycli".to_string(), "status".to_string()],
+            None,
+            false,
+            &|exe, args| match (exe, args) {
+                ("mycli", ["status", "--help"]) => {
+                    Some("Options:\n  -v, --verbose    Verbose status\n".to_string())
+                }
+                _ => None,
+            },
+        )
+        .unwrap();
+        assert!(status_report.entries.iter().any(|e| e.text == "--verbose"));
+
+        // 4. Catalog function with ':' (valid shell ident) resolves safely when present
+        let fn_report = inspect_command_chain_with(
+            ShellDialect::Posix,
+            &catalog,
+            &["db:migrate".to_string()],
+            None,
+            false,
+            &|exe, _| panic!("catalog func with children should not invoke runner: {exe}"),
+        )
+        .unwrap();
+        assert_eq!(fn_report.entries[0].text, "--step");
+
+        // 5. History entry does not shadow Cli entry with same text
+        let git_report = inspect_command_chain_with(
+            ShellDialect::Posix,
+            &catalog,
+            &["git".to_string()],
+            None,
+            false,
+            &|exe, args| match (exe, args) {
+                ("git", ["-h"]) => {
+                    Some("start a working area\n   clone    Clone repo\n".to_string())
+                }
+                _ => None,
+            },
+        )
+        .unwrap();
+        let git_cmd = git_report.command.as_ref().expect("git matched");
+        assert_eq!(git_cmd.kind, EntryKind::Cli);
+        assert_eq!(git_cmd.desc, "/usr/bin/git");
+        assert!(git_report.entries.iter().any(|e| e.text == "clone"));
+
+        // 6. InspectReport PartialEq / Eq and JSON serialization shape
+        assert_eq!(ps_report, ps_report.clone());
+        assert_ne!(ps_report, deploy_report);
+        let json_val = serde_json::to_value(&ps_report).unwrap();
+        assert_eq!(json_val["dialect"], "pwsh");
+        assert_eq!(json_val["command"]["children"], serde_json::json!([]));
+        assert_eq!(json_val["entries"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_inspect_command_chain_tokenization_cache_hit_and_persistence() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let cache_path = env::temp_dir().join(format!(
+            "zpane_test_inspect_cache_{}_{nonce}.json",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&cache_path);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+
+        // Single whitespace-delimited string (`--inspect "  cargo   build  "`)
+        let r1 = inspect_command_chain_with(
+            ShellDialect::Fish,
+            &[],
+            &["  cargo   build  ".to_string()],
+            Some(&cache_path),
+            false,
+            &move |exe, args| {
+                calls_ref.fetch_add(1, Ordering::SeqCst);
+                match (exe, args) {
+                    ("cargo", ["build", "--help"]) => {
+                        Some("Options:\n  -r, --release    Build in release mode\n".to_string())
+                    }
+                    _ => None,
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(r1.dialect, "fish");
+        assert_eq!(r1.chain, vec!["cargo", "build"]);
+        assert!(r1.command.is_none());
+        assert!(r1.entries.iter().any(|e| e.text == "--release"));
+        assert!(cache_path.exists());
+
+        // Multi-token form (`zpane inspect cargo build`) hits disk cache without calling runner
+        let r2 = inspect_command_chain_with(
+            ShellDialect::Fish,
+            &[],
+            &["cargo".to_string(), "build".to_string()],
+            Some(&cache_path),
+            false,
+            &|_exe, _args| panic!("disk cache hit should satisfy inspect without spawning runner"),
+        )
+        .unwrap();
+        assert_eq!(r1, r2);
+
+        // Failed / unknown command must not poison disk cache with fallback entries
+        let r_unknown = inspect_command_chain_with(
+            ShellDialect::Fish,
+            &[],
+            &["unknown_nonexistent_tool".to_string()],
+            Some(&cache_path),
+            false,
+            &|_exe, _args| None,
+        )
+        .unwrap();
+        assert!(r_unknown.command.is_none());
+        assert!(r_unknown
+            .entries
+            .iter()
+            .any(|e| e.text == "--help" && e.desc.contains("unknown_nonexistent_tool")));
+
+        let persisted = load_cli_disk_cache_from(&cache_path, ShellDialect::Fish);
+        assert!(persisted.contains_key("cargo::build"));
+        assert!(!persisted.contains_key("unknown_nonexistent_tool"));
+
+        let _ = fs::remove_file(&cache_path);
+    }
+
+    #[test]
+    fn test_inspect_command_chain_pentest_rejects_injection_traversal_bidi_and_oversized() {
+        let oversized = "a".repeat(MAX_INSPECT_INPUT_BYTES + 1);
+        let oversized_tokens = "a ".repeat(2500);
+        let oversized_exe = "b".repeat(261);
+        let oversized_sub = "c".repeat(129);
+
+        let hostile_inputs: Vec<Vec<String>> = vec![
+            vec![],
+            vec!["".to_string()],
+            vec!["   ".to_string()],
+            vec!["git".to_string(), "".to_string()],
+            vec!["-rf".to_string()],
+            vec!["--upload-pack=calc".to_string()],
+            vec!["git".to_string(), "-c".to_string()],
+            vec!["git".to_string(), "--exec-path=/tmp/evil".to_string()],
+            vec!["git --upload-pack=calc".to_string()],
+            vec!["cmd".to_string(), "/c".to_string()],
+            vec!["../evil".to_string()],
+            vec!["./evil".to_string()],
+            vec!["sub/evil".to_string()],
+            vec!["sub\\evil".to_string()],
+            vec!["C:evil.exe".to_string()],
+            vec!["/usr/../bin/evil".to_string()],
+            vec!["\\\\attacker\\share\\evil.exe".to_string()],
+            vec!["//attacker/share/evil".to_string()],
+            vec!["git".to_string(), "../sub".to_string()],
+            vec!["git;id".to_string()],
+            vec!["git|sh".to_string()],
+            vec!["git&calc".to_string()],
+            vec!["git$(whoami)".to_string()],
+            vec!["git`id`".to_string()],
+            vec!["git>out".to_string()],
+            vec!["git%COMSPEC%".to_string()],
+            vec!["git\ncommit".to_string()],
+            vec!["git\tcommit".to_string()],
+            vec!["git\0evil".to_string()],
+            vec!["git\x1b[31m".to_string()],
+            vec!["git\u{202e}commit".to_string()],
+            vec!["git\u{061c}commit".to_string()],
+            vec!["git\u{2028}commit".to_string()],
+            vec!["git".to_string(), "sub\u{2066}x".to_string()],
+            vec![oversized],
+            vec![oversized_tokens],
+            vec![oversized_exe],
+            vec!["git".to_string(), oversized_sub],
+            vec![
+                "a".into(),
+                "b".into(),
+                "c".into(),
+                "d".into(),
+                "e".into(),
+                "f".into(),
+                "g".into(),
+                "h".into(),
+                "i".into(),
+            ],
+        ];
+
+        for raw_chain in &hostile_inputs {
+            let err = inspect_command_chain_with(
+                ShellDialect::Posix,
+                &[],
+                raw_chain,
+                None,
+                true,
+                &|exe, _| panic!("hostile inspect input spawned runner for '{exe}'"),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                !msg.contains('\x1b') && !msg.contains('\0') && !msg.contains('\u{202e}'),
+                "error message leaked unsafe control chars for {raw_chain:?}: {msg:?}"
+            );
+        }
     }
 }

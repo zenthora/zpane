@@ -9,8 +9,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use discovery::{
-    clear_disk_cache, detect_runtime_context, load_catalog, reload_catalog,
-    sync_powershell_metadata, warm_cli_cache, CliIntrospector, ShellDialect,
+    clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog, reload_catalog,
+    sync_powershell_metadata, warm_cli_cache, CliIntrospector, InspectReport, ShellDialect,
 };
 use model::RuntimeContext;
 use session::{MillerSession, SessionOutcome};
@@ -168,6 +168,7 @@ zpane - 3-pane Miller column command, parameter & variable explorer
 
 Usage: zpane [OPTIONS] [--] [INITIAL_TOKENS]...
        zpane init <pwsh|zsh|bash|fish>
+       zpane inspect [--json] <CMD>...
 
 Options:
       --initial <TEXT>       Seed the command builder with an existing command buffer
@@ -179,6 +180,8 @@ Options:
       --git-branch <NAME>    Override current Git branch name for runtime context
       --history <CMD>        Add a recent command to the top of Pane 1 (repeatable)
       --init <SHELL>         Print shell integration snippet (`pwsh`, `zsh`, `bash`, `fish`) and exit
+      --inspect <CMD>        Inspect a command or subcommand chain non-interactively and exit
+      --json                 Emit machine-readable JSON for non-interactive commands
       --sync-ps              Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
       --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
       --clear-cache          Delete persisted CLI help & PowerShell metadata cache files and exit
@@ -341,12 +344,31 @@ struct CliOptions {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum PendingMode {
+    ClearCache,
+    SyncPs { warm: bool },
+    Init(ShellInitTarget),
+    InspectFlag(String),
+    InspectSubcmd,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum CliCommand {
     Version,
     Help,
     Init(ShellInitTarget),
-    ClearCache,
-    SyncPs { warm: bool },
+    ClearCache {
+        json: bool,
+    },
+    SyncPs {
+        warm: bool,
+        json: bool,
+    },
+    Inspect {
+        raw_chain: Vec<String>,
+        json: bool,
+        runtime_context: RuntimeContext,
+    },
     Interactive(CliOptions),
 }
 
@@ -527,6 +549,30 @@ fn ensure_no_inline_value(flag: &str, inline_val: Option<&str>) -> anyhow::Resul
     Ok(())
 }
 
+fn build_runtime_context(
+    context_args: Vec<ContextArg<'_>>,
+    git_branch_override: Option<String>,
+    history_overrides: Vec<String>,
+) -> anyhow::Result<RuntimeContext> {
+    let mut runtime_context = RuntimeContext::default();
+    for src in context_args {
+        match src {
+            ContextArg::Inline(raw) => {
+                merge_runtime_context(&mut runtime_context, parse_context_json(raw)?);
+            }
+            ContextArg::File(path) => {
+                let raw = read_context_file_bounded(path, MAX_CONTEXT_FILE_BYTES)?;
+                merge_runtime_context(&mut runtime_context, parse_context_json(&raw)?);
+            }
+        }
+    }
+    if let Some(branch) = git_branch_override {
+        runtime_context.git_branch = Some(branch);
+    }
+    runtime_context.history.extend(history_overrides);
+    Ok(runtime_context)
+}
+
 fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     if args.first().map(String::as_str) == Some("init") {
         let Some(target) = args.get(1) else {
@@ -552,7 +598,9 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     let mut context_args: Vec<ContextArg<'_>> = Vec::new();
     let mut git_branch_override: Option<String> = None;
     let mut history_overrides: Vec<String> = Vec::new();
-    let mut mode_cmd: Option<CliCommand> = None;
+    let mut mode_cmd: Option<PendingMode> = None;
+    let mut inspect_tokens: Vec<String> = Vec::new();
+    let mut json = false;
 
     let mut saw_double_dash = false;
     let mut has_positional = false;
@@ -560,13 +608,28 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
 
     while i < args.len() {
         let arg = args[i].as_str();
-        if !saw_double_dash && !has_positional && arg == "--" {
+        let in_inspect_subcmd = matches!(mode_cmd, Some(PendingMode::InspectSubcmd));
+        if !saw_double_dash && (!has_positional || in_inspect_subcmd) && arg == "--" {
             saw_double_dash = true;
             i += 1;
             continue;
         }
 
-        if saw_double_dash || has_positional || !arg.starts_with('-') || arg == "-" {
+        if saw_double_dash
+            || (has_positional && !in_inspect_subcmd)
+            || !arg.starts_with('-')
+            || arg == "-"
+        {
+            if !saw_double_dash && !has_positional && mode_cmd.is_none() && arg == "inspect" {
+                mode_cmd = Some(PendingMode::InspectSubcmd);
+                i += 1;
+                continue;
+            }
+            if in_inspect_subcmd {
+                inspect_tokens.push(arg.to_string());
+                i += 1;
+                continue;
+            }
             if mode_cmd.is_some() {
                 anyhow::bail!(
                     "Unexpected positional argument '{arg}' with standalone command flag"
@@ -599,12 +662,17 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                 ensure_no_inline_value(flag, inline_val)?;
                 return Ok(CliCommand::Help);
             }
+            "--json" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                json = true;
+                i += 1;
+            }
             "--clear-cache" => {
                 ensure_no_inline_value(flag, inline_val)?;
                 if mode_cmd.is_some() {
                     anyhow::bail!("Conflicting command mode option {flag}");
                 }
-                mode_cmd = Some(CliCommand::ClearCache);
+                mode_cmd = Some(PendingMode::ClearCache);
                 i += 1;
             }
             "--init" => {
@@ -612,15 +680,25 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                     anyhow::bail!("Conflicting command mode option {flag}");
                 }
                 let target = take_flag_value(flag, inline_val, args, &mut i)?;
-                mode_cmd = Some(CliCommand::Init(ShellInitTarget::parse(target)?));
+                mode_cmd = Some(PendingMode::Init(ShellInitTarget::parse(target)?));
+            }
+            "--inspect" => {
+                if mode_cmd.is_some() {
+                    anyhow::bail!("Conflicting command mode option {flag}");
+                }
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                if val.trim().is_empty() {
+                    anyhow::bail!("Option --inspect must not be empty");
+                }
+                mode_cmd = Some(PendingMode::InspectFlag(val.to_string()));
             }
             "--sync-ps" | "--warm" => {
                 ensure_no_inline_value(flag, inline_val)?;
                 let warm = flag == "--warm";
                 match mode_cmd {
-                    None => mode_cmd = Some(CliCommand::SyncPs { warm }),
-                    Some(CliCommand::SyncPs { warm: prev_warm }) => {
-                        mode_cmd = Some(CliCommand::SyncPs {
+                    None => mode_cmd = Some(PendingMode::SyncPs { warm }),
+                    Some(PendingMode::SyncPs { warm: prev_warm }) => {
+                        mode_cmd = Some(PendingMode::SyncPs {
                             warm: prev_warm || warm,
                         });
                     }
@@ -677,26 +755,51 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         }
     }
 
-    if let Some(cmd) = mode_cmd {
-        return Ok(cmd);
-    }
-
-    let mut runtime_context = RuntimeContext::default();
-    for src in context_args {
-        match src {
-            ContextArg::Inline(raw) => {
-                merge_runtime_context(&mut runtime_context, parse_context_json(raw)?);
+    match mode_cmd {
+        Some(PendingMode::ClearCache) => return Ok(CliCommand::ClearCache { json }),
+        Some(PendingMode::SyncPs { warm }) => return Ok(CliCommand::SyncPs { warm, json }),
+        Some(PendingMode::Init(target)) => {
+            if json {
+                anyhow::bail!(
+                    "Option --json requires a non-interactive command (--inspect, --clear-cache, --sync-ps, or --warm)"
+                );
             }
-            ContextArg::File(path) => {
-                let raw = read_context_file_bounded(path, MAX_CONTEXT_FILE_BYTES)?;
-                merge_runtime_context(&mut runtime_context, parse_context_json(&raw)?);
+            return Ok(CliCommand::Init(target));
+        }
+        Some(PendingMode::InspectFlag(raw)) => {
+            let runtime_context =
+                build_runtime_context(context_args, git_branch_override, history_overrides)?;
+            return Ok(CliCommand::Inspect {
+                raw_chain: vec![raw],
+                json,
+                runtime_context,
+            });
+        }
+        Some(PendingMode::InspectSubcmd) => {
+            if inspect_tokens.is_empty() {
+                anyhow::bail!(
+                    "Missing command for `inspect` (expected: zpane inspect [--json] <CMD>...)"
+                );
+            }
+            let runtime_context =
+                build_runtime_context(context_args, git_branch_override, history_overrides)?;
+            return Ok(CliCommand::Inspect {
+                raw_chain: inspect_tokens,
+                json,
+                runtime_context,
+            });
+        }
+        None => {
+            if json {
+                anyhow::bail!(
+                    "Option --json requires a non-interactive command (--inspect, --clear-cache, --sync-ps, or --warm)"
+                );
             }
         }
     }
-    if let Some(branch) = git_branch_override {
-        runtime_context.git_branch = Some(branch);
-    }
-    runtime_context.history.extend(history_overrides);
+
+    let runtime_context =
+        build_runtime_context(context_args, git_branch_override, history_overrides)?;
 
     Ok(CliCommand::Interactive(CliOptions {
         initial_buffer,
@@ -705,6 +808,75 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         fallback_height,
         runtime_context,
     }))
+}
+
+fn sanitize_plain_text(raw: &str, scratch: &mut String) -> String {
+    ui::strip_escapes_and_controls_into(raw, scratch);
+    scratch.clone()
+}
+
+fn format_inspect_human(report: &InspectReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut scratch = String::new();
+    let dialect = sanitize_plain_text(&report.dialect, &mut scratch);
+
+    let mut clean_chain = Vec::with_capacity(report.chain.len());
+    for (idx, part) in report.chain.iter().enumerate() {
+        let token = if idx == 0 {
+            if let Some(cmd) = &report.command {
+                ui::strip_escapes_and_controls_into(&cmd.text, &mut scratch);
+                let clean_cmd = scratch.trim();
+                if !clean_cmd.is_empty() {
+                    clean_cmd.to_string()
+                } else {
+                    sanitize_plain_text(part, &mut scratch)
+                }
+            } else {
+                sanitize_plain_text(part, &mut scratch)
+            }
+        } else {
+            sanitize_plain_text(part, &mut scratch)
+        };
+        clean_chain.push(token);
+    }
+
+    let chain_str = if clean_chain.is_empty() {
+        if let Some(cmd) = &report.command {
+            sanitize_plain_text(&cmd.text, &mut scratch)
+        } else {
+            String::new()
+        }
+    } else {
+        clean_chain.join(" ")
+    };
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Command: {chain_str} (dialect: {dialect}, entries: {})",
+        report.entries.len()
+    );
+
+    for entry in &report.entries {
+        ui::strip_escapes_and_controls_into(&entry.label, &mut scratch);
+        let mut label = scratch.trim().to_string();
+        if label.is_empty() && !entry.text.is_empty() {
+            ui::strip_escapes_and_controls_into(&entry.text, &mut scratch);
+            label = scratch.trim().to_string();
+        }
+
+        ui::strip_escapes_and_controls_into(&entry.desc, &mut scratch);
+        let desc = scratch.trim();
+
+        if desc.is_empty() {
+            let _ = writeln!(out, "  {} {}", entry.kind.badge(), label);
+        } else {
+            let _ = writeln!(out, "  {} {} — {}", entry.kind.badge(), label, desc);
+        }
+    }
+
+    out
 }
 
 fn main() -> anyhow::Result<()> {
@@ -724,27 +896,65 @@ fn main() -> anyhow::Result<()> {
             print!("{}", render_shell_init(target));
             return Ok(());
         }
-        CliCommand::ClearCache => {
+        CliCommand::ClearCache { json } => {
             let removed = clear_disk_cache()?;
-            eprintln!("Cleared {removed} cached metadata file(s).");
+            if json {
+                println!("{}", serde_json::json!({ "cleared": removed }));
+            } else {
+                eprintln!("Cleared {removed} cached metadata file(s).");
+            }
             return Ok(());
         }
-        CliCommand::SyncPs { warm } => {
-            match sync_powershell_metadata() {
+        CliCommand::SyncPs { warm, json } => {
+            let synced_ps = match sync_powershell_metadata() {
                 Ok(count) => {
-                    eprintln!("Synced {count} PowerShell commands & parameter definitions.");
+                    if !json {
+                        eprintln!("Synced {count} PowerShell commands & parameter definitions.");
+                    }
+                    count
                 }
                 // PowerShell is optional on Linux / Termux: only a hard error when explicitly requested.
                 Err(e) if !warm => {
                     return Err(e.context("PowerShell metadata sync failed (is `pwsh` on PATH?)"));
                 }
                 Err(_) => {
-                    eprintln!("Skipping PowerShell metadata sync (`pwsh` not available).");
+                    if !json {
+                        eprintln!("Skipping PowerShell metadata sync (`pwsh` not available).");
+                    }
+                    0
                 }
-            }
-            if warm {
+            };
+            let warmed_cli = if warm {
                 let warmed = warm_cli_cache(dialect);
-                eprintln!("Pre-warmed CLI cache for {warmed} installed priority tools.");
+                if !json {
+                    eprintln!("Pre-warmed CLI cache for {warmed} installed priority tools.");
+                }
+                warmed
+            } else {
+                0
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "synced_ps": synced_ps,
+                        "warmed_cli": warmed_cli,
+                    })
+                );
+            }
+            return Ok(());
+        }
+        CliCommand::Inspect {
+            raw_chain,
+            json,
+            runtime_context,
+        } => {
+            let runtime_ctx = detect_runtime_context(runtime_context);
+            let report = inspect_command_chain(dialect, &runtime_ctx, &raw_chain)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_inspect_human(&report));
             }
             return Ok(());
         }
@@ -867,11 +1077,17 @@ mod tests {
         assert_eq!(parse_cli_args(&s(&["-h"])).unwrap(), CliCommand::Help);
         assert_eq!(
             parse_cli_args(&s(&["--sync-ps"])).unwrap(),
-            CliCommand::SyncPs { warm: false }
+            CliCommand::SyncPs {
+                warm: false,
+                json: false,
+            }
         );
         assert_eq!(
             parse_cli_args(&s(&["--warm"])).unwrap(),
-            CliCommand::SyncPs { warm: true }
+            CliCommand::SyncPs {
+                warm: true,
+                json: false,
+            }
         );
 
         let interactive = parse_cli_args(&s(&[
@@ -965,7 +1181,7 @@ mod tests {
 
         assert_eq!(
             parse_cli_args(&s(&["--clear-cache"])).unwrap(),
-            CliCommand::ClearCache
+            CliCommand::ClearCache { json: false }
         );
         assert_eq!(
             parse_cli_args(&s(&["init", "pwsh"])).unwrap(),
@@ -1336,5 +1552,274 @@ mod tests {
             median_step_ms,
             step_budget_ms
         );
+    }
+
+    #[test]
+    fn test_parse_cli_args_inspect_and_json_modes() {
+        let argv = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        match parse_cli_args(&argv(&["inspect", "git", "commit"])).expect("subcommand inspect") {
+            CliCommand::Inspect {
+                raw_chain, json, ..
+            } => {
+                assert_eq!(raw_chain, vec!["git", "commit"]);
+                assert!(!json);
+            }
+            other => panic!("expected CliCommand::Inspect, got {other:?}"),
+        }
+
+        match parse_cli_args(&argv(&["inspect", "--json", "git", "commit"]))
+            .expect("inspect --json")
+        {
+            CliCommand::Inspect {
+                raw_chain, json, ..
+            } => {
+                assert_eq!(raw_chain, vec!["git", "commit"]);
+                assert!(json);
+            }
+            other => panic!("expected CliCommand::Inspect, got {other:?}"),
+        }
+
+        match parse_cli_args(&argv(&["inspect", "git", "commit", "--json"]))
+            .expect("inspect trailing --json")
+        {
+            CliCommand::Inspect {
+                raw_chain, json, ..
+            } => {
+                assert_eq!(raw_chain, vec!["git", "commit"]);
+                assert!(json);
+            }
+            other => panic!("expected CliCommand::Inspect, got {other:?}"),
+        }
+
+        match parse_cli_args(&argv(&["--json", "inspect", "git", "commit"]))
+            .expect("--json before inspect")
+        {
+            CliCommand::Inspect {
+                raw_chain, json, ..
+            } => {
+                assert_eq!(raw_chain, vec!["git", "commit"]);
+                assert!(json);
+            }
+            other => panic!("expected CliCommand::Inspect, got {other:?}"),
+        }
+
+        let hist_path = std::env::temp_dir().join(format!(
+            "zpane-test-inspect-history-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&hist_path, "git status\ncargo test\n").expect("write temp history");
+        let hist_str = hist_path.to_string_lossy().to_string();
+
+        match parse_cli_args(&argv(&[
+            "--inspect",
+            "git commit",
+            "--context",
+            r#"{"git_branch":"old","git_branches":["dev"]}"#,
+            "--git-branch",
+            "main",
+            "--history",
+            &hist_str,
+        ]))
+        .expect("--inspect with context options")
+        {
+            CliCommand::Inspect {
+                raw_chain,
+                json,
+                runtime_context,
+            } => {
+                assert_eq!(raw_chain, vec!["git commit"]);
+                assert!(!json);
+                assert_eq!(runtime_context.git_branch.as_deref(), Some("main"));
+                assert_eq!(runtime_context.git_branches, vec!["dev"]);
+                assert!(!runtime_context.history.is_empty());
+            }
+            other => panic!("expected CliCommand::Inspect, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&hist_path);
+
+        match parse_cli_args(&argv(&["--inspect=git commit", "--json"]))
+            .expect("--inspect= with --json")
+        {
+            CliCommand::Inspect {
+                raw_chain, json, ..
+            } => {
+                assert_eq!(raw_chain, vec!["git commit"]);
+                assert!(json);
+            }
+            other => panic!("expected CliCommand::Inspect, got {other:?}"),
+        }
+
+        assert!(matches!(
+            parse_cli_args(&argv(&["--clear-cache", "--json"])).expect("--clear-cache --json"),
+            CliCommand::ClearCache { json: true }
+        ));
+        assert!(matches!(
+            parse_cli_args(&argv(&["--sync-ps", "--json"])).expect("--sync-ps --json"),
+            CliCommand::SyncPs {
+                warm: false,
+                json: true
+            }
+        ));
+        assert!(matches!(
+            parse_cli_args(&argv(&["--warm", "--json"])).expect("--warm --json"),
+            CliCommand::SyncPs {
+                warm: true,
+                json: true
+            }
+        ));
+
+        // `-- inspect` treats `inspect` as positional interactive query rather than subcommand.
+        assert!(matches!(
+            parse_cli_args(&argv(&["--", "inspect"])).expect("-- inspect"),
+            CliCommand::Interactive(ref opts) if opts.initial_buffer == "inspect"
+        ));
+        // `git inspect` keeps `inspect` as second token of interactive query.
+        assert!(matches!(
+            parse_cli_args(&argv(&["git", "inspect"])).expect("git inspect"),
+            CliCommand::Interactive(ref opts) if opts.initial_buffer == "git inspect"
+        ));
+        assert!(matches!(
+            parse_cli_args(&argv(&["inspect", "--help"])).expect("inspect --help"),
+            CliCommand::Help
+        ));
+    }
+
+    #[test]
+    fn test_parse_cli_args_inspect_and_json_errors() {
+        let argv = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+
+        let bare_json = parse_cli_args(&argv(&["--json"])).expect_err("--json alone must fail");
+        assert!(
+            bare_json
+                .to_string()
+                .contains("Option --json requires a non-interactive command"),
+            "unexpected error: {bare_json}"
+        );
+
+        for invalid in [
+            vec!["--json", "git", "status"],
+            vec!["--init", "pwsh", "--json"],
+            vec!["init", "pwsh", "--json"],
+            vec!["--json=foo", "--clear-cache"],
+            vec!["--inspect"],
+            vec!["--inspect="],
+            vec!["--inspect", ""],
+            vec!["--inspect", "   "],
+            vec!["inspect"],
+            vec!["inspect", "--json"],
+            vec!["inspect", "git", "--clear-cache"],
+            vec!["--inspect", "git", "--warm"],
+            vec!["--clear-cache", "--inspect", "git"],
+            vec!["--inspect", "git", "--inspect", "cargo"],
+            vec!["--clear-cache", "inspect"],
+        ] {
+            let err = parse_cli_args(&argv(&invalid))
+                .expect_err(&format!("expected error for args {invalid:?}"));
+            assert!(
+                !err.to_string().trim().is_empty(),
+                "error message should not be empty for {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_inspect_human_and_pentest_sanitization() {
+        use crate::discovery::{inspect_command_chain_with, InspectReport, ShellDialect};
+        use crate::model::{Entry, EntryKind};
+
+        // 1. Standard human output formatting with desc and empty desc.
+        let mut git = Entry::new("git", "git", EntryKind::Cmdlet, "Distributed VCS");
+        git.children = vec![
+            Entry::new("commit", "commit", EntryKind::Subcmd, "Record changes"),
+            Entry::new("--version", "--version", EntryKind::Flag, ""),
+        ];
+        let catalog = vec![git];
+
+        let report = inspect_command_chain_with(
+            ShellDialect::Fish,
+            &catalog,
+            &["git".to_string()],
+            None,
+            false,
+            &|_, _| None,
+        )
+        .expect("inspect should succeed");
+        let rendered = format_inspect_human(&report);
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 3, "unexpected human output:\n{rendered}");
+        assert_eq!(lines[0], "Command: git (dialect: fish, entries: 2)");
+        assert_eq!(
+            lines[1],
+            format!(
+                "  {} commit \u{2014} Record changes",
+                EntryKind::Subcmd.badge()
+            )
+        );
+        assert_eq!(lines[2], format!("  {} --version", EntryKind::Flag.badge()));
+
+        let json_str = serde_json::to_string_pretty(&report).expect("serialize InspectReport");
+        let parsed_json: serde_json::Value =
+            serde_json::from_str(&json_str).expect("parse InspectReport JSON");
+        assert_eq!(parsed_json["dialect"], "fish");
+        assert_eq!(parsed_json["chain"], serde_json::json!(["git"]));
+        assert_eq!(parsed_json["command"]["text"], "git");
+        assert_eq!(
+            parsed_json["command"]["children"],
+            serde_json::json!([]),
+            "command.children should be cleared so entries are not duplicated"
+        );
+        assert_eq!(parsed_json["entries"].as_array().map(Vec::len), Some(2));
+
+        // 2. Hostile escape sequences, DCS/OSC/CSI/C1, CRLF, and BiDi controls are stripped.
+        let hostile_cmd = Entry::new("git\x1b]0;pwn\x07", "git", EntryKind::Cmdlet, "desc");
+        let hostile_entry = Entry::new(
+            "commit",
+            "commit\x1b[2J\u{061c}",
+            EntryKind::Subcmd,
+            "Hello\x1bP1;2$q\x1b\\\u{009b}31m\nWorld\u{202a}",
+        );
+        let hostile = InspectReport {
+            dialect: "pwsh\x1b[31m\nspoof".to_string(),
+            chain: vec!["git\u{202e}".to_string(), "commit\r\nFAKE".to_string()],
+            command: Some(hostile_cmd),
+            entries: vec![hostile_entry],
+        };
+
+        let sanitized = format_inspect_human(&hostile);
+        assert_eq!(
+            sanitized.lines().count(),
+            2,
+            "newlines must not inject extra output lines:\n{sanitized}"
+        );
+        for forbidden in [
+            '\x1b', '\x07', '\u{009b}', '\u{202e}', '\u{202a}', '\u{061c}', '\r',
+        ] {
+            assert!(
+                !sanitized.contains(forbidden),
+                "forbidden control/BiDi char {forbidden:?} survived in {sanitized:?}"
+            );
+        }
+        assert!(
+            sanitized.contains("Command: git commit  FAKE (dialect: pwsh spoof, entries: 1)"),
+            "unexpected sanitized header:\n{sanitized:?}"
+        );
+        assert!(
+            sanitized.contains("commit — Hello World"),
+            "unexpected sanitized entry:\n{sanitized:?}"
+        );
+    }
+
+    #[test]
+    fn test_help_text_and_readme_document_inspect_and_json() {
+        let readme = include_str!("../README.md");
+        for needle in [
+            "zpane inspect [--json] <CMD>...",
+            "--inspect <CMD>",
+            "--json",
+        ] {
+            assert!(HELP_TEXT.contains(needle), "HELP_TEXT missing `{needle}`");
+            assert!(readme.contains(needle), "README.md missing `{needle}`");
+        }
     }
 }

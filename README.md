@@ -291,6 +291,7 @@ zpane - 3-pane Miller column command, parameter & variable explorer
 
 Usage: zpane [OPTIONS] [--] [INITIAL_TOKENS]...
        zpane init <pwsh|zsh|bash|fish>
+       zpane inspect [--json] <CMD>...
 
 Options:
       --initial <TEXT>       Seed the command builder with an existing command buffer
@@ -302,6 +303,8 @@ Options:
       --git-branch <NAME>    Override current Git branch name for runtime context
       --history <CMD>        Add a recent command to the top of Pane 1 (repeatable)
       --init <SHELL>         Print shell integration snippet (`pwsh`, `zsh`, `bash`, `fish`) and exit
+      --inspect <CMD>        Inspect a command or subcommand chain non-interactively and exit
+      --json                 Emit machine-readable JSON for non-interactive commands
       --sync-ps              Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
       --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
       --clear-cache          Delete persisted CLI help & PowerShell metadata cache files and exit
