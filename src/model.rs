@@ -103,13 +103,15 @@ pub struct RuntimeContext {
 }
 
 fn format_path_token(raw: &str, is_dir: bool) -> (String, String) {
+    let trimmed = raw.trim();
     let display = if is_dir {
-        format!("{}/", raw.trim_end_matches(['/', '\\']))
+        format!("{}/", trimmed.trim_end_matches(['/', '\\']))
     } else {
-        raw.to_string()
+        trimmed.to_string()
     };
-    let token = if display.contains(char::is_whitespace) {
-        format!("\"{display}\"")
+    let token = if display.chars().any(char::is_whitespace) {
+        let escaped = display.replace('"', "\\\"");
+        format!("\"{escaped}\"")
     } else {
         display.clone()
     };
@@ -158,7 +160,7 @@ impl RuntimeContext {
     pub fn cwd_path_entries(&self, dirs_only: bool) -> Vec<Entry> {
         self.cwd_entries
             .iter()
-            .filter(|e| !dirs_only || e.is_dir)
+            .filter(|e| (!dirs_only || e.is_dir) && !e.name.trim().is_empty())
             .map(|e| {
                 let (token, label) = format_path_token(&e.name, e.is_dir);
                 let kind_desc = if e.is_dir {
@@ -272,28 +274,29 @@ impl Entry {
     /// Whether this parameter or flag Entry matches a raw command token (`-Id`, `--id`, `-Id:value`, `--extension=rs`)
     /// by exact token name or structured Parameter Alias, case-insensitively.
     pub fn matches_parameter_token(&self, token: &str) -> bool {
-        if !token.starts_with('-') {
+        if !self.is_emittable() || !matches!(self.kind, EntryKind::Param | EntryKind::Flag) {
             return false;
         }
-        let clean = token
-            .trim_start_matches('-')
-            .split([':', '='])
-            .next()
-            .unwrap_or("");
+        let Some(after_dash) = token.strip_prefix("--").or_else(|| token.strip_prefix('-')) else {
+            return false;
+        };
+        let clean = after_dash.split([':', '=']).next().unwrap_or("");
         if clean.is_empty() {
             return false;
         }
 
-        self.text
-            .trim_start_matches('-')
-            .trim_end_matches('=')
-            .eq_ignore_ascii_case(clean)
-            || self.aliases.iter().any(|alias| {
-                alias
-                    .trim_start_matches('-')
-                    .trim_end_matches('=')
-                    .eq_ignore_ascii_case(clean)
-            })
+        fn norm(raw: &str) -> &str {
+            raw.strip_prefix("--")
+                .or_else(|| raw.strip_prefix('-'))
+                .unwrap_or(raw)
+                .trim_end_matches(['=', ':'])
+        }
+
+        norm(&self.text).eq_ignore_ascii_case(clean)
+            || self
+                .aliases
+                .iter()
+                .any(|alias| norm(alias).eq_ignore_ascii_case(clean))
     }
 
     /// Computes the active PowerShell Parameter Sets implied by `tokens`, using exact
@@ -309,6 +312,9 @@ impl Entry {
         let mut active_sets: Option<HashSet<String>> = None;
 
         for tok in tokens.iter().skip(1) {
+            if tok == "--" || tok == "--%" {
+                break;
+            }
             if !tok.starts_with('-') {
                 continue;
             }
@@ -486,5 +492,71 @@ mod tests {
             .with_aliases(vec!["PID".to_string()]);
         assert!(ps_param.matches_parameter_token("-Id:42"));
         assert!(ps_param.matches_parameter_token("-PID:42"));
+    }
+
+    #[test]
+    fn test_parameter_matching_excludes_subcmds_and_stops_at_end_of_options() {
+        let subcmd = Entry::new("version", "version", EntryKind::Subcmd, "Print version")
+            .with_aliases(vec!["v".to_string()]);
+        assert!(!subcmd.matches_parameter_token("--version"));
+        assert!(!subcmd.matches_parameter_token("-v"));
+
+        let arg = Entry::new("Name", "Name", EntryKind::Arg, "Positional arg");
+        assert!(!arg.matches_parameter_token("-Name"));
+
+        let param = Entry::new("-Id", "-Id", EntryKind::Param, "Process ID");
+        assert!(!param.matches_parameter_token("---Id"));
+        assert!(!param.matches_parameter_token("--"));
+        assert!(!param.matches_parameter_token("-"));
+
+        let mut cmd = Entry::new("Get-Process", "Get-Process", EntryKind::Cmdlet, "");
+        cmd.children = vec![
+            Entry::new("-Id", "-Id", EntryKind::Param, "")
+                .with_parameter_sets(vec!["Id".to_string()]),
+            Entry::new("-Name", "-Name", EntryKind::Param, "")
+                .with_parameter_sets(vec!["Name".to_string()]),
+        ];
+
+        assert_eq!(
+            cmd.active_parameter_sets(&[
+                "Get-Process".to_string(),
+                "--".to_string(),
+                "-Name".to_string()
+            ]),
+            None
+        );
+        assert_eq!(
+            cmd.active_parameter_sets(&[
+                "Get-Process".to_string(),
+                "--%".to_string(),
+                "-Id".to_string()
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_cwd_path_entries_skips_blank_names_and_escapes_embedded_quotes() {
+        let ctx = RuntimeContext {
+            cwd_entries: vec![
+                CwdEntry {
+                    name: "   ".to_string(),
+                    is_dir: false,
+                },
+                CwdEntry {
+                    name: r#"dir "1""#.to_string(),
+                    is_dir: true,
+                },
+                CwdEntry {
+                    name: r#"my "quote".txt"#.to_string(),
+                    is_dir: false,
+                },
+            ],
+            ..RuntimeContext::default()
+        };
+
+        let paths = ctx.cwd_path_entries(false);
+        let texts: Vec<&str> = paths.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts, vec![r#""dir \"1\"/""#, r#""my \"quote\".txt""#]);
     }
 }
