@@ -117,17 +117,24 @@ impl ShellDialect {
         shell: Option<&str>,
         is_windows: bool,
     ) -> Self {
-        if let Some(zs) = zpane_shell {
+        if let Some(zs) = zpane_shell.map(str::trim).filter(|s| !s.is_empty()) {
             match zs.to_ascii_lowercase().as_str() {
                 "pwsh" | "powershell" => return ShellDialect::PowerShell,
                 "fish" => return ShellDialect::Fish,
-                "posix" | "bash" | "zsh" | "sh" => return ShellDialect::Posix,
+                "posix" | "bash" | "zsh" | "sh" | "dash" | "ash" | "ksh" | "mksh" => {
+                    return ShellDialect::Posix;
+                }
                 _ => {}
             }
         }
         if is_windows || has_ps_module_path {
             ShellDialect::PowerShell
-        } else if has_fish_version || shell.map(|s| s.ends_with("/fish")).unwrap_or(false) {
+        } else if has_fish_version
+            || shell
+                .map(str::trim)
+                .map(|s| s == "fish" || s.ends_with("/fish"))
+                .unwrap_or(false)
+        {
             ShellDialect::Fish
         } else {
             ShellDialect::Posix
@@ -398,6 +405,7 @@ fn parse_toml_string_array(raw: &str) -> Vec<String> {
 /// Parses `config.toml` supporting `priority_tools`, `disabled_tools`, and `history_limit`.
 pub fn parse_user_config_toml(raw: &str) -> UserConfig {
     let mut cfg = UserConfig::default();
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let cleaned_lines: Vec<&str> = raw
         .lines()
         .map(strip_toml_comment)
@@ -432,7 +440,16 @@ pub fn parse_user_config_toml(raw: &str) -> UserConfig {
             "priority_tools" => cfg.priority_tools = parse_toml_string_array(&val),
             "disabled_tools" => cfg.disabled_tools = parse_toml_string_array(&val),
             "history_limit" => {
-                if let Ok(limit) = val.trim().parse::<usize>() {
+                let raw_num = val.trim();
+                let normalized = if !raw_num.starts_with('_')
+                    && !raw_num.ends_with('_')
+                    && !raw_num.contains("__")
+                {
+                    raw_num.replace('_', "")
+                } else {
+                    raw_num.to_string()
+                };
+                if let Ok(limit) = normalized.parse::<usize>() {
                     cfg.history_limit = Some(limit);
                 }
             }
@@ -567,6 +584,17 @@ impl EnvSource for OsEnv {
                         out.push((name.to_string(), body));
                     }
                 }
+                if let Some(zdotdir) = std::env::var_os("ZDOTDIR")
+                    .map(PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty() && p != &home)
+                {
+                    for name in [".zshrc", ".zsh_aliases"] {
+                        let path = zdotdir.join(name);
+                        if let Some(body) = read_tail_string(&path, MAX_RC_BYTES) {
+                            out.push((format!("$ZDOTDIR/{name}"), body));
+                        }
+                    }
+                }
             }
             ShellDialect::Fish => {
                 let config_base = env::var_os("XDG_CONFIG_HOME")
@@ -638,6 +666,10 @@ where
 
     let mut children = Vec::with_capacity(vars.len());
     for (k, v) in vars {
+        // Windows exposes hidden per-drive CWD entries like `=C:` and `=ExitCode` in env blocks.
+        if k.is_empty() || k.starts_with('=') {
+            continue;
+        }
         let token = dialect.env_token(&k);
         let mut entry = Entry::new(&token, &k, EntryKind::Env, &v);
 
@@ -858,21 +890,94 @@ fn is_valid_command_ident(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | ':'))
 }
 
+/// Strips a trailing `# comment` when preceded by whitespace outside single/double quotes.
+fn strip_unquoted_shell_comment(line: &str) -> &str {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut prev_ws = true;
+    for (idx, c) in line.char_indices() {
+        if escaped {
+            escaped = false;
+            prev_ws = false;
+            continue;
+        }
+        if c == '\\' && !in_single {
+            escaped = true;
+            prev_ws = false;
+        } else if c == '\'' && !in_double {
+            in_single = !in_single;
+            prev_ws = false;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+            prev_ws = false;
+        } else if !in_single && !in_double && c == '#' && prev_ws {
+            return line[..idx].trim_end();
+        } else {
+            prev_ws = c.is_whitespace();
+        }
+    }
+    line.trim_end()
+}
+
+/// Extracts the next shell word from `input`, respecting single/double quotes and escapes,
+/// stopping at unquoted whitespace or `;` (which terminates a command header).
+fn next_shell_token(input: &str) -> Option<(&str, &str)> {
+    let trimmed = input.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with(';') {
+        return None;
+    }
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    for (idx, c) in trimmed.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && !in_single {
+            escaped = true;
+        } else if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if !in_single && !in_double && (c.is_whitespace() || c == ';') {
+            return Some((&trimmed[..idx], &trimmed[idx..]));
+        }
+    }
+    Some((trimmed, ""))
+}
+
+fn strip_command_keyword<'a>(line: &'a str, kw: &str) -> Option<&'a str> {
+    let rest = line.strip_prefix(kw)?;
+    rest.starts_with(char::is_whitespace)
+        .then(|| rest.trim_start())
+}
+
 fn extract_fish_function_desc(rest: &str) -> Option<String> {
-    for flag in ["--description", "-d"] {
-        if let Some(idx) = rest.find(flag) {
-            let after = rest[idx + flag.len()..]
-                .trim_start_matches([' ', '='])
-                .trim_start();
-            if let Some(q) = after.chars().next().filter(|c| *c == '\'' || *c == '"') {
-                if let Some(end) = after[1..].find(q) {
-                    return Some(after[1..1 + end].to_string());
-                }
-            } else if let Some(word) = after.split_whitespace().next() {
-                if !word.is_empty() {
-                    return Some(word.to_string());
+    // Skip the first token (the function name) so substrings like `-d` inside
+    // `my-d-func` or `--description` inside a name cannot trigger a false match.
+    let (_, mut cursor) = next_shell_token(rest)?;
+    while let Some((tok, next)) = next_shell_token(cursor) {
+        cursor = next;
+        if tok == "--description" || tok == "-d" {
+            if let Some((val, _)) = next_shell_token(cursor) {
+                let cleaned = strip_matching_quotes(val);
+                if !cleaned.is_empty() {
+                    return Some(cleaned.to_string());
                 }
             }
+            return None;
+        }
+        if let Some(val) = tok
+            .strip_prefix("--description=")
+            .or_else(|| tok.strip_prefix("-d="))
+        {
+            let cleaned = strip_matching_quotes(val);
+            if !cleaned.is_empty() {
+                return Some(cleaned.to_string());
+            }
+            return None;
         }
     }
     None
@@ -888,23 +993,39 @@ pub fn parse_posix_fish_definitions(
     let mut seen = HashSet::new();
 
     for (source, content) in files {
+        let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         for raw_line in content.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let line = strip_unquoted_shell_comment(trimmed);
+            if line.is_empty() {
                 continue;
             }
             match dialect {
                 ShellDialect::PowerShell => {}
                 ShellDialect::Posix => {
-                    if let Some(rest) = line.strip_prefix("alias ") {
-                        let rest = rest.trim_start();
-                        let rest = rest.strip_prefix("-g ").unwrap_or(rest).trim_start();
+                    if let Some(mut rest) = strip_command_keyword(line, "alias") {
+                        while let Some((tok, next)) = next_shell_token(rest) {
+                            if tok == "--" {
+                                rest = next.trim_start();
+                                break;
+                            }
+                            if tok.starts_with('-') && !tok.contains('=') {
+                                rest = next.trim_start();
+                            } else {
+                                break;
+                            }
+                        }
                         if let Some((name_raw, val_raw)) = rest.split_once('=') {
                             let name = strip_matching_quotes(name_raw.trim());
                             if is_valid_command_ident(name)
                                 && seen.insert(name.to_ascii_lowercase())
                             {
-                                let target = strip_matching_quotes(val_raw.trim_end_matches(';'));
+                                let target = strip_matching_quotes(
+                                    val_raw.trim().trim_end_matches(';').trim(),
+                                );
                                 entries.push(Entry::new(
                                     name,
                                     name,
@@ -915,9 +1036,9 @@ pub fn parse_posix_fish_definitions(
                         }
                         continue;
                     }
-                    if let Some(rest) = line.strip_prefix("function ") {
+                    if let Some(rest) = strip_command_keyword(line, "function") {
                         let name = rest
-                            .split(|c: char| c.is_whitespace() || c == '(' || c == '{')
+                            .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ';')
                             .next()
                             .unwrap_or("");
                         if is_valid_command_ident(name) && seen.insert(name.to_ascii_lowercase()) {
@@ -930,9 +1051,15 @@ pub fn parse_posix_fish_definitions(
                         }
                         continue;
                     }
-                    if let Some((head, _after)) = line.split_once("()") {
+                    if let Some((head, after)) = line.split_once("()") {
                         let name = head.trim();
-                        if !name.contains(char::is_whitespace)
+                        let after_trim = after.trim_start();
+                        let body_follows = after_trim.is_empty()
+                            || after_trim.starts_with('{')
+                            || after_trim.starts_with('(')
+                            || after_trim.starts_with('#');
+                        if body_follows
+                            && !name.contains(char::is_whitespace)
                             && is_valid_command_ident(name)
                             && seen.insert(name.to_ascii_lowercase())
                         {
@@ -946,17 +1073,31 @@ pub fn parse_posix_fish_definitions(
                     }
                 }
                 ShellDialect::Fish => {
-                    if let Some(rest) = line.strip_prefix("alias ") {
-                        let rest = rest.trim_start();
-                        if let Some((name, target)) = rest
-                            .split_once('=')
-                            .or_else(|| rest.split_once(char::is_whitespace))
-                        {
-                            let name = strip_matching_quotes(name);
+                    if let Some(mut rest) = strip_command_keyword(line, "alias") {
+                        while let Some((tok, next)) = next_shell_token(rest) {
+                            if tok == "--" {
+                                rest = next.trim_start();
+                                break;
+                            }
+                            if matches!(tok, "-s" | "--save") {
+                                rest = next.trim_start();
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Some((first_tok, rem)) = next_shell_token(rest) {
+                            let (name_raw, target_raw) =
+                                if let Some((n, t)) = first_tok.split_once('=') {
+                                    (n, t)
+                                } else {
+                                    (first_tok, rem.trim().trim_end_matches(';').trim())
+                                };
+                            let name = strip_matching_quotes(name_raw);
                             if is_valid_command_ident(name)
+                                && !target_raw.is_empty()
                                 && seen.insert(name.to_ascii_lowercase())
                             {
-                                let target = strip_matching_quotes(target);
+                                let target = strip_matching_quotes(target_raw);
                                 entries.push(Entry::new(
                                     name,
                                     name,
@@ -967,32 +1108,54 @@ pub fn parse_posix_fish_definitions(
                         }
                         continue;
                     }
-                    if let Some(rest) = line.strip_prefix("abbr ") {
-                        let mut parts = rest.split_whitespace().peekable();
+                    if let Some(rest) = strip_command_keyword(line, "abbr") {
+                        let mut cursor = rest;
                         let mut add_mode = false;
-                        while let Some(&tok) = parts.peek() {
-                            if tok.starts_with('-') {
-                                if tok == "-a" || tok == "--add" {
-                                    add_mode = true;
-                                }
-                                parts.next();
-                            } else {
+                        while let Some((tok, next)) = next_shell_token(cursor) {
+                            if tok == "--" {
+                                cursor = next;
                                 break;
+                            }
+                            if !tok.starts_with('-') {
+                                break;
+                            }
+                            cursor = next;
+                            if tok == "-a"
+                                || tok == "--add"
+                                || (!tok.starts_with("--") && tok.contains('a'))
+                            {
+                                add_mode = true;
+                            }
+                            // Fish abbr flags that consume the following token as a value argument.
+                            if matches!(
+                                tok,
+                                "--position"
+                                    | "-c"
+                                    | "--command"
+                                    | "-r"
+                                    | "--regex"
+                                    | "-f"
+                                    | "--function"
+                            ) {
+                                if let Some((_, after_val)) = next_shell_token(cursor) {
+                                    cursor = after_val;
+                                }
                             }
                         }
                         if add_mode {
-                            if let Some(first) = parts.next() {
-                                let (name, target) = if let Some((n, t)) = first.split_once('=') {
-                                    (n, t.to_string())
-                                } else {
-                                    let rest_vec: Vec<&str> = parts.collect();
-                                    (first, rest_vec.join(" "))
-                                };
-                                let name = strip_matching_quotes(name);
+                            if let Some((first_tok, rem)) = next_shell_token(cursor) {
+                                let (name_raw, target_raw) =
+                                    if let Some((n, t)) = first_tok.split_once('=') {
+                                        (n, t)
+                                    } else {
+                                        (first_tok, rem.trim().trim_end_matches(';').trim())
+                                    };
+                                let name = strip_matching_quotes(name_raw);
                                 if is_valid_command_ident(name)
+                                    && !target_raw.is_empty()
                                     && seen.insert(name.to_ascii_lowercase())
                                 {
-                                    let target = strip_matching_quotes(&target);
+                                    let target = strip_matching_quotes(target_raw);
                                     entries.push(Entry::new(
                                         name,
                                         name,
@@ -1004,14 +1167,13 @@ pub fn parse_posix_fish_definitions(
                         }
                         continue;
                     }
-                    if let Some(rest) = line.strip_prefix("function ") {
-                        let trimmed = rest.trim_start();
-                        if let Some(name) = trimmed.split_whitespace().next() {
-                            let name = name.trim_end_matches(';');
+                    if let Some(rest) = strip_command_keyword(line, "function") {
+                        if let Some((raw_name, _)) = next_shell_token(rest) {
+                            let name = raw_name.trim_end_matches(';');
                             if is_valid_command_ident(name)
                                 && seen.insert(name.to_ascii_lowercase())
                             {
-                                let desc = extract_fish_function_desc(trimmed)
+                                let desc = extract_fish_function_desc(rest)
                                     .unwrap_or_else(|| format!("Fish function ({source})"));
                                 entries.push(Entry::new(name, name, EntryKind::Func, desc));
                             }
@@ -1025,6 +1187,54 @@ pub fn parse_posix_fish_definitions(
     entries
 }
 
+fn unescape_fish_history_cmd(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push(' '),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn strip_zsh_extended_timestamp(line: &str) -> &str {
+    let Some(rest) = line.strip_prefix(": ") else {
+        return line;
+    };
+    let rest = rest.trim_start();
+    let Some((header, cmd)) = rest.split_once(';') else {
+        return line;
+    };
+    let Some((ts, elapsed)) = header.split_once(':') else {
+        return line;
+    };
+    if !ts.is_empty()
+        && ts.bytes().all(|b| b.is_ascii_digit())
+        && !elapsed.is_empty()
+        && elapsed.bytes().all(|b| b.is_ascii_digit())
+    {
+        cmd.trim()
+    } else {
+        line
+    }
+}
+
+fn has_odd_trailing_escape(s: &str, escape_char: char) -> bool {
+    let count = s.chars().rev().take_while(|&c| c == escape_char).count();
+    count % 2 == 1
+}
+
 /// Parses recent command history lines (newest first, deduplicated case-insensitively)
 /// for Bash, Zsh extended history, Fish YAML history, or PowerShell PSReadLine history.
 pub fn parse_shell_history_from_str(
@@ -1036,17 +1246,20 @@ pub fn parse_shell_history_from_str(
         return Vec::new();
     }
 
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
     let mut extracted = Vec::new();
+    let mut pending: Option<String> = None;
+
     for raw_line in raw.lines() {
         let trimmed_end = raw_line.trim_end();
         let trimmed = trimmed_end.trim_start();
-        if trimmed.is_empty() {
-            continue;
-        }
         match dialect {
             ShellDialect::Fish => {
+                if trimmed.is_empty() {
+                    continue;
+                }
                 if let Some(cmd) = trimmed.strip_prefix("- cmd:") {
-                    let cleaned = cmd.trim().replace("\\n", " ").replace("\\\\", "\\");
+                    let cleaned = unescape_fish_history_cmd(cmd.trim());
                     if !cleaned.is_empty() {
                         extracted.push(cleaned);
                     }
@@ -1058,23 +1271,59 @@ pub fn parse_shell_history_from_str(
                 }
             }
             ShellDialect::Posix | ShellDialect::PowerShell => {
-                if trimmed.starts_with('#') {
+                let escape_char = match dialect {
+                    ShellDialect::Posix => '\\',
+                    ShellDialect::PowerShell => '`',
+                    ShellDialect::Fish => unreachable!(),
+                };
+                if let Some(mut buf) = pending.take() {
+                    if has_odd_trailing_escape(trimmed, escape_char) {
+                        let part = &trimmed[..trimmed.len() - escape_char.len_utf8()];
+                        let part = part.trim_end();
+                        if !part.is_empty() {
+                            if !buf.is_empty() {
+                                buf.push(' ');
+                            }
+                            buf.push_str(part);
+                        }
+                        pending = Some(buf);
+                    } else {
+                        if !trimmed.is_empty() {
+                            if !buf.is_empty() {
+                                buf.push(' ');
+                            }
+                            buf.push_str(trimmed);
+                        }
+                        if !buf.is_empty() {
+                            extracted.push(buf);
+                        }
+                    }
                     continue;
                 }
-                let cmd = if trimmed.starts_with(": ") {
-                    if let Some((_, after_semi)) = trimmed.split_once(';') {
-                        after_semi.trim()
-                    } else {
-                        trimmed
-                    }
+
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                let cmd = if dialect == ShellDialect::Posix {
+                    strip_zsh_extended_timestamp(trimmed)
                 } else {
                     trimmed
                 };
-                if !cmd.is_empty() {
+                if cmd.is_empty() {
+                    continue;
+                }
+                if has_odd_trailing_escape(cmd, escape_char) {
+                    let prefix = cmd[..cmd.len() - escape_char.len_utf8()].trim_end();
+                    pending = Some(prefix.to_string());
+                } else {
                     extracted.push(cmd.to_string());
                 }
             }
         }
+    }
+
+    if let Some(leftover) = pending.filter(|s| !s.is_empty()) {
+        extracted.push(leftover);
     }
 
     let mut seen = HashSet::new();
@@ -1239,6 +1488,13 @@ fn collect_git_refs(base: &Path, dir: &Path, out: &mut Vec<String>) {
         if path.is_dir() {
             collect_git_refs(base, &path, out);
         } else if path.is_file() {
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".lock"))
+            {
+                continue;
+            }
             if let Ok(rel) = path.strip_prefix(base) {
                 let branch = rel.to_string_lossy().replace('\\', "/");
                 if !branch.is_empty() {
@@ -1249,10 +1505,27 @@ fn collect_git_refs(base: &Path, dir: &Path, out: &mut Vec<String>) {
     }
 }
 
+fn resolve_git_common_dir(git_dir: &Path) -> PathBuf {
+    let Ok(raw) = fs::read_to_string(git_dir.join("commondir")) else {
+        return git_dir.to_path_buf();
+    };
+    let rel = raw.trim();
+    if rel.is_empty() {
+        return git_dir.to_path_buf();
+    }
+    let candidate = Path::new(rel);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        git_dir.join(candidate)
+    }
+}
+
 fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
     let Some(git_dir) = resolve_git_dir(start_dir) else {
         return (None, Vec::new());
     };
+    let common_dir = resolve_git_common_dir(&git_dir);
 
     let current = fs::read_to_string(git_dir.join("HEAD"))
         .ok()
@@ -1270,26 +1543,40 @@ fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
         });
 
     let mut branches = Vec::new();
-    let heads_dir = git_dir.join("refs").join("heads");
+    let heads_dir = common_dir.join("refs").join("heads");
     if heads_dir.is_dir() {
         collect_git_refs(&heads_dir, &heads_dir, &mut branches);
     }
-    if let Ok(packed) = fs::read_to_string(git_dir.join("packed-refs")) {
-        for line in packed.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
-                continue;
-            }
-            if let Some((_, ref_name)) = line.split_once(' ') {
-                if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
-                    if !branches.iter().any(|b| b == branch) {
-                        branches.push(branch.to_string());
+    if common_dir != git_dir {
+        let local_heads = git_dir.join("refs").join("heads");
+        if local_heads.is_dir() {
+            collect_git_refs(&local_heads, &local_heads, &mut branches);
+        }
+    }
+    let mut packed_seen = HashSet::new();
+    for dir in [&common_dir, &git_dir] {
+        let packed_path = dir.join("packed-refs");
+        if !packed_seen.insert(packed_path.clone()) {
+            continue;
+        }
+        if let Ok(packed) = fs::read_to_string(&packed_path) {
+            for line in packed.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                if let Some((_, ref_name)) = line.split_once(char::is_whitespace) {
+                    if let Some(branch) = ref_name.trim().strip_prefix("refs/heads/") {
+                        if !branch.is_empty() && !branches.iter().any(|b| b == branch) {
+                            branches.push(branch.to_string());
+                        }
                     }
                 }
             }
         }
     }
     branches.sort();
+    branches.dedup();
 
     if let Some(ref cur) = current {
         branches.retain(|b| b != cur);
@@ -1326,6 +1613,14 @@ fn scan_cwd_entries(dir: &Path) -> Vec<CwdEntry> {
     items
 }
 
+fn child_dedup_key(c: &Entry) -> (bool, String) {
+    if c.is_placeholder() {
+        (true, c.label.to_ascii_lowercase())
+    } else {
+        (false, c.text.to_ascii_lowercase())
+    }
+}
+
 fn merge_spec_into_entry(target: &mut Entry, spec: Entry) {
     if !spec.desc.is_empty() {
         if target.desc.is_empty() {
@@ -1341,13 +1636,10 @@ fn merge_spec_into_entry(target: &mut Entry, spec: Entry) {
         if target.children.is_empty() {
             target.children = spec.children;
         } else {
-            let mut existing: HashSet<String> = target
-                .children
-                .iter()
-                .map(|c| c.text.to_ascii_lowercase())
-                .collect();
+            let mut existing: HashSet<(bool, String)> =
+                target.children.iter().map(child_dedup_key).collect();
             for child in spec.children {
-                if existing.insert(child.text.to_ascii_lowercase()) {
+                if existing.insert(child_dedup_key(&child)) {
                     target.children.push(child);
                 }
             }
@@ -1435,7 +1727,16 @@ pub(super) fn load_catalog_with_context(
     //    (Windows: .exe / .cmd / .bat; Unix: any file with an execute bit)
     let mut cli_map: HashMap<String, Entry> = HashMap::new();
     let mut cli_order: Vec<String> = Vec::new();
+    let mut seen_path_dirs = HashSet::new();
     for dir in env_src.path_dirs() {
+        let dir_key = if cfg!(windows) {
+            dir.to_string_lossy().to_ascii_lowercase()
+        } else {
+            dir.to_string_lossy().into_owned()
+        };
+        if !seen_path_dirs.insert(dir_key) {
+            continue;
+        }
         for (name, path) in env_src.dir_executables(&dir) {
             let key = name.to_ascii_lowercase();
             if disabled.contains(&key) {
@@ -1473,7 +1774,12 @@ pub(super) fn load_catalog_with_context(
     }
 
     // Enrich `git` description with detected current branch if available
-    if let Some(ref branch) = ctx.git_branch {
+    if let Some(branch) = ctx
+        .git_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
         if let Some(git_entry) = cli_map.get_mut("git") {
             git_entry.desc = format!("[branch: {branch}] {}", git_entry.desc);
         }
@@ -1483,7 +1789,8 @@ pub(super) fn load_catalog_with_context(
     for p in user_cfg
         .priority_tools
         .iter()
-        .map(String::as_str)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
         .chain(PRIORITY_CLI_TOOLS.iter().copied())
     {
         let key = p.to_ascii_lowercase();
@@ -1577,7 +1884,7 @@ foreach ($c in $cmds) {
         params = $pList
     })
 }
-$out | ConvertTo-Json -Depth 4 -Compress
+if ($out.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject @($out) -Depth 6 -Compress }
 "#;
 
     let mut cmd = Command::new("pwsh");
@@ -1586,6 +1893,13 @@ $out | ConvertTo-Json -Depth 4 -Compress
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let output = hide_window(&mut cmd).output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "pwsh metadata export failed with status {}",
+            output.status
+        ))
+        .into());
+    }
 
     let exports: Vec<PsCommandExport> = serde_json::from_slice(&output.stdout)?;
     let count = exports.len();
@@ -2208,5 +2522,212 @@ disabled_tools = ["blocked"] # hide unwanted binaries
         let texts: Vec<&str> = catalog.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(texts, vec!["$", "$", "mycli", "gs", "git"]);
         assert!(!texts.contains(&"blocked"));
+    }
+
+    #[test]
+    fn test_detect_git_context_resolves_worktree_commondir_and_skips_lock_files() {
+        let root = std::env::temp_dir().join(format!("zpane_git_wt_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let main_git = root.join("repo").join(".git");
+        let wt_git = main_git.join("worktrees").join("wt1");
+        let wt_dir = root.join("wt1_checkout");
+
+        fs::create_dir_all(main_git.join("refs").join("heads").join("feature")).unwrap();
+        fs::create_dir_all(&wt_git).unwrap();
+        fs::create_dir_all(wt_dir.join("sub")).unwrap();
+
+        fs::write(
+            wt_dir.join(".git"),
+            format!("gitdir: {}\n", wt_git.display()),
+        )
+        .unwrap();
+        fs::write(wt_git.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+
+        fs::write(main_git.join("refs").join("heads").join("main"), b"0001\n").unwrap();
+        fs::write(
+            main_git.join("refs").join("heads").join("main.lock"),
+            b"lock\n",
+        )
+        .unwrap();
+        fs::write(
+            main_git.join("packed-refs"),
+            "# pack-refs\nabcdef0123456789\trefs/heads/feature/wt \n^000000\n",
+        )
+        .unwrap();
+
+        let (current, branches) = detect_git_context_in(&wt_dir.join("sub"));
+        assert_eq!(current.as_deref(), Some("wt-branch"));
+        assert_eq!(branches, vec!["wt-branch", "feature/wt", "main"]);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_parse_posix_fish_definitions_handles_comments_flags_and_desc_substrings() {
+        let posix_files = vec![(
+            ".zshrc".to_string(),
+            "\u{feff}alias -- ll='ls -la'; # show hidden\n\
+             alias grep_hash='rg \"#todo\"' # inline comment\n\
+             function  spaced_fn () { echo ok; }\n\
+             not_fn=$(sub())\n\
+             real_fn() { echo real; }\n"
+                .to_string(),
+        )];
+        let posix_defs = parse_posix_fish_definitions(ShellDialect::Posix, &posix_files);
+        let posix_items: Vec<(&str, EntryKind, &str)> = posix_defs
+            .iter()
+            .map(|e| (e.text.as_str(), e.kind, e.desc.as_str()))
+            .collect();
+        assert_eq!(
+            posix_items,
+            vec![
+                ("ll", EntryKind::Alias, "Alias -> ls -la"),
+                ("grep_hash", EntryKind::Alias, "Alias -> rg \"#todo\""),
+                ("spaced_fn", EntryKind::Func, "Shell function (.zshrc)"),
+                ("real_fn", EntryKind::Func, "Shell function (.zshrc)"),
+            ]
+        );
+
+        let fish_files = vec![(
+            "config.fish".to_string(),
+            "\u{feff}alias mygrep 'rg --color=always' # space form with =\n\
+             abbr -a --position anywhere -- gc git commit\n\
+             abbr -a -c git co checkout\n\
+             abbr --erase stale\n\
+             function my-d-func\n\
+                 echo $argv\n\
+             end\n\
+             function grep_it -d 'Find text'; echo -d ignored; end\n"
+                .to_string(),
+        )];
+        let fish_defs = parse_posix_fish_definitions(ShellDialect::Fish, &fish_files);
+        let fish_items: Vec<(&str, EntryKind, &str)> = fish_defs
+            .iter()
+            .map(|e| (e.text.as_str(), e.kind, e.desc.as_str()))
+            .collect();
+        assert_eq!(
+            fish_items,
+            vec![
+                ("mygrep", EntryKind::Alias, "Alias -> rg --color=always"),
+                ("gc", EntryKind::Alias, "Abbr -> git commit"),
+                ("co", EntryKind::Alias, "Abbr -> checkout"),
+                ("my-d-func", EntryKind::Func, "Fish function (config.fish)"),
+                ("grep_it", EntryKind::Func, "Find text"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_shell_history_handles_bom_continuations_unescaping_and_timestamps() {
+        let fish_raw = "\u{feff}- cmd: echo C:\\\\new\\\\dir\\nnext\n  when: 1700000001\n";
+        assert_eq!(
+            parse_shell_history_from_str(ShellDialect::Fish, fish_raw, 10),
+            vec!["echo C:\\new\\dir next"]
+        );
+
+        let posix_raw =
+            "\u{feff}: 1700000001:0;git commit \\\n  -m \"fix\"\n: check; echo ok\necho foo\\\\\n";
+        assert_eq!(
+            parse_shell_history_from_str(ShellDialect::Posix, posix_raw, 10),
+            vec!["echo foo\\\\", ": check; echo ok", "git commit -m \"fix\"",]
+        );
+
+        let ps_raw = "Get-ChildItem `\n  -Path src\n";
+        assert_eq!(
+            parse_shell_history_from_str(ShellDialect::PowerShell, ps_raw, 10),
+            vec!["Get-ChildItem -Path src"]
+        );
+    }
+
+    #[test]
+    fn test_merge_spec_into_entry_preserves_distinct_placeholders_and_filters_windows_drive_env() {
+        let mut target = Entry::new("tool", "tool", EntryKind::Cli, "/bin/tool");
+        target.children = vec![
+            Entry::placeholder("File", EntryKind::Arg, "Path"),
+            Entry::new("--help", "--help", EntryKind::Flag, "Help"),
+        ];
+
+        let mut spec = Entry::new("tool", "tool", EntryKind::Cli, "Spec desc");
+        spec.children = vec![
+            Entry::placeholder("File", EntryKind::Arg, "Duplicate file"),
+            Entry::placeholder("Dir", EntryKind::Arg, "Directory"),
+            Entry::new("--help", "--help", EntryKind::Flag, "Dup help"),
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Verbose"),
+        ];
+
+        merge_spec_into_entry(&mut target, spec);
+        let child_summary: Vec<(EntryRole, &str, &str)> = target
+            .children
+            .iter()
+            .map(|c| (c.role, c.text.as_str(), c.label.as_str()))
+            .collect();
+        assert_eq!(
+            child_summary,
+            vec![
+                (EntryRole::Placeholder, "", "File"),
+                (EntryRole::Token, "--help", "--help"),
+                (EntryRole::Placeholder, "", "Dir"),
+                (EntryRole::Token, "--verbose", "--verbose"),
+            ]
+        );
+
+        let env_root = build_env_scope_entry_from_vars(
+            ShellDialect::PowerShell,
+            vec![
+                ("=C:".to_string(), "C:\\work".to_string()),
+                ("=ExitCode".to_string(), "00000000".to_string()),
+                ("PATH".to_string(), "C:\\bin".to_string()),
+            ],
+        );
+        let var_labels: Vec<&str> = env_root.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(var_labels, vec!["PATH"]);
+    }
+
+    #[test]
+    fn test_shell_dialect_and_config_toml_edge_cases() {
+        assert_eq!(
+            ShellDialect::from_env(Some("  dash  "), false, false, None, false),
+            ShellDialect::Posix
+        );
+        assert_eq!(
+            ShellDialect::from_env(Some("ksh"), false, false, None, false),
+            ShellDialect::Posix
+        );
+        assert_eq!(
+            ShellDialect::from_env(None, false, false, Some("fish"), false),
+            ShellDialect::Fish
+        );
+
+        let cfg = parse_user_config_toml(
+            "\u{feff}history_limit = 1_500\npriority_tools = [\" mycli \"]\n",
+        );
+        assert_eq!(cfg.history_limit, Some(1500));
+
+        let dir = PathBuf::from("/fake/bin");
+        let fake = FakeEnv {
+            vars: vec![],
+            path_dirs: vec![dir.clone(), dir.clone()],
+            bins: HashMap::from([(
+                dir,
+                vec![
+                    ("git".to_string(), PathBuf::from("/fake/bin/git")),
+                    ("mycli".to_string(), PathBuf::from("/fake/bin/mycli")),
+                ],
+            )]),
+            ps_metadata: None,
+            specs: Vec::new(),
+            user_config: cfg,
+            shell_rc: Vec::new(),
+        };
+        let ctx = RuntimeContext {
+            git_branch: Some("   ".to_string()),
+            ..RuntimeContext::default()
+        };
+        let catalog = load_catalog_with_context(ShellDialect::Posix, &fake, &ctx);
+        let git_entry = catalog.iter().find(|e| e.text == "git").unwrap();
+        assert_eq!(git_entry.desc, "/fake/bin/git");
+        let cli_count = catalog.iter().filter(|e| e.text == "mycli").count();
+        assert_eq!(cli_count, 1);
     }
 }

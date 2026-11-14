@@ -58,14 +58,27 @@ fn spec_value_to_entry(value: &serde_json::Value) -> anyhow::Result<Entry> {
         }
         Ok(fig_spec_to_entry(&spec, true))
     } else if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            anyhow::bail!("Declarative command spec missing required 'name'");
+        }
         let desc = obj
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("Declarative command spec");
-        Ok(Entry::new(name, name, EntryKind::Cli, desc))
+        Ok(Entry::new(trimmed_name, trimmed_name, EntryKind::Cli, desc))
     } else {
         anyhow::bail!("Unrecognized declarative spec format");
     }
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
 }
 
 // ============================================================================
@@ -74,29 +87,29 @@ fn spec_value_to_entry(value: &serde_json::Value) -> anyhow::Result<Entry> {
 
 #[derive(Debug, Default, Deserialize)]
 struct CarapaceSpec {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     aliases: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     flags: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     persistentflags: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     commands: Vec<CarapaceSpec>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     completion: CarapaceCompletion,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct CarapaceCompletion {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     flag: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     positional: Vec<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     positionalany: Vec<String>,
 }
 
@@ -116,21 +129,23 @@ fn carapace_spec_to_entry(
         effective_persistent.insert(k.clone(), v.clone());
     }
 
+    let spec_name = spec.name.trim();
     let label = if !is_root && !spec.aliases.is_empty() {
-        format!("{} ({})", spec.name, spec.aliases.join(", "))
+        format!("{spec_name} ({})", spec.aliases.join(", "))
     } else {
-        spec.name.clone()
+        spec_name.to_string()
     };
 
     let mut entry =
-        Entry::new(&spec.name, label, kind, &spec.description).with_aliases(spec.aliases.clone());
+        Entry::new(spec_name, label, kind, &spec.description).with_aliases(spec.aliases.clone());
 
     let mut children = Vec::new();
     let mut seen_sub = HashSet::new();
 
     // 1. Subcommands first (matches CLI Explorer Pane 2 ergonomics)
     for sub in &spec.commands {
-        if !sub.name.trim().is_empty() && seen_sub.insert(sub.name.clone()) {
+        let sub_name = sub.name.trim();
+        if !sub_name.is_empty() && seen_sub.insert(sub_name.to_ascii_lowercase()) {
             children.push(carapace_spec_to_entry(sub, &effective_persistent, false));
         }
     }
@@ -141,22 +156,26 @@ fn carapace_spec_to_entry(
         pos_candidates.extend(first_pos.iter().cloned());
     }
     pos_candidates.extend(spec.completion.positionalany.iter().cloned());
+    let mut seen_pos = HashSet::new();
     for raw in pos_candidates {
         if let Some(val_entry) = carapace_completion_item_to_entry(&raw, EntryKind::Arg) {
-            children.push(val_entry);
+            let dedup_key = if val_entry.is_placeholder() {
+                format!("ph:{}", val_entry.label.to_ascii_lowercase())
+            } else {
+                format!("tok:{}", val_entry.text.to_ascii_lowercase())
+            };
+            if seen_pos.insert(dedup_key) {
+                children.push(val_entry);
+            }
         }
     }
 
-    // 3. Merge local flags + persistent flags (local takes precedence)
-    let mut all_flags = effective_persistent;
-    for (k, v) in &spec.flags {
-        all_flags.insert(k.clone(), v.clone());
-    }
-
+    // 3. Local flags first, then inherited/persistent flags so local overrides win even when
+    //    suffix markers (=, ?, *) or short-flag prefixes differ.
     let mut seen_flags = HashSet::new();
-    for (flag_spec, desc) in &all_flags {
+    for (flag_spec, desc) in spec.flags.iter().chain(effective_persistent.iter()) {
         if let Some(flag_entry) = parse_carapace_flag(flag_spec, desc, &spec.completion.flag) {
-            if seen_flags.insert(flag_entry.text.clone()) {
+            if seen_flags.insert(flag_entry.text.to_ascii_lowercase()) {
                 children.push(flag_entry);
             }
         }
@@ -211,6 +230,7 @@ fn parse_carapace_flag(
         .collect();
 
     let mut children = Vec::new();
+    let mut seen_vals = HashSet::new();
     for candidate_key in parts.iter().copied() {
         let stripped = candidate_key.trim_start_matches('-');
         if let Some(vals) = flag_completions
@@ -219,7 +239,14 @@ fn parse_carapace_flag(
         {
             for raw in vals {
                 if let Some(child) = carapace_completion_item_to_entry(raw, EntryKind::Enum) {
-                    children.push(child);
+                    let dedup_key = if child.is_placeholder() {
+                        format!("ph:{}", child.label.to_ascii_lowercase())
+                    } else {
+                        format!("tok:{}", child.text.to_ascii_lowercase())
+                    };
+                    if seen_vals.insert(dedup_key) {
+                        children.push(child);
+                    }
                 }
             }
         }
@@ -248,13 +275,17 @@ fn carapace_completion_item_to_entry(raw: &str, default_kind: EntryKind) -> Opti
         return None;
     }
 
-    if trimmed == "$files" || trimmed == "$directories" {
-        let desc = if trimmed == "$directories" {
-            "Dynamic macro: current directory folders"
+    if trimmed == "$files"
+        || trimmed.starts_with("$files(")
+        || trimmed == "$directories"
+        || trimmed.starts_with("$directories(")
+    {
+        let (macro_label, desc) = if trimmed.starts_with("$directories") {
+            ("$directories", "Dynamic macro: current directory folders")
         } else {
-            "Dynamic macro: current directory files & folders"
+            ("$files", "Dynamic macro: current directory files & folders")
         };
-        return Some(Entry::placeholder(trimmed, EntryKind::Path, desc));
+        return Some(Entry::placeholder(macro_label, EntryKind::Path, desc));
     }
     if trimmed.starts_with('$') {
         return None;
@@ -277,19 +308,19 @@ fn carapace_completion_item_to_entry(raw: &str, default_kind: EntryKind) -> Opti
 
 #[derive(Debug, Default, Deserialize)]
 struct FigSpec {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     description: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     subcommands: Vec<FigSpec>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     options: Vec<FigOption>,
     #[serde(default)]
     args: Option<FigArgsField>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum OneOrManyStrings {
     One(String),
@@ -297,15 +328,15 @@ enum OneOrManyStrings {
 }
 
 impl OneOrManyStrings {
-    fn into_vec(self) -> Vec<String> {
+    fn as_slice(&self) -> &[String] {
         match self {
-            OneOrManyStrings::One(s) => vec![s],
-            OneOrManyStrings::Many(v) => v,
+            OneOrManyStrings::One(s) => std::slice::from_ref(s),
+            OneOrManyStrings::Many(v) => v.as_slice(),
         }
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum FigArgsField {
     Single(FigArg),
@@ -313,10 +344,10 @@ enum FigArgsField {
 }
 
 impl FigArgsField {
-    fn into_vec(self) -> Vec<FigArg> {
+    fn as_slice(&self) -> &[FigArg] {
         match self {
-            FigArgsField::Single(a) => vec![a],
-            FigArgsField::Multiple(v) => v,
+            FigArgsField::Single(a) => std::slice::from_ref(a),
+            FigArgsField::Multiple(v) => v.as_slice(),
         }
     }
 }
@@ -324,29 +355,30 @@ impl FigArgsField {
 #[derive(Debug, Default, Deserialize)]
 struct FigOption {
     name: Option<OneOrManyStrings>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     description: String,
     #[serde(default)]
     args: Option<FigArgsField>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct FigArg {
-    #[serde(default)]
+    #[allow(dead_code)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     suggestions: Vec<FigSuggestion>,
     #[serde(default)]
     template: Option<OneOrManyStrings>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 enum FigSuggestion {
     Plain(String),
     Detailed {
         name: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_null_default")]
         description: String,
     },
 }
@@ -357,7 +389,8 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
     } else {
         EntryKind::Subcmd
     };
-    let mut entry = Entry::new(&spec.name, &spec.name, kind, &spec.description);
+    let spec_name = spec.name.trim();
+    let mut entry = Entry::new(spec_name, spec_name, kind, &spec.description);
     let mut children = Vec::new();
 
     for sub in &spec.subcommands {
@@ -367,20 +400,19 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
     }
 
     if let Some(ref args_field) = spec.args {
-        children.extend(fig_args_to_entries(match args_field {
-            FigArgsField::Single(a) => std::slice::from_ref(a),
-            FigArgsField::Multiple(v) => v.as_slice(),
-        }));
+        children.extend(fig_args_to_entries(args_field.as_slice()));
     }
 
     for opt in &spec.options {
         let Some(ref names_raw) = opt.name else {
             continue;
         };
-        let names: Vec<String> = match names_raw {
-            OneOrManyStrings::One(s) => vec![s.clone()],
-            OneOrManyStrings::Many(v) => v.clone(),
-        };
+        let names: Vec<String> = names_raw
+            .as_slice()
+            .iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
         if names.is_empty() {
             continue;
         }
@@ -393,12 +425,7 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
         let arg_children = opt
             .args
             .as_ref()
-            .map(|a| {
-                fig_args_to_entries(&match a {
-                    FigArgsField::Single(x) => vec![x.clone_light()],
-                    FigArgsField::Multiple(v) => v.iter().map(FigArg::clone_light).collect(),
-                })
-            })
+            .map(|a| fig_args_to_entries(a.as_slice()))
             .unwrap_or_default();
 
         let takes_arg = opt.args.is_some() || !arg_children.is_empty();
@@ -419,44 +446,15 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
         children.push(opt_entry);
     }
 
-    let _ = FigArgsField::into_vec;
-    let _ = OneOrManyStrings::into_vec;
     entry.children = children;
     entry
-}
-
-impl FigArg {
-    fn clone_light(&self) -> Self {
-        Self {
-            name: self.name.clone(),
-            suggestions: self
-                .suggestions
-                .iter()
-                .map(|s| match s {
-                    FigSuggestion::Plain(p) => FigSuggestion::Plain(p.clone()),
-                    FigSuggestion::Detailed { name, description } => FigSuggestion::Detailed {
-                        name: name.clone(),
-                        description: description.clone(),
-                    },
-                })
-                .collect(),
-            template: self.template.as_ref().map(|t| match t {
-                OneOrManyStrings::One(s) => OneOrManyStrings::One(s.clone()),
-                OneOrManyStrings::Many(v) => OneOrManyStrings::Many(v.clone()),
-            }),
-        }
-    }
 }
 
 fn fig_args_to_entries(args: &[FigArg]) -> Vec<Entry> {
     let mut out = Vec::new();
     for arg in args {
         if let Some(ref tpl) = arg.template {
-            let tpls: &[String] = match tpl {
-                OneOrManyStrings::One(s) => std::slice::from_ref(s),
-                OneOrManyStrings::Many(v) => v.as_slice(),
-            };
-            for t in tpls {
+            for t in tpl.as_slice() {
                 if t == "folders" {
                     out.push(Entry::placeholder(
                         "$directories",
@@ -474,11 +472,13 @@ fn fig_args_to_entries(args: &[FigArg]) -> Vec<Entry> {
         }
         for sug in &arg.suggestions {
             match sug {
-                FigSuggestion::Plain(val) if !val.is_empty() => {
-                    out.push(Entry::new(val, val, EntryKind::Enum, ""));
+                FigSuggestion::Plain(val) if !val.trim().is_empty() => {
+                    let v = val.trim();
+                    out.push(Entry::new(v, v, EntryKind::Enum, ""));
                 }
-                FigSuggestion::Detailed { name, description } if !name.is_empty() => {
-                    out.push(Entry::new(name, name, EntryKind::Enum, description));
+                FigSuggestion::Detailed { name, description } if !name.trim().is_empty() => {
+                    let n = name.trim();
+                    out.push(Entry::new(n, n, EntryKind::Enum, description));
                 }
                 _ => {}
             }
@@ -549,12 +549,67 @@ fn yaml_to_json(input: &str) -> anyhow::Result<serde_json::Value> {
     if lines.is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
-    let (val, _) = parse_yaml_block(&lines, 0, lines[0].indent)?;
+    let (val, next_idx) = parse_yaml_block(&lines, 0, lines[0].indent)?;
+    if next_idx < lines.len() {
+        anyhow::bail!(
+            "Unexpected YAML syntax or indentation near: {}",
+            lines[next_idx].text
+        );
+    }
     Ok(val)
 }
 
 fn is_seq_item(text: &str) -> bool {
     text == "-" || text.starts_with("- ")
+}
+
+fn is_block_scalar(val_part: &str) -> Option<bool> {
+    match val_part {
+        "|" | "|-" | "|+" => Some(true),
+        ">" | ">-" | ">+" => Some(false),
+        _ => None,
+    }
+}
+
+fn consume_yaml_value(
+    lines: &[YamlLine],
+    idx: &mut usize,
+    parent_indent: usize,
+    val_part: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(literal) = is_block_scalar(val_part) {
+        if *idx < lines.len() && lines[*idx].indent > parent_indent {
+            let block_indent = lines[*idx].indent;
+            let mut parts = Vec::new();
+            while *idx < lines.len() && lines[*idx].indent >= block_indent {
+                parts.push(lines[*idx].text.as_str());
+                *idx += 1;
+            }
+            let sep = if literal { "\n" } else { " " };
+            return Ok(serde_json::Value::String(parts.join(sep)));
+        }
+        return Ok(serde_json::Value::String(String::new()));
+    }
+
+    if val_part.is_empty() {
+        if *idx < lines.len() && lines[*idx].indent > parent_indent {
+            let child_indent = lines[*idx].indent;
+            let (nested, next_idx) = parse_yaml_block(lines, *idx, child_indent)?;
+            *idx = next_idx;
+            Ok(nested)
+        } else if *idx < lines.len()
+            && lines[*idx].indent == parent_indent
+            && is_seq_item(&lines[*idx].text)
+        {
+            let (nested, next_idx) = parse_yaml_seq(lines, *idx, lines[*idx].indent)?;
+            *idx = next_idx;
+            Ok(nested)
+        } else {
+            Ok(serde_json::Value::Null)
+        }
+    } else {
+        parse_yaml_inline(val_part)
+    }
 }
 
 fn find_mapping_colon(text: &str) -> Option<usize> {
@@ -610,6 +665,9 @@ fn parse_yaml_map(
         if line.indent < base_indent || is_seq_item(&line.text) {
             break;
         }
+        if line.indent > base_indent {
+            anyhow::bail!("Unexpected YAML indentation at: {}", line.text);
+        }
         let Some(colon) = find_mapping_colon(&line.text) else {
             anyhow::bail!(
                 "Expected YAML 'key: value' mapping entry, found: {}",
@@ -618,28 +676,10 @@ fn parse_yaml_map(
         };
         let key = unquote_yaml_scalar(line.text[..colon].trim());
         let val_part = line.text[colon + 1..].trim();
+        let line_indent = line.indent;
         idx += 1;
 
-        let val = if val_part.is_empty() {
-            if idx < lines.len() && lines[idx].indent > line.indent {
-                let child_indent = lines[idx].indent;
-                let (nested, next_idx) = parse_yaml_block(lines, idx, child_indent)?;
-                idx = next_idx;
-                nested
-            } else if idx < lines.len()
-                && lines[idx].indent == line.indent
-                && is_seq_item(&lines[idx].text)
-            {
-                let (nested, next_idx) = parse_yaml_seq(lines, idx, lines[idx].indent)?;
-                idx = next_idx;
-                nested
-            } else {
-                serde_json::Value::Object(serde_json::Map::new())
-            }
-        } else {
-            parse_yaml_inline(val_part)?
-        };
-
+        let val = consume_yaml_value(lines, &mut idx, line_indent, val_part)?;
         map.insert(key, val);
     }
     Ok((serde_json::Value::Object(map), idx))
@@ -656,7 +696,10 @@ fn parse_yaml_seq(
         if line.indent != base_indent || !is_seq_item(&line.text) {
             break;
         }
-        let after_dash = line.text.strip_prefix('-').unwrap_or("").trim();
+        let after_dash_raw = &line.text[1..];
+        let spaces = after_dash_raw.bytes().take_while(|b| *b == b' ').count();
+        let after_dash = after_dash_raw[spaces..].trim();
+        let item_indent = base_indent + 1 + spaces;
         idx += 1;
 
         if after_dash.is_empty() {
@@ -671,19 +714,7 @@ fn parse_yaml_seq(
         } else if let Some(colon) = find_mapping_colon(after_dash) {
             let first_key = unquote_yaml_scalar(after_dash[..colon].trim());
             let first_val_part = after_dash[colon + 1..].trim();
-            let item_indent = base_indent + 2;
-
-            let first_val = if first_val_part.is_empty() {
-                if idx < lines.len() && lines[idx].indent > item_indent {
-                    let (nested, next_idx) = parse_yaml_block(lines, idx, lines[idx].indent)?;
-                    idx = next_idx;
-                    nested
-                } else {
-                    serde_json::Value::Object(serde_json::Map::new())
-                }
-            } else {
-                parse_yaml_inline(first_val_part)?
-            };
+            let first_val = consume_yaml_value(lines, &mut idx, item_indent, first_val_part)?;
 
             let mut item_map = serde_json::Map::new();
             item_map.insert(first_key, first_val);
@@ -1005,5 +1036,87 @@ commands:
             .expect("--target");
         assert_eq!(target.kind, EntryKind::Param);
         assert_eq!(target.children.len(), 2);
+    }
+
+    #[test]
+    fn test_carapace_yaml_empty_sections_block_scalars_local_override_and_nested_seq() {
+        let yaml = r#"
+name: mytool
+description: |
+  Line one: with colon
+  Line two
+aliases:
+persistentflags:
+  --mode: Persistent flag without value
+flags:
+  -m, --mode=: Local parameter overrides persistent flag
+commands:
+  - aliases:
+    - s
+    name: status
+    completion:
+      positional:
+        - ["$files([\"*.rs\"])", "$files", "explicit-arg"]
+      positionalany:
+        - "explicit-arg"
+"#;
+        let entry = parse_spec_str("mytool.yaml", yaml).expect("parse extended carapace YAML");
+        assert_eq!(entry.desc, "Line one: with colon\nLine two");
+
+        let mode = entry
+            .children
+            .iter()
+            .find(|c| c.text == "--mode")
+            .expect("--mode parameter");
+        assert_eq!(mode.kind, EntryKind::Param);
+        assert_eq!(mode.aliases, vec!["-m"]);
+        assert_eq!(mode.desc, "Local parameter overrides persistent flag");
+
+        let status = entry
+            .children
+            .iter()
+            .find(|c| c.text == "status")
+            .expect("status subcmd");
+        assert_eq!(status.aliases, vec!["s"]);
+        assert_eq!(
+            status
+                .children
+                .iter()
+                .filter(|c| c.label == "$files")
+                .count(),
+            1
+        );
+        assert_eq!(
+            status
+                .children
+                .iter()
+                .filter(|c| c.text == "explicit-arg")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_parse_spec_rejects_malformed_yaml_indentation_and_blank_entries() {
+        let bad_yaml = "name: tool\n- unexpected_seq\n";
+        assert!(parse_spec_str("bad.yaml", bad_yaml).is_err());
+
+        let bad_indent = "name: tool\n  stray: value\n";
+        assert!(parse_spec_str("indent.yaml", bad_indent).is_err());
+
+        let blank_name = r#"{"name": "   ", "description": "blank"}"#;
+        assert!(parse_spec_str("blank.json", blank_name).is_err());
+
+        let fig_with_empty_opt = r#"{
+  "name": "fig",
+  "options": [
+    { "name": ["", "  "], "description": "ignored" },
+    { "name": "-v", "description": "verbose" }
+  ],
+  "subcommands": null
+}"#;
+        let parsed = parse_spec_str("fig.json", fig_with_empty_opt).expect("fig with null/empty");
+        let texts: Vec<&str> = parsed.children.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(texts, vec!["-v"]);
     }
 }
