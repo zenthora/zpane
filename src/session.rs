@@ -141,8 +141,7 @@ fn split_pipeline_prefix_impl(
     let mut last_sep_end: Option<usize> = None;
     let mut i = 0;
 
-    while i < bytes.len() {
-        let ch = input[i..].chars().next().unwrap();
+    while let Some(ch) = input.get(i..).and_then(|rest| rest.chars().next()) {
         let ch_len = ch.len_utf8();
         if escaped {
             escaped = false;
@@ -1247,6 +1246,38 @@ fn resolve_pane3_entries<I: Introspect>(
     entries
 }
 
+fn subcommand_has_pane2_children<I: Introspect>(
+    p1_opt: Option<&Entry>,
+    p2: &Entry,
+    subcmd_chain: &[String],
+    introspector: &mut I,
+) -> bool {
+    if !p2.children.is_empty() {
+        return true;
+    }
+    let Some(p1) = p1_opt else {
+        return false;
+    };
+    if walk_entry_chain(p1, subcmd_chain)
+        .and_then(|parent| {
+            parent
+                .children
+                .iter()
+                .find(|c| c.text.eq_ignore_ascii_case(&p2.text))
+        })
+        .is_some_and(|e| !e.children.is_empty())
+    {
+        return true;
+    }
+    let p1_exe = primary_exe_for_entry(p1);
+    let mut exe_chain: Vec<&str> = Vec::with_capacity(2 + subcmd_chain.len());
+    exe_chain.push(p1_exe);
+    exe_chain.extend(subcmd_chain.iter().map(String::as_str));
+    exe_chain.push(p2.text.as_str());
+    let queried = introspector.query(&exe_chain);
+    !queried.is_empty() && !queried.iter().any(Entry::is_loading)
+}
+
 fn resolve_pane3_token_cow<'a>(
     cur_p3: Option<&'a Entry>,
     pane3_filter: &str,
@@ -1607,33 +1638,6 @@ impl<I: Introspect> MillerSession<I> {
         }
     }
 
-    fn subcommand_has_pane2_children(&mut self, p1_opt: Option<&Entry>, p2: &Entry) -> bool {
-        if !p2.children.is_empty() {
-            return true;
-        }
-        let Some(p1) = p1_opt else {
-            return false;
-        };
-        if walk_entry_chain(p1, &self.cmd.subcmd_chain)
-            .and_then(|parent| {
-                parent
-                    .children
-                    .iter()
-                    .find(|c| c.text.eq_ignore_ascii_case(&p2.text))
-            })
-            .is_some_and(|e| !e.children.is_empty())
-        {
-            return true;
-        }
-        let p1_exe = primary_exe_for_entry(p1);
-        let mut exe_chain: Vec<&str> = Vec::with_capacity(2 + self.cmd.subcmd_chain.len());
-        exe_chain.push(p1_exe);
-        exe_chain.extend(self.cmd.subcmd_chain.iter().map(String::as_str));
-        exe_chain.push(p2.text.as_str());
-        let queried = self.introspector.query(&exe_chain);
-        !queried.is_empty() && !queried.iter().any(Entry::is_loading)
-    }
-
     fn slide_window_into_subcmd(
         &mut self,
         parent_sub: String,
@@ -1657,9 +1661,9 @@ impl<I: Introspect> MillerSession<I> {
         let dialect = self.dialect;
         match self.active_pane {
             Pane::First => {
-                if let Some(p1) = self.selected_entry(Pane::First).cloned() {
+                if let Some(p1) = self.panes[0].selected() {
                     if !p1.is_loading() {
-                        self.cmd.commit_pane1_entry(&p1, dialect);
+                        self.cmd.commit_pane1_entry(p1, dialect);
                         self.active_pane = Pane::Second;
                         self.cmd.resume_preview(Pane::Second);
                         self.dirty = true;
@@ -1667,10 +1671,10 @@ impl<I: Introspect> MillerSession<I> {
                 }
             }
             Pane::Second => {
-                let p1_opt = self.selected_entry(Pane::First).cloned();
-                if let Some(p2) = self.selected_entry(Pane::Second).cloned() {
+                let p1_opt = self.panes[0].selected();
+                if let Some(p2) = self.panes[1].selected() {
                     if !p2.is_loading() {
-                        self.cmd.commit_pane2_entry(p1_opt.as_ref(), &p2, dialect);
+                        self.cmd.commit_pane2_entry(p1_opt, p2, dialect);
                         self.active_pane = Pane::Third;
                         self.cmd.resume_preview(Pane::Second);
                         self.cmd.resume_preview(Pane::Third);
@@ -1680,9 +1684,9 @@ impl<I: Introspect> MillerSession<I> {
             }
             Pane::Third => {
                 if let (Some(p1), Some(p2), Some(p3)) = (
-                    self.selected_entry(Pane::First).cloned(),
-                    self.selected_entry(Pane::Second).cloned(),
-                    self.selected_entry(Pane::Third).cloned(),
+                    self.panes[0].selected(),
+                    self.panes[1].selected(),
+                    self.panes[2].selected(),
                 ) {
                     let can_slide_p3 = p3.kind == EntryKind::Subcmd
                         || p3.kind == EntryKind::Param
@@ -1690,14 +1694,16 @@ impl<I: Introspect> MillerSession<I> {
                     if p2.kind == EntryKind::Subcmd
                         && can_slide_p3
                         && p3.is_emittable()
-                        && is_safe_entry_for_emit(&p3, dialect)
+                        && is_safe_entry_for_emit(p3, dialect)
                         && !p3.is_loading()
                     {
-                        self.cmd.commit_pane2_entry(Some(&p1), &p2, dialect);
-                        let parent_idx = self.cmd.find_subcmd_token_idx(&p2);
+                        self.cmd.commit_pane2_entry(Some(p1), p2, dialect);
+                        let parent_idx = self.cmd.find_subcmd_token_idx(p2);
                         self.cmd.push_token_dedup(p3.text.clone());
                         self.cmd.pending_pane3_seeds.clear();
-                        self.slide_window_into_subcmd(p2.text, parent_idx, p3.text, false);
+                        let p2_text = p2.text.clone();
+                        let p3_text = p3.text.clone();
+                        self.slide_window_into_subcmd(p2_text, parent_idx, p3_text, false);
                     }
                 }
             }
@@ -1743,13 +1749,17 @@ impl<I: Introspect> MillerSession<I> {
         match self.active_pane {
             Pane::First => {
                 let dialect = self.dialect;
-                if let Some(p1) = self.selected_entry(Pane::First).cloned() {
+                if let Some(p1) = self.panes[0].selected() {
                     if !p1.is_loading() {
-                        self.cmd.commit_pane1_entry(&p1, dialect);
-                        if self.panes[0].clear_filter() {
-                            self.panes[0].select_first_matching(|it| {
-                                it.text == p1.text && it.kind == p1.kind
-                            });
+                        self.cmd.commit_pane1_entry(p1, dialect);
+                        if !self.panes[0].filter().is_empty() {
+                            let p1_text = p1.text.clone();
+                            let p1_kind = p1.kind;
+                            if self.panes[0].clear_filter() {
+                                self.panes[0].select_first_matching(|it| {
+                                    it.text == p1_text && it.kind == p1_kind
+                                });
+                            }
                         }
                         self.active_pane = Pane::Second;
                         self.cmd.resume_preview(Pane::Second);
@@ -1764,8 +1774,8 @@ impl<I: Introspect> MillerSession<I> {
                     return;
                 }
                 let dialect = self.dialect;
-                let p1_opt = self.selected_entry(Pane::First).cloned();
-                let Some(p2) = self.selected_entry(Pane::Second).cloned() else {
+                let p1_opt = self.panes[0].selected();
+                let Some(p2) = self.panes[1].selected() else {
                     return;
                 };
                 if p2.is_loading() || !p2.is_emittable() {
@@ -1773,10 +1783,8 @@ impl<I: Introspect> MillerSession<I> {
                 }
 
                 let commit_without_value = p2.commits_without_value()
-                    || p1_opt
-                        .as_ref()
-                        .is_some_and(|p1| p1.is_scope_root() && p2.children.is_empty());
-                self.cmd.commit_pane2_entry(p1_opt.as_ref(), &p2, dialect);
+                    || p1_opt.is_some_and(|p1| p1.is_scope_root() && p2.children.is_empty());
+                self.cmd.commit_pane2_entry(p1_opt, p2, dialect);
                 if commit_without_value {
                     self.panes[1].clear_filter();
                     self.panes[1].reset_cursor();
@@ -1790,12 +1798,12 @@ impl<I: Introspect> MillerSession<I> {
                 self.dirty = true;
             }
             Pane::Third => {
-                let p1_opt = self.selected_entry(Pane::First).cloned();
-                let p2_opt = self.selected_entry(Pane::Second).cloned();
-                let p3_opt = self.selected_entry(Pane::Third).cloned();
+                let p1_opt = self.panes[0].selected();
+                let p2_opt = self.panes[1].selected();
+                let p3_opt = self.panes[2].selected();
 
-                if let Some(p2) = p2_opt.as_ref().filter(|e| e.kind == EntryKind::Subcmd) {
-                    let slide_into_p3 = p3_opt.as_ref().is_some_and(|p3| {
+                if let Some(p2) = p2_opt.filter(|e| e.kind == EntryKind::Subcmd) {
+                    let slide_into_p3 = p3_opt.is_some_and(|p3| {
                         !p3.is_loading()
                             && p3.is_emittable()
                             && (p3.kind == EntryKind::Subcmd
@@ -1810,17 +1818,14 @@ impl<I: Introspect> MillerSession<I> {
                     if slide_into_p3 {
                         if let Some(p3) = p3_opt {
                             let dialect = self.dialect;
-                            if is_safe_entry_for_emit(&p3, dialect) {
-                                self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2, dialect);
+                            if is_safe_entry_for_emit(p3, dialect) {
+                                self.cmd.commit_pane2_entry(p1_opt, p2, dialect);
                                 let parent_idx = self.cmd.find_subcmd_token_idx(p2);
                                 self.cmd.push_token_dedup(p3.text.clone());
                                 self.cmd.pending_pane3_seeds.clear();
-                                self.slide_window_into_subcmd(
-                                    p2.text.clone(),
-                                    parent_idx,
-                                    p3.text,
-                                    false,
-                                );
+                                let p2_text = p2.text.clone();
+                                let p3_text = p3.text.clone();
+                                self.slide_window_into_subcmd(p2_text, parent_idx, p3_text, false);
                             }
                             return;
                         }
@@ -1828,9 +1833,8 @@ impl<I: Introspect> MillerSession<I> {
                 }
 
                 let pane3_filter = self.panes[2].filter();
-                let val_to_add = resolve_pane3_token(p3_opt.as_ref(), pane3_filter, self.dialect);
+                let val_to_add = resolve_pane3_token(p3_opt, pane3_filter, self.dialect);
                 let is_flag_placeholder = p3_opt
-                    .as_ref()
                     .is_some_and(|p3| p3.is_placeholder() && p3.kind == EntryKind::Flag)
                     && pane3_filter.trim().is_empty();
 
@@ -1838,7 +1842,7 @@ impl<I: Introspect> MillerSession<I> {
                     return;
                 }
 
-                if let (Some(p2), Some(val)) = (p2_opt.as_ref(), val_to_add.as_ref()) {
+                if let (Some(p2), Some(val)) = (p2_opt, val_to_add.as_ref()) {
                     let inline_updated = matches!(p2.kind, EntryKind::Param | EntryKind::Flag)
                         .then(|| {
                             let last = self.cmd.tokens().last()?;
@@ -1863,19 +1867,29 @@ impl<I: Introspect> MillerSession<I> {
                 }
 
                 let dialect = self.dialect;
-                if let Some(ref p2) = p2_opt {
+                if let Some(p2) = p2_opt {
                     let should_slide_subcmd = p2.kind == EntryKind::Subcmd
-                        && self.subcommand_has_pane2_children(p1_opt.as_ref(), p2);
-                    self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2, dialect);
+                        && subcommand_has_pane2_children(
+                            p1_opt,
+                            p2,
+                            &self.cmd.subcmd_chain,
+                            &mut self.introspector,
+                        );
+                    self.cmd.commit_pane2_entry(p1_opt, p2, dialect);
                     if let Some(val) = val_to_add {
                         self.cmd.push_token_dedup(val);
                     }
                     if p2.kind == EntryKind::Subcmd {
+                        let p2_slide = if should_slide_subcmd {
+                            let parent_idx = self.cmd.find_subcmd_token_idx(p2);
+                            Some((p2.text.clone(), parent_idx))
+                        } else {
+                            None
+                        };
                         self.panes[2].clear_filter();
                         self.cmd.resume_preview(Pane::Third);
-                        if should_slide_subcmd {
-                            let parent_idx = self.cmd.find_subcmd_token_idx(p2);
-                            self.cmd.push_subcmd(p2.text.clone(), parent_idx);
+                        if let Some((p2_text, parent_idx)) = p2_slide {
+                            self.cmd.push_subcmd(p2_text, parent_idx);
                             self.panes[1].clear_filter();
                             self.panes[1].reset_cursor();
                             self.active_pane = Pane::Second;
@@ -1890,7 +1904,7 @@ impl<I: Introspect> MillerSession<I> {
                         return;
                     }
                 } else {
-                    self.cmd.ensure_pane1_token(p1_opt.as_ref(), dialect);
+                    self.cmd.ensure_pane1_token(p1_opt, dialect);
                     if let Some(val) = val_to_add {
                         self.cmd.push_token_dedup(val);
                     }
@@ -2211,7 +2225,9 @@ impl<I: Introspect> MillerSession<I> {
         if self.active_pane == Pane::Third && !self.cmd.pending_pane3_seeds.is_empty() {
             let pane3_entries = self.panes[2].entries();
             if !pane3_entries.iter().any(Entry::is_loading) {
-                let (tok3_idx, tok3) = self.cmd.pending_pane3_seeds.pop_front().unwrap();
+                let Some((tok3_idx, tok3)) = self.cmd.pending_pane3_seeds.pop_front() else {
+                    return false;
+                };
                 let has_more = !self.cmd.pending_pane3_seeds.is_empty();
                 let matched = select_best_matching(&mut self.panes[2], &tok3);
                 let matched_navigable_child = matched
@@ -4279,6 +4295,241 @@ mod tests {
         assert_eq!(
             session.command_line(),
             "Invoke-Task0200 -Verbose -Alpha v -AlphaExtra"
+        );
+    }
+
+    #[test]
+    fn test_perf_step_right_and_accept_without_subtree_clone() {
+        let leaf_template: Vec<Entry> = (0..20)
+            .map(|k| {
+                let name = format!("--arg{k:02}");
+                Entry::new(name.clone(), name, EntryKind::Param, "Leaf parameter")
+            })
+            .collect();
+
+        let mut root_cmd = Entry::new("az", "az", EntryKind::Cli, "Azure CLI");
+        let mut svc_children = Vec::with_capacity(20);
+        for i in 0..20 {
+            let svc_name = format!("svc{i:02}");
+            let mut svc = Entry::new(svc_name.clone(), svc_name, EntryKind::Subcmd, "Service");
+            let mut op_children = Vec::with_capacity(26);
+            for j in 0..25 {
+                let op_name = format!("op{j:02}");
+                let mut op = Entry::new(op_name.clone(), op_name, EntryKind::Subcmd, "Operation");
+                op.children = leaf_template.clone();
+                op_children.push(op);
+            }
+            let mut dry_run = Entry::new("--dry-run", "--dry-run", EntryKind::Flag, "Dry run");
+            dry_run.children = vec![Entry::placeholder(
+                "(Flag - No Value Needed)",
+                EntryKind::Flag,
+                "Valueless flag",
+            )];
+            op_children.push(dry_run);
+            svc.children = op_children;
+            svc_children.push(svc);
+        }
+        root_cmd.children = svc_children;
+
+        let mut session = MillerSession::new(
+            vec![root_cmd],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        assert_eq!(session.command_line(), "az");
+
+        const ITERS: usize = 500;
+        let step_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            session.apply(UserAction::StepRight); // Pane 1 -> Pane 2 (`svc00`)
+            session.apply(UserAction::StepRight); // Pane 2 -> Pane 3 (`op00`)
+            session.apply(UserAction::StepLeft); // Pane 3 -> Pane 2
+            session.apply(UserAction::StepLeft); // Pane 2 -> Pane 1
+        }
+        let step_elapsed = step_start.elapsed();
+        assert_eq!(session.command_line(), "az svc00");
+
+        session.apply(UserAction::Backspace); // pop `svc00`
+        session.apply(UserAction::Backspace); // pop `az`
+        assert_eq!(session.view().active_pane, Pane::First);
+
+        let accept_start = std::time::Instant::now();
+        for _ in 0..ITERS {
+            session.apply(UserAction::InsertChar('a'));
+            session.apply(UserAction::AcceptToken); // Pane 1 with filter -> Pane 2
+            session.apply(UserAction::AcceptToken); // Pane 2 (`svc00`) -> Pane 3
+            session.apply(UserAction::StepLeft); // Pane 3 -> Pane 2
+            session.apply(UserAction::StepLeft); // Pane 2 -> Pane 1
+        }
+        let accept_elapsed = accept_start.elapsed();
+
+        // Also verify Pane 3 subcommand sliding and Pane 2 valueless flag accept over deep tree.
+        session.apply(UserAction::StepRight); // Pane 1 -> Pane 2 (`svc00`)
+        session.apply(UserAction::StepRight); // Pane 2 -> Pane 3 (`op00`)
+        session.apply(UserAction::AcceptToken); // slides into `svc00` (Pane 3 of `op00`)
+        assert_eq!(session.command_line(), "az svc00 op00 --arg00");
+        session.apply(UserAction::StepLeft); // `svc00` Pane 2
+        session.apply(UserAction::MoveEnd); // `--dry-run`
+        session.apply(UserAction::AcceptToken); // commits valueless Flag
+        assert_eq!(session.command_line(), "az svc00 op00 --dry-run");
+
+        eprintln!(
+            "[perf] test_perf_step_right_and_accept_without_subtree_clone: iters={ITERS} step_right={:.2}ms ({:.1}us/iter) accept_token={:.2}ms ({:.1}us/iter)",
+            step_elapsed.as_secs_f64() * 1000.0,
+            step_elapsed.as_secs_f64() * 1_000_000.0 / ITERS as f64,
+            accept_elapsed.as_secs_f64() * 1000.0,
+            accept_elapsed.as_secs_f64() * 1_000_000.0 / ITERS as f64,
+        );
+
+        assert!(
+            step_elapsed < std::time::Duration::from_secs(2),
+            "StepRight over deep Entry tree took too long: {step_elapsed:?}"
+        );
+        assert!(
+            accept_elapsed < std::time::Duration::from_secs(2),
+            "AcceptToken over deep Entry tree took too long: {accept_elapsed:?}"
+        );
+        assert_eq!(
+            session.apply(UserAction::Confirm),
+            SessionOutcome::Confirmed("az svc00 op00 --dry-run".to_string())
+        );
+    }
+
+    #[test]
+    fn test_pentest_split_pipeline_prefix_adversarial_and_unicode_boundaries() {
+        assert_eq!(
+            split_pipeline_prefix("echo 🦀|🚀; grep ☃"),
+            (Some("echo 🦀|🚀;".to_string()), "grep ☃")
+        );
+        assert_eq!(
+            split_pipeline_prefix("echo café&&ls --all"),
+            (Some("echo café&&".to_string()), "ls --all")
+        );
+        assert_eq!(
+            split_pipeline_prefix("((a | b) && {c; d}) | tail"),
+            (Some("((a | b) && {c; d}) |".to_string()), "tail")
+        );
+        assert_eq!(
+            split_pipeline_prefix("echo 'a|b' \"c;d\""),
+            (None, "echo 'a|b' \"c;d\"")
+        );
+        assert_eq!(split_pipeline_prefix("echo \\"), (None, "echo \\"));
+        assert_eq!(
+            split_pipeline_prefix("echo 'unclosed"),
+            (None, "echo 'unclosed")
+        );
+        assert_eq!(
+            split_pipeline_prefix("echo \"unclosed"),
+            (None, "echo \"unclosed")
+        );
+        assert_eq!(
+            split_pipeline_prefix("| cmd"),
+            (Some("|".to_string()), "cmd")
+        );
+        assert_eq!(split_pipeline_prefix("a |"), (Some("a |".to_string()), ""));
+        assert_eq!(split_pipeline_prefix(";;;"), (Some(";;;".to_string()), ""));
+
+        let ps_pipe_amp =
+            split_pipeline_prefix_for_dialect("echo ok |& grep err", ShellDialect::PowerShell);
+        assert_eq!(ps_pipe_amp, (Some("echo ok |".to_string()), "& grep err"));
+
+        let posix_pipe_amp =
+            split_pipeline_prefix_for_dialect("echo ok |& grep err", ShellDialect::Posix);
+        assert_eq!(posix_pipe_amp, (Some("echo ok |&".to_string()), "grep err"));
+    }
+
+    #[test]
+    fn test_pentest_pane3_seeding_and_hostile_introspector_entries() {
+        let mut kubectl = Entry::new("kubectl", "kubectl", EntryKind::Cli, "Kubernetes");
+        let mut get = Entry::new("get", "get", EntryKind::Subcmd, "Get resources");
+        get.children = vec![
+            Entry::new("pods", "pods", EntryKind::Subcmd, "Pods"),
+            Entry::new("bad\n;id", "bad", EntryKind::Subcmd, "Control injection"),
+            Entry::new(
+                "evil\u{202E}txt",
+                "bidi",
+                EntryKind::Param,
+                "BiDi injection",
+            ),
+            Entry::new("$BAD;id", "badvar", EntryKind::Var, "Unsafe variable"),
+        ];
+        kubectl.children = vec![get];
+
+        // Multi-token seeded initial buffer with embedded escapes/controls/BiDi must never panic
+        // when draining `pending_pane3_seeds` and must emit zero disallowed controls.
+        let mut seeded = MillerSession::new(
+            vec![kubectl.clone()],
+            FakeIntrospector::empty(),
+            "kubectl get pods \x1b[31m--all\r\n;id\0\u{202E}\u{2028}",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        let seeded_cmd = seeded.command_line();
+        assert!(!seeded_cmd.chars().any(is_disallowed_control));
+        assert!(seeded_cmd.starts_with("kubectl get pods"));
+        seeded.apply(UserAction::StepRight);
+        seeded.apply(UserAction::AcceptToken);
+        seeded.apply(UserAction::Backspace);
+        assert!(!seeded.command_line().chars().any(is_disallowed_control));
+
+        // Hostile introspector output containing control/BiDi chars and unsafe variables must
+        // never leak into the assembled Command Line on StepRight or AcceptToken.
+        let mut target_param = Entry::new("--target", "--target", EntryKind::Param, "Target");
+        target_param.children = vec![
+            Entry::new("evil\nval", "evil_nl", EntryKind::Value, "Bad value"),
+            Entry::new("$EVIL;id", "evil_var", EntryKind::Var, "Bad var"),
+            Entry::new("ok.txt", "ok.txt", EntryKind::Value, "Safe value"),
+        ];
+        let introspector = FakeIntrospector::empty();
+        introspector.push_ready(
+            "mycli",
+            vec![
+                Entry::new("bad\n;id", "bad_sub", EntryKind::Subcmd, "Newline"),
+                Entry::new("$EVIL;id", "bad_var", EntryKind::Var, "Unsafe var"),
+                Entry::new("safe\x1b[31m", "ansi_sub", EntryKind::Subcmd, "ANSI"),
+                target_param,
+                Entry::new("clean", "clean", EntryKind::Subcmd, "Clean"),
+            ],
+        );
+
+        let mut sess = MillerSession::new(
+            vec![Entry::new("mycli", "mycli", EntryKind::Cli, "CLI")],
+            introspector,
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        sess.poll_discovery();
+        sess.apply(UserAction::StepRight); // Pane 2 on `bad\n;id` (unsafe)
+        sess.apply(UserAction::StepRight); // Pane 3 of unsafe entry
+        assert!(!sess.command_line().contains("bad"));
+        assert!(!sess.command_line().chars().any(is_disallowed_control));
+        sess.apply(UserAction::StepLeft);
+        sess.apply(UserAction::MoveDown); // `$EVIL;id`
+        sess.apply(UserAction::AcceptToken);
+        assert!(!sess.command_line().contains("$EVIL"));
+        sess.apply(UserAction::StepLeft);
+        sess.apply(UserAction::MoveDown); // `safe\x1b[31m`
+        sess.apply(UserAction::AcceptToken);
+        assert!(!sess.command_line().chars().any(is_disallowed_control));
+        sess.apply(UserAction::StepLeft);
+        sess.apply(UserAction::MoveDown); // `--target`
+        sess.apply(UserAction::StepRight); // Pane 3 on `evil\nval`
+        sess.apply(UserAction::AcceptToken); // ignored unsafe Value
+        assert!(!sess.command_line().contains("evil"));
+        sess.apply(UserAction::MoveDown); // `$EVIL;id` in Pane 3
+        sess.apply(UserAction::AcceptToken); // ignored unsafe Var
+        assert!(!sess.command_line().contains("$EVIL"));
+        sess.apply(UserAction::MoveDown); // `ok.txt`
+        sess.apply(UserAction::AcceptToken);
+        assert_eq!(sess.command_line(), "mycli --target ok.txt");
+        sess.apply(UserAction::MoveEnd); // `clean`
+        sess.apply(UserAction::AcceptToken);
+        assert_eq!(
+            sess.apply(UserAction::Confirm),
+            SessionOutcome::Confirmed("mycli --target ok.txt clean".to_string())
         );
     }
 }

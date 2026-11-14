@@ -2097,15 +2097,13 @@ fn scan_cwd_entries(dir: &Path) -> Vec<CwdEntry> {
         .take(MAX_CWD_SCAN_READS)
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            if name.is_empty()
-                || name
-                    .chars()
-                    .any(|c| c.is_control() || is_bidi_format_char(c))
-            {
+            let os_name = e.file_name();
+            let name_str = os_name.to_str()?;
+            if name_str.is_empty() || crate::model::has_disallowed_control(name_str) {
                 return None;
             }
             let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            let name = os_name.into_string().ok()?;
             Some(CwdEntry { name, is_dir })
         })
         .collect();
@@ -2241,35 +2239,44 @@ pub(super) fn load_catalog_with_context(
     let mut cli_order: Vec<String> = Vec::with_capacity(2048);
     let mut seen_path_dirs = HashSet::new();
     for dir in env_src.path_dirs() {
-        let dir_key = if cfg!(windows) {
-            dir.to_string_lossy().to_ascii_lowercase()
+        let dir_key: Cow<'_, str> = if cfg!(windows) {
+            let s = dir.to_string_lossy();
+            if s.bytes().any(|b| b.is_ascii_uppercase()) {
+                Cow::Owned(s.to_ascii_lowercase())
+            } else {
+                s
+            }
         } else {
-            dir.to_string_lossy().into_owned()
+            dir.to_string_lossy()
         };
-        if !seen_path_dirs.insert(dir_key) {
+        if seen_path_dirs.contains(dir_key.as_ref()) {
             continue;
         }
+        seen_path_dirs.insert(dir_key.into_owned());
         for (name, path) in env_src.dir_executables(&dir) {
             if !is_safe_command_token(&name) {
                 continue;
             }
             let has_upper = name.bytes().any(|b| b.is_ascii_uppercase());
-            if !has_upper && (disabled.contains(&name) || cli_map.contains_key(&name)) {
+            let key: Cow<'_, str> = if has_upper {
+                Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                Cow::Borrowed(name.as_str())
+            };
+            if disabled.contains(key.as_ref()) || cli_map.contains_key(key.as_ref()) {
                 continue;
             }
-            let key = name.to_ascii_lowercase();
-            if disabled.contains(&key) {
-                continue;
-            }
-            if let std::collections::hash_map::Entry::Vacant(e) = cli_map.entry(key.clone()) {
-                cli_order.push(key);
-                e.insert(Entry::new(
+            let owned_key = key.into_owned();
+            cli_order.push(owned_key.clone());
+            cli_map.insert(
+                owned_key,
+                Entry::new(
                     name.clone(),
                     name,
                     EntryKind::Cli,
                     path.display().to_string(),
-                ));
-            }
+                ),
+            );
         }
     }
 
@@ -3391,5 +3398,105 @@ disabled_tools = ["blocked"] # hide unwanted binaries
         assert!(!git_branches.iter().any(|b| b.contains("too_deep")));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_pentest_cwd_scan_and_path_catalog_filters_hostile_entries() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "zpane_test_cwd_pentest_{}_{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub_dir")).unwrap();
+        fs::write(root.join("safe.txt"), b"ok").unwrap();
+
+        // Hostile Unicode BiDi and line-separator filenames must be skipped before allocation.
+        let _ = fs::write(root.join("spoof\u{202E}txt.exe"), b"bad");
+        let _ = fs::write(root.join("line\u{2028}sep.txt"), b"bad");
+
+        #[cfg(unix)]
+        {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            let raw_invalid =
+                OsString::from_vec(vec![b'b', b'a', b'd', 0xff, b'.', b't', b'x', b't']);
+            let _ = fs::write(root.join(raw_invalid), b"bad");
+        }
+
+        let cwd = scan_cwd_entries(&root);
+        let names: Vec<(&str, bool)> = cwd.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+        assert_eq!(names, vec![("sub_dir", true), ("safe.txt", false)]);
+        let _ = fs::remove_dir_all(&root);
+
+        // PATH catalog scan: deduplicates mixed/lowercase tools, obeys case-insensitive
+        // disabled_tools, and rejects option/control/BiDi/oversized command tokens.
+        let dir1 = PathBuf::from("/fake/bin1");
+        let dir2 = PathBuf::from("/fake/bin2");
+        let oversized = "x".repeat(300);
+        let fake = FakeEnv {
+            vars: vec![],
+            path_dirs: vec![dir1.clone(), dir2.clone(), dir1.clone()],
+            bins: HashMap::from([
+                (
+                    dir1,
+                    vec![
+                        ("git".to_string(), PathBuf::from("/fake/bin1/git")),
+                        ("MyTool".to_string(), PathBuf::from("/fake/bin1/MyTool")),
+                        ("-evil".to_string(), PathBuf::from("/fake/bin1/-evil")),
+                        (".".to_string(), PathBuf::from("/fake/bin1/.")),
+                        ("..".to_string(), PathBuf::from("/fake/bin1/..")),
+                        (
+                            "cmd\ninject".to_string(),
+                            PathBuf::from("/fake/bin1/cmd_nl"),
+                        ),
+                        ("cmd\0nul".to_string(), PathBuf::from("/fake/bin1/cmd_nul")),
+                        (
+                            "cmd\u{202E}bidi".to_string(),
+                            PathBuf::from("/fake/bin1/cmd_bidi"),
+                        ),
+                        ("two words".to_string(), PathBuf::from("/fake/bin1/spaces")),
+                        (oversized, PathBuf::from("/fake/bin1/oversized")),
+                        (
+                            "BlockedTool".to_string(),
+                            PathBuf::from("/fake/bin1/BlockedTool"),
+                        ),
+                    ],
+                ),
+                (
+                    dir2,
+                    vec![
+                        ("Git".to_string(), PathBuf::from("/fake/bin2/Git")),
+                        ("mytool".to_string(), PathBuf::from("/fake/bin2/mytool")),
+                        (
+                            "blockedtool".to_string(),
+                            PathBuf::from("/fake/bin2/blockedtool"),
+                        ),
+                        (
+                            "lowercase_only".to_string(),
+                            PathBuf::from("/fake/bin2/lowercase_only"),
+                        ),
+                    ],
+                ),
+            ]),
+            ps_metadata: None,
+            specs: Vec::new(),
+            user_config: UserConfig {
+                disabled_tools: vec!["blockedtool".to_string()],
+                ..UserConfig::default()
+            },
+            shell_rc: Vec::new(),
+        };
+
+        let catalog = load_catalog_with(ShellDialect::Posix, &fake);
+        let cli_names: Vec<&str> = catalog
+            .iter()
+            .filter(|e| e.kind == EntryKind::Cli)
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(cli_names, vec!["git", "MyTool", "lowercase_only"]);
     }
 }
