@@ -131,9 +131,12 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
     if ($null -eq $line) { $line = '' }
 
-    $tmp = [System.IO.Path]::GetTempFileName()
-    $ctxFile = [System.IO.Path]::GetTempFileName()
+    $tmp = $null
+    $ctxFile = $null
     try {
+        $tmp = [System.IO.Path]::GetTempFileName()
+        $ctxFile = [System.IO.Path]::GetTempFileName()
+
         $histPath = (Get-PSReadLineOption).HistorySavePath
         $recent = @()
         if ($histPath -and (Test-Path -LiteralPath $histPath)) {
@@ -159,7 +162,7 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
         } else {
             zpane --context-file "$ctxFile" --out-file "$tmp"
         }
-        if (Test-Path -LiteralPath $tmp) {
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $tmp)) {
             $accepted = [System.IO.File]::ReadAllText($tmp, [System.Text.UTF8Encoding]::new($false))
             if ($accepted) {
                 $accepted = $accepted.Trim()
@@ -169,7 +172,8 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
             }
         }
     } finally {
-        Remove-Item -LiteralPath $tmp, $ctxFile -Force -ErrorAction SilentlyContinue
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if ($ctxFile) { Remove-Item -LiteralPath $ctxFile -Force -ErrorAction SilentlyContinue }
     }
 }
 ```
@@ -178,14 +182,15 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
 
 ```zsh
 _zpane_widget() {
+    setopt localoptions localtraps
     local tmp
-    tmp="$(mktemp)" || return
-    zpane --initial "$BUFFER" --out-file "$tmp"
-    if [[ -s "$tmp" ]]; then
+    tmp="$(umask 077 && mktemp)" || return
+    trap 'rm -f -- "$tmp"' EXIT INT TERM
+    if zpane --initial "$BUFFER" --out-file "$tmp" && [[ -s "$tmp" ]]; then
         BUFFER="$(<"$tmp")"
         CURSOR=${#BUFFER}
     fi
-    rm -f "$tmp"
+    rm -f -- "$tmp"
     zle redisplay
 }
 zle -N _zpane_widget
@@ -197,13 +202,14 @@ bindkey '^[m' _zpane_widget
 ```bash
 _zpane_readline() {
     local tmp
-    tmp="$(mktemp)" || return
-    zpane --initial "$READLINE_LINE" --out-file "$tmp"
-    if [[ -s "$tmp" ]]; then
+    tmp="$(umask 077 && mktemp)" || return
+    trap 'rm -f -- "$tmp"' RETURN INT TERM
+    if zpane --initial "$READLINE_LINE" --out-file "$tmp" && [[ -s "$tmp" ]]; then
         READLINE_LINE="$(<"$tmp")"
         READLINE_POINT=${#READLINE_LINE}
     fi
-    rm -f "$tmp"
+    rm -f -- "$tmp"
+    trap - RETURN INT TERM
 }
 bind -x '"\em": _zpane_readline'
 ```
@@ -212,21 +218,27 @@ bind -x '"\em": _zpane_readline'
 
 ```fish
 function _zpane_fish
-    set -l tmp (mktemp); or return
+    set -l old_umask (umask)
+    umask 077
+    set -l tmp (mktemp)
+    set -l mk_status $status
+    umask $old_umask
+    test $mk_status -eq 0; or return
+
     set -l buf (commandline -b | string join \n)
     if test (count $buf) -gt 0
         zpane --initial "$buf" --out-file "$tmp"
     else
         zpane --initial "" --out-file "$tmp"
     end
-    if test -s "$tmp"
-        set -l accepted (string trim -- (cat "$tmp" | string join \n))
+    if test $status -eq 0 -a -s "$tmp"
+        set -l accepted (string trim -- (string collect < "$tmp"))
         if test -n "$accepted"
             commandline -r -- "$accepted"
             commandline -C (string length -- "$accepted")
         end
     end
-    rm -f "$tmp"
+    rm -f -- "$tmp"
     commandline -f repaint
 end
 bind \em _zpane_fish

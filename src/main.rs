@@ -16,8 +16,8 @@ use model::RuntimeContext;
 use session::{MillerSession, SessionOutcome};
 use std::env;
 use std::fs;
-use std::io;
-use std::path::PathBuf;
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Windows console output: writes UTF-16 frames straight to `CONOUT$` via `WriteConsoleW`,
@@ -221,9 +221,12 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
     if ($null -eq $line) { $line = '' }
 
-    $tmp = [System.IO.Path]::GetTempFileName()
-    $ctxFile = [System.IO.Path]::GetTempFileName()
+    $tmp = $null
+    $ctxFile = $null
     try {
+        $tmp = [System.IO.Path]::GetTempFileName()
+        $ctxFile = [System.IO.Path]::GetTempFileName()
+
         $histPath = (Get-PSReadLineOption).HistorySavePath
         $recent = @()
         if ($histPath -and (Test-Path -LiteralPath $histPath)) {
@@ -249,7 +252,7 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
         } else {
             zpane --context-file "$ctxFile" --out-file "$tmp"
         }
-        if (Test-Path -LiteralPath $tmp) {
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $tmp)) {
             $accepted = [System.IO.File]::ReadAllText($tmp, [System.Text.UTF8Encoding]::new($false))
             if ($accepted) {
                 $accepted = $accepted.Trim()
@@ -259,21 +262,23 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
             }
         }
     } finally {
-        Remove-Item -LiteralPath $tmp, $ctxFile -Force -ErrorAction SilentlyContinue
+        if ($tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        if ($ctxFile) { Remove-Item -LiteralPath $ctxFile -Force -ErrorAction SilentlyContinue }
     }
 }
 "#
         }
         ShellInitTarget::Zsh => {
             r#"_zpane_widget() {
+    setopt localoptions localtraps
     local tmp
-    tmp="$(mktemp)" || return
-    zpane --initial "$BUFFER" --out-file "$tmp"
-    if [[ -s "$tmp" ]]; then
+    tmp="$(umask 077 && mktemp)" || return
+    trap 'rm -f -- "$tmp"' EXIT INT TERM
+    if zpane --initial "$BUFFER" --out-file "$tmp" && [[ -s "$tmp" ]]; then
         BUFFER="$(<"$tmp")"
         CURSOR=${#BUFFER}
     fi
-    rm -f "$tmp"
+    rm -f -- "$tmp"
     zle redisplay
 }
 zle -N _zpane_widget
@@ -283,34 +288,41 @@ bindkey '^[m' _zpane_widget
         ShellInitTarget::Bash => {
             r#"_zpane_readline() {
     local tmp
-    tmp="$(mktemp)" || return
-    zpane --initial "$READLINE_LINE" --out-file "$tmp"
-    if [[ -s "$tmp" ]]; then
+    tmp="$(umask 077 && mktemp)" || return
+    trap 'rm -f -- "$tmp"' RETURN INT TERM
+    if zpane --initial "$READLINE_LINE" --out-file "$tmp" && [[ -s "$tmp" ]]; then
         READLINE_LINE="$(<"$tmp")"
         READLINE_POINT=${#READLINE_LINE}
     fi
-    rm -f "$tmp"
+    rm -f -- "$tmp"
+    trap - RETURN INT TERM
 }
 bind -x '"\em": _zpane_readline'
 "#
         }
         ShellInitTarget::Fish => {
             r#"function _zpane_fish
-    set -l tmp (mktemp); or return
+    set -l old_umask (umask)
+    umask 077
+    set -l tmp (mktemp)
+    set -l mk_status $status
+    umask $old_umask
+    test $mk_status -eq 0; or return
+
     set -l buf (commandline -b | string join \n)
     if test (count $buf) -gt 0
         zpane --initial "$buf" --out-file "$tmp"
     else
         zpane --initial "" --out-file "$tmp"
     end
-    if test -s "$tmp"
-        set -l accepted (string trim -- (cat "$tmp" | string join \n))
+    if test $status -eq 0 -a -s "$tmp"
+        set -l accepted (string trim -- (string collect < "$tmp"))
         if test -n "$accepted"
             commandline -r -- "$accepted"
             commandline -C (string length -- "$accepted")
         end
     end
-    rm -f "$tmp"
+    rm -f -- "$tmp"
     commandline -f repaint
 end
 bind \em _zpane_fish
@@ -351,10 +363,123 @@ fn parse_dimension(flag: &str, raw: &str, min: usize) -> anyhow::Result<usize> {
     Ok(val)
 }
 
+const MAX_CONTEXT_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 fn parse_context_json(raw: &str) -> anyhow::Result<RuntimeContext> {
+    if raw.len() as u64 > MAX_CONTEXT_FILE_BYTES {
+        anyhow::bail!(
+            "Runtime context JSON exceeds {} byte limit",
+            MAX_CONTEXT_FILE_BYTES
+        );
+    }
     let cleaned = raw.trim_start_matches('\u{feff}');
     serde_json::from_str::<RuntimeContext>(cleaned)
         .map_err(|e| anyhow::anyhow!("Invalid runtime context JSON: {e}"))
+}
+
+fn read_context_file_bounded(path: &str, max_bytes: u64) -> anyhow::Result<String> {
+    let meta = fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+    if !meta.is_file() {
+        anyhow::bail!("Failed to read context file '{path}': not a regular file");
+    }
+    if meta.len() > max_bytes {
+        anyhow::bail!("Failed to read context file '{path}': exceeds {max_bytes} byte limit");
+    }
+
+    let file = fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+    let open_meta = file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+    if !open_meta.is_file() {
+        anyhow::bail!("Failed to read context file '{path}': not a regular file");
+    }
+
+    let mut buf = Vec::with_capacity((open_meta.len() as usize).min(max_bytes as usize));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+    if buf.len() as u64 > max_bytes {
+        anyhow::bail!("Failed to read context file '{path}': exceeds {max_bytes} byte limit");
+    }
+    String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': invalid UTF-8 ({e})"))
+}
+
+fn ensure_regular_non_symlink_if_exists(path: &Path) -> anyhow::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "Refusing to access output file through symlink '{}'",
+                    path.display()
+                );
+            }
+            if !meta.file_type().is_file() {
+                anyhow::bail!("Output path '{}' is not a regular file", path.display());
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to inspect output file '{}': {e}",
+            path.display()
+        )),
+    }
+}
+
+fn verify_and_secure_out_file(file: &fs::File, path: &Path) -> anyhow::Result<()> {
+    if !file
+        .metadata()
+        .map_err(|e| anyhow::anyhow!("Failed to inspect output file '{}': {e}", path.display()))?
+        .is_file()
+    {
+        anyhow::bail!("Output path '{}' is not a regular file", path.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to secure output file '{}': {e}", path.display())
+            })?;
+    }
+    Ok(())
+}
+
+fn prepare_out_file(path: &Path) -> anyhow::Result<()> {
+    if !ensure_regular_non_symlink_if_exists(path)? {
+        return Ok(());
+    }
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to prepare output file '{}': {e}", path.display()))?;
+    verify_and_secure_out_file(&file, path)
+}
+
+fn write_out_file(path: &Path, content: &str) -> anyhow::Result<()> {
+    let exists = ensure_regular_non_symlink_if_exists(path)?;
+    let mut opts = fs::OpenOptions::new();
+    if exists {
+        opts.write(true).truncate(true);
+    } else {
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+    }
+    let mut file = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to write output file '{}': {e}", path.display()))?;
+    verify_and_secure_out_file(&file, path)?;
+    file.write_all(content.as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|e| anyhow::anyhow!("Failed to write output file '{}': {e}", path.display()))
 }
 
 fn merge_runtime_context(base: &mut RuntimeContext, incoming: RuntimeContext) {
@@ -563,8 +688,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                 merge_runtime_context(&mut runtime_context, parse_context_json(raw)?);
             }
             ContextArg::File(path) => {
-                let raw = fs::read_to_string(path)
-                    .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+                let raw = read_context_file_bounded(path, MAX_CONTEXT_FILE_BYTES)?;
                 merge_runtime_context(&mut runtime_context, parse_context_json(&raw)?);
             }
         }
@@ -628,7 +752,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if let Some(ref f) = opts.out_file {
-        let _ = fs::remove_file(f);
+        prepare_out_file(f)?;
     }
 
     let runtime_ctx = detect_runtime_context(opts.runtime_context);
@@ -698,9 +822,7 @@ fn main() -> anyhow::Result<()> {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
             if let Some(ref f) = opts.out_file {
-                fs::write(f, trimmed.as_bytes()).map_err(|e| {
-                    anyhow::anyhow!("Failed to write output file '{}': {e}", f.display())
-                })?;
+                write_out_file(f, trimmed)?;
             } else {
                 println!("{trimmed}");
             }
@@ -899,13 +1021,111 @@ mod tests {
         assert!(pwsh.contains("@(Get-Content -LiteralPath $histPath"));
         assert!(pwsh.contains("ReadAllText($tmp"));
         assert!(pwsh.contains("if (-not [string]::IsNullOrEmpty($line))"));
+        assert!(pwsh.contains("$LASTEXITCODE -eq 0"));
+        assert!(!pwsh.contains("Invoke-Expression"));
 
         let fish = render_shell_init(ShellInitTarget::Fish);
+        assert!(fish.contains("umask 077"));
+        assert!(fish.contains("umask $old_umask"));
         assert!(fish.contains("if test (count $buf) -gt 0"));
         assert!(fish.contains("zpane --initial \"\" --out-file"));
+        assert!(fish.contains("rm -f -- \"$tmp\""));
+        assert!(!fish.contains("eval "));
 
-        assert!(render_shell_init(ShellInitTarget::Zsh).contains("tmp=\"$(mktemp)\" || return"));
-        assert!(render_shell_init(ShellInitTarget::Bash).contains("tmp=\"$(mktemp)\" || return"));
+        let zsh = render_shell_init(ShellInitTarget::Zsh);
+        assert!(zsh.contains("tmp=\"$(umask 077 && mktemp)\" || return"));
+        assert!(zsh.contains("setopt localoptions localtraps"));
+        assert!(zsh.contains("trap 'rm -f -- \"$tmp\"' EXIT INT TERM"));
+        assert!(!zsh.contains("eval "));
+
+        let bash = render_shell_init(ShellInitTarget::Bash);
+        assert!(bash.contains("tmp=\"$(umask 077 && mktemp)\" || return"));
+        assert!(bash.contains("trap 'rm -f -- \"$tmp\"' RETURN INT TERM"));
+        assert!(!bash.contains("eval "));
+    }
+
+    #[test]
+    fn test_pentest_context_file_bounded_size_and_non_regular_rejection() {
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+
+        // 1. Oversized --context-file (> MAX_CONTEXT_FILE_BYTES) must fail before OOM JSON parsing
+        let big_path =
+            env::temp_dir().join(format!("zpane_ctx_big_{}_{uniq}.json", std::process::id()));
+        let oversized_len = (MAX_CONTEXT_FILE_BYTES as usize) + 1;
+        fs::write(&big_path, vec![b' '; oversized_len]).unwrap();
+        let err_big =
+            parse_cli_args(&s(&["--context-file", big_path.to_str().unwrap()])).unwrap_err();
+        let _ = fs::remove_file(&big_path);
+        assert!(err_big.to_string().contains("byte limit"));
+
+        // 2. Directory (non-regular file) must be rejected cleanly before File::open
+        let dir_path = env::temp_dir().join(format!("zpane_ctx_dir_{}_{uniq}", std::process::id()));
+        fs::create_dir_all(&dir_path).unwrap();
+        let err_dir =
+            parse_cli_args(&s(&["--context-file", dir_path.to_str().unwrap()])).unwrap_err();
+        let _ = fs::remove_dir_all(&dir_path);
+        assert!(err_dir.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn test_pentest_out_file_prepare_and_write_preserves_regular_and_blocks_non_regular() {
+        let uniq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let out_path =
+            env::temp_dir().join(format!("zpane_out_sec_{}_{uniq}.txt", std::process::id()));
+        fs::write(&out_path, b"stale secret").unwrap();
+
+        // Pre-existing regular file is truncated in-place (never unlinked/re-raced)
+        prepare_out_file(&out_path).unwrap();
+        assert_eq!(fs::read_to_string(&out_path).unwrap(), "");
+        write_out_file(&out_path, "git status").unwrap();
+        assert_eq!(fs::read_to_string(&out_path).unwrap(), "git status");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        let _ = fs::remove_file(&out_path);
+
+        // Fresh output path uses create_new securely and non-regular directory path is rejected
+        let fresh_path =
+            env::temp_dir().join(format!("zpane_out_fresh_{}_{uniq}.txt", std::process::id()));
+        prepare_out_file(&fresh_path).unwrap();
+        assert!(!fresh_path.exists());
+        write_out_file(&fresh_path, "cargo test").unwrap();
+        assert_eq!(fs::read_to_string(&fresh_path).unwrap(), "cargo test");
+        let _ = fs::remove_file(&fresh_path);
+
+        let dir_out = env::temp_dir().join(format!("zpane_out_dir_{}_{uniq}", std::process::id()));
+        fs::create_dir_all(&dir_out).unwrap();
+        let err_dir = write_out_file(&dir_out, "git status").unwrap_err();
+        let _ = fs::remove_dir_all(&dir_out);
+        assert!(err_dir.to_string().contains("not a regular file"));
+
+        #[cfg(unix)]
+        {
+            let target =
+                env::temp_dir().join(format!("zpane_sym_tgt_{}_{uniq}.txt", std::process::id()));
+            let link =
+                env::temp_dir().join(format!("zpane_sym_lnk_{}_{uniq}.txt", std::process::id()));
+            fs::write(&target, b"keep").unwrap();
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let err_prep = prepare_out_file(&link).unwrap_err();
+            let err_write = write_out_file(&link, "pwned").unwrap_err();
+            assert!(err_prep.to_string().contains("symlink"));
+            assert!(err_write.to_string().contains("symlink"));
+            assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+            let _ = fs::remove_file(&link);
+            let _ = fs::remove_file(&target);
+        }
     }
 
     #[test]
