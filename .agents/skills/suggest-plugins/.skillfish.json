@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "suggest-plugins",
+  "owner": "mattbobambrose",
+  "repo": "mattbobambrose-claude-skills",
+  "path": "plugins/project-tools/skills/suggest-plugins",
+  "branch": "master",
+  "sha": "f003a1df8f2c32adc5aa61fd65e1f923432f5c65",
+  "source": "manual"
+}

@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "suggest-tests",
+  "owner": "mattbobambrose",
+  "repo": "mattbobambrose-claude-skills",
+  "path": "plugins/testing/skills/suggest-tests",
+  "branch": "master",
+  "sha": "a2f393f9318dc7c036c8e95ccdf8aab6c8b09efc",
+  "source": "manual"
+}

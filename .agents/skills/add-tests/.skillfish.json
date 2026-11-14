@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "name": "add-tests",
+  "owner": "mattbobambrose",
+  "repo": "mattbobambrose-claude-skills",
+  "path": "plugins/testing/skills/add-tests",
+  "branch": "master",
+  "sha": "3917777f81501585bbe78614d00b83231043909f",
+  "source": "manual"
+}
