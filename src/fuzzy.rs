@@ -59,12 +59,14 @@ impl PaneList {
     pub fn push_filter_char(&mut self, ch: char) {
         self.filter.push(ch);
         self.sel_idx = 0;
+        self.scroll_idx = 0;
         self.recompute_filtered();
     }
 
     pub fn pop_filter_char(&mut self) -> bool {
         if self.filter.pop().is_some() {
             self.sel_idx = 0;
+            self.scroll_idx = 0;
             self.recompute_filtered();
             true
         } else {
@@ -76,6 +78,7 @@ impl PaneList {
         if !self.filter.is_empty() {
             self.filter.clear();
             self.sel_idx = 0;
+            self.scroll_idx = 0;
             self.recompute_filtered();
             true
         } else {
@@ -91,6 +94,9 @@ impl PaneList {
     fn clamp_sel(&mut self) {
         if self.sel_idx >= self.filtered.len() {
             self.sel_idx = self.filtered.len().saturating_sub(1);
+        }
+        if self.scroll_idx > self.sel_idx {
+            self.scroll_idx = self.sel_idx;
         }
     }
 
@@ -180,7 +186,7 @@ impl PaneList {
         if len == 0 || page_rows == 0 {
             return false;
         }
-        self.sel_idx = (self.sel_idx + page_rows).min(len - 1);
+        self.sel_idx = self.sel_idx.saturating_add(page_rows).min(len - 1);
         true
     }
 
@@ -201,8 +207,12 @@ impl PaneList {
         if self.sel_idx < self.scroll_idx {
             self.scroll_idx = self.sel_idx;
         }
-        if self.sel_idx >= self.scroll_idx + max_rows {
+        if self.sel_idx >= self.scroll_idx.saturating_add(max_rows) {
             self.scroll_idx = self.sel_idx + 1 - max_rows;
+        }
+        let max_scroll = self.filtered.len().saturating_sub(max_rows);
+        if self.scroll_idx > max_scroll {
+            self.scroll_idx = max_scroll;
         }
     }
 }
@@ -240,6 +250,7 @@ fn fuzzy_match_precomputed(
     desc: &str,
     q_chars: &[char],
     q_lower_str: &str,
+    q_is_ascii: bool,
 ) -> Option<(i32, Vec<usize>)> {
     let q_len = q_chars.len();
     if q_len == 0 {
@@ -268,8 +279,18 @@ fn fuzzy_match_precomputed(
         label_char_len = i + 1;
 
         if q_idx < q_len {
-            let lc = cur_orig.to_ascii_lowercase();
-            if lc == q_chars[q_idx] {
+            let q_ch = q_chars[q_idx];
+            let matched_char = if cur_orig.is_ascii() {
+                cur_orig.to_ascii_lowercase() == q_ch
+            } else if q_ch.is_ascii() {
+                false
+            } else {
+                cur_orig == q_ch || {
+                    let mut lc = cur_orig.to_lowercase();
+                    lc.next() == Some(q_ch) && lc.next().is_none()
+                }
+            };
+            if matched_char {
                 if let Some(ref mut vec) = pos_overflow {
                     vec.push(i);
                 } else {
@@ -301,7 +322,11 @@ fn fuzzy_match_precomputed(
                 if i > 0 {
                     if matches!(prev_orig, '-' | '_' | ':' | '.' | ' ' | '/' | '\\' | '$') {
                         score += 32;
-                    } else if prev_orig.is_ascii_lowercase() && cur_orig.is_ascii_uppercase() {
+                    } else if (prev_orig.is_ascii_lowercase() && cur_orig.is_ascii_uppercase())
+                        || (!prev_orig.is_ascii()
+                            && prev_orig.is_lowercase()
+                            && cur_orig.is_uppercase())
+                    {
                         score += 30;
                     }
                 }
@@ -315,7 +340,7 @@ fn fuzzy_match_precomputed(
 
     if q_idx == q_len {
         // Shorter labels that match completely get a slight tie-break bonus
-        score += (40_i32 - (label_char_len as i32)).max(0);
+        score += (40_i32.saturating_sub(label_char_len as i32)).max(0);
         let positions = match pos_overflow {
             Some(vec) => vec,
             None => pos_buf[..q_len].to_vec(),
@@ -323,8 +348,12 @@ fn fuzzy_match_precomputed(
         return Some((score, positions));
     }
 
-    // 2. Fallback: zero-allocation case-insensitive substring match in description
-    if contains_ignore_ascii_case(desc, q_lower_str.as_bytes()) {
+    // 2. Fallback: zero-allocation case-insensitive substring match in description (ASCII fast path)
+    if q_is_ascii {
+        if contains_ignore_ascii_case(desc, q_lower_str.as_bytes()) {
+            return Some((5, Vec::new()));
+        }
+    } else if desc.to_lowercase().contains(q_lower_str) {
         return Some((5, Vec::new()));
     }
 
@@ -343,14 +372,19 @@ fn filter_entries(entries: &[Entry], query: &str) -> Vec<FilteredEntry> {
             .collect();
     }
 
-    let q_lower = q.to_ascii_lowercase();
+    let q_is_ascii = q.is_ascii();
+    let q_lower = if q_is_ascii {
+        q.to_ascii_lowercase()
+    } else {
+        q.to_lowercase()
+    };
     let q_chars: Vec<char> = q_lower.chars().collect();
 
     let mut matched: Vec<FilteredEntry> = entries
         .iter()
         .enumerate()
         .filter_map(|(idx, entry)| {
-            fuzzy_match_precomputed(&entry.label, &entry.desc, &q_chars, &q_lower).map(
+            fuzzy_match_precomputed(&entry.label, &entry.desc, &q_chars, &q_lower, q_is_ascii).map(
                 |(score, match_positions)| FilteredEntry {
                     entry_idx: idx,
                     score,
@@ -455,5 +489,69 @@ mod tests {
         pane.set_entries(vec![Entry::new("only", "only", EntryKind::Cli, "")]);
         assert_eq!(pane.sel_idx(), 0);
         assert_eq!(pane.selected().unwrap().text, "only");
+    }
+
+    #[test]
+    fn test_pane_scroll_clamps_on_viewport_growth_and_large_page_bounds() {
+        let entries: Vec<Entry> = (0..10)
+            .map(|i| Entry::new(format!("cmd{i}"), format!("cmd{i}"), EntryKind::Cli, ""))
+            .collect();
+        let mut pane = PaneList::new(entries);
+
+        pane.move_end();
+        pane.clamp_scroll(4);
+        assert_eq!(pane.scroll_idx(), 6);
+
+        // Viewport grows taller: scroll_idx pulls back so all 8 visible rows fill cleanly
+        pane.clamp_scroll(8);
+        assert_eq!(pane.scroll_idx(), 2);
+
+        // Viewport grows larger than entry count: scroll_idx resets to 0
+        pane.clamp_scroll(12);
+        assert_eq!(pane.scroll_idx(), 0);
+
+        // Huge page_rows / max_rows must not overflow
+        pane.move_home();
+        assert!(pane.page_down(usize::MAX));
+        assert_eq!(pane.sel_idx(), 9);
+        pane.clamp_scroll(usize::MAX);
+        assert_eq!(pane.scroll_idx(), 0);
+
+        // Shrinking entries clamps scroll_idx eagerly
+        pane.set_entries(
+            (0..6)
+                .map(|i| Entry::new(format!("x{i}"), format!("x{i}"), EntryKind::Cli, ""))
+                .collect(),
+        );
+        pane.set_sel_idx(5);
+        pane.clamp_scroll(4);
+        assert_eq!(pane.scroll_idx(), 2);
+        pane.push_filter_char('x');
+        assert_eq!(pane.scroll_idx(), 0);
+        assert_eq!(pane.sel_idx(), 0);
+    }
+
+    #[test]
+    fn test_unicode_case_insensitive_pane_filtering() {
+        let entries = vec![
+            Entry::new("café", "Café", EntryKind::Arg, "Bistro menu"),
+            Entry::new("über", "Über", EntryKind::Arg, "Übersicht helper"),
+            Entry::new("plain", "plain", EntryKind::Cli, "Plain ASCII"),
+        ];
+        let mut pane = PaneList::new(entries);
+
+        for ch in "CAFÉ".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        assert_eq!(pane.selected().unwrap().text, "café");
+        assert_eq!(pane.row_at(0).unwrap().1, &[0, 1, 2, 3]);
+
+        assert!(pane.clear_filter());
+        for ch in "übersicht".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        assert_eq!(pane.selected().unwrap().text, "über");
     }
 }

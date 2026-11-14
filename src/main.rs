@@ -82,15 +82,23 @@ mod conout {
         pub fn write_raw(&mut self, s: &str) {
             self.utf16_buf.clear();
             self.utf16_buf.extend(s.encode_utf16());
-            let mut written: u32 = 0;
-            unsafe {
-                WriteConsoleW(
-                    self.handle(),
-                    self.utf16_buf.as_ptr(),
-                    self.utf16_buf.len() as u32,
-                    &mut written,
-                    std::ptr::null_mut(),
-                );
+            let mut offset = 0usize;
+            while offset < self.utf16_buf.len() {
+                let chunk_len = (self.utf16_buf.len() - offset).min(16384) as u32;
+                let mut written: u32 = 0;
+                let ok = unsafe {
+                    WriteConsoleW(
+                        self.handle(),
+                        self.utf16_buf[offset..].as_ptr(),
+                        chunk_len,
+                        &mut written,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || written == 0 {
+                    break;
+                }
+                offset += written as usize;
             }
         }
     }
@@ -158,7 +166,7 @@ impl Drop for TerminalGuard {
 const HELP_TEXT: &str = "\
 zpane - 3-pane Miller column command, parameter & variable explorer
 
-Usage: zpane [OPTIONS] [INITIAL_TOKENS]...
+Usage: zpane [OPTIONS] [--] [INITIAL_TOKENS]...
        zpane init <pwsh|zsh|bash|fish>
 
 Options:
@@ -211,36 +219,55 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
     $line = $null
     $cursor = $null
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+    if ($null -eq $line) { $line = '' }
 
     $tmp = [System.IO.Path]::GetTempFileName()
     $ctxFile = [System.IO.Path]::GetTempFileName()
     try {
         $histPath = (Get-PSReadLineOption).HistorySavePath
         $recent = @()
-        if ($histPath -and (Test-Path $histPath)) {
-            $recent = Get-Content -Path $histPath -Tail 15 -ErrorAction SilentlyContinue
-            [array]::Reverse($recent)
+        if ($histPath -and (Test-Path -LiteralPath $histPath)) {
+            $recent = @(Get-Content -LiteralPath $histPath -Tail 15 -Encoding UTF8 -ErrorAction SilentlyContinue)
+            if ($recent.Count -gt 1) {
+                [array]::Reverse($recent)
+            }
         }
         $ctxPayload = @{ history = @($recent) } | ConvertTo-Json -Compress
         [System.IO.File]::WriteAllText($ctxFile, $ctxPayload, [System.Text.UTF8Encoding]::new($false))
 
-        zpane --initial "$line" --context-file "$ctxFile" --out-file "$tmp"
-        if (Test-Path $tmp) {
-            $accepted = (Get-Content -Path $tmp -Raw -ErrorAction SilentlyContinue)
+        if (-not [string]::IsNullOrEmpty($line)) {
+            $legacyNativeArgs = ($PSVersionTable.PSVersion.Major -lt 7) -or
+                ($PSVersionTable.PSVersion.Major -eq 7 -and $PSVersionTable.PSVersion.Minor -lt 3) -or
+                ((Get-Variable -Name PSNativeCommandArgumentPassing -ValueOnly -ErrorAction SilentlyContinue) -eq 'Legacy')
+            $initVal = if ($legacyNativeArgs) {
+                $escaped = $line -replace '(\\*)"', '$1$1\"'
+                if ($escaped -match '\s') { $escaped -replace '(\\+)$', '$1$1' } else { $escaped }
+            } else {
+                $line
+            }
+            zpane --initial "$initVal" --context-file "$ctxFile" --out-file "$tmp"
+        } else {
+            zpane --context-file "$ctxFile" --out-file "$tmp"
+        }
+        if (Test-Path -LiteralPath $tmp) {
+            $accepted = [System.IO.File]::ReadAllText($tmp, [System.Text.UTF8Encoding]::new($false))
             if ($accepted) {
                 $accepted = $accepted.Trim()
-                [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $accepted)
+                if ($accepted) {
+                    [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $accepted)
+                }
             }
         }
     } finally {
-        Remove-Item -Path $tmp, $ctxFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tmp, $ctxFile -Force -ErrorAction SilentlyContinue
     }
 }
 "#
         }
         ShellInitTarget::Zsh => {
             r#"_zpane_widget() {
-    local tmp="$(mktemp)"
+    local tmp
+    tmp="$(mktemp)" || return
     zpane --initial "$BUFFER" --out-file "$tmp"
     if [[ -s "$tmp" ]]; then
         BUFFER="$(<"$tmp")"
@@ -256,7 +283,7 @@ bindkey '^[m' _zpane_widget
         ShellInitTarget::Bash => {
             r#"_zpane_readline() {
     local tmp
-    tmp="$(mktemp)"
+    tmp="$(mktemp)" || return
     zpane --initial "$READLINE_LINE" --out-file "$tmp"
     if [[ -s "$tmp" ]]; then
         READLINE_LINE="$(<"$tmp")"
@@ -269,11 +296,19 @@ bind -x '"\em": _zpane_readline'
         }
         ShellInitTarget::Fish => {
             r#"function _zpane_fish
-    set -l tmp (mktemp)
-    zpane --initial (commandline -b) --out-file "$tmp"
+    set -l tmp (mktemp); or return
+    set -l buf (commandline -b | string join \n)
+    if test (count $buf) -gt 0
+        zpane --initial "$buf" --out-file "$tmp"
+    else
+        zpane --initial "" --out-file "$tmp"
+    end
     if test -s "$tmp"
-        commandline -r (string trim (cat "$tmp"))
-        commandline -C (string length (commandline -b))
+        set -l accepted (string trim -- (cat "$tmp" | string join \n))
+        if test -n "$accepted"
+            commandline -r -- "$accepted"
+            commandline -C (string length -- "$accepted")
+        end
     end
     rm -f "$tmp"
     commandline -f repaint
@@ -310,6 +345,9 @@ fn parse_dimension(flag: &str, raw: &str, min: usize) -> anyhow::Result<usize> {
     if val < min {
         anyhow::bail!("{flag} must be at least {min}, got {val}");
     }
+    if val > u16::MAX as usize {
+        anyhow::bail!("{flag} must be at most {}, got {val}", u16::MAX);
+    }
     Ok(val)
 }
 
@@ -334,93 +372,207 @@ fn merge_runtime_context(base: &mut RuntimeContext, incoming: RuntimeContext) {
     }
 }
 
+enum ContextArg<'a> {
+    Inline(&'a str),
+    File(&'a str),
+}
+
+fn take_flag_value<'a>(
+    flag: &str,
+    inline_val: Option<&'a str>,
+    args: &'a [String],
+    idx: &mut usize,
+) -> anyhow::Result<&'a str> {
+    if let Some(v) = inline_val {
+        *idx += 1;
+        Ok(v)
+    } else {
+        let Some(v) = args.get(*idx + 1) else {
+            anyhow::bail!("Missing value for option {flag}");
+        };
+        *idx += 2;
+        Ok(v.as_str())
+    }
+}
+
+fn ensure_no_inline_value(flag: &str, inline_val: Option<&str>) -> anyhow::Result<()> {
+    if inline_val.is_some() {
+        anyhow::bail!("Option {flag} does not take a value");
+    }
+    Ok(())
+}
+
 fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        return Ok(CliCommand::Version);
-    }
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        return Ok(CliCommand::Help);
-    }
-    if args.iter().any(|a| a == "--clear-cache") {
-        return Ok(CliCommand::ClearCache);
-    }
     if args.first().map(String::as_str) == Some("init") {
         let Some(target) = args.get(1) else {
             anyhow::bail!("Missing shell target for `init` (expected: pwsh, zsh, bash, fish)");
         };
-        return Ok(CliCommand::Init(ShellInitTarget::parse(target)?));
-    }
-    if let Some(pos) = args.iter().position(|a| a == "--init") {
-        let Some(target) = args.get(pos + 1) else {
-            anyhow::bail!("Missing value for option --init");
-        };
-        return Ok(CliCommand::Init(ShellInitTarget::parse(target)?));
-    }
-    if args.iter().any(|a| a == "--sync-ps" || a == "--warm") {
-        let warm = args.iter().any(|a| a == "--warm");
-        return Ok(CliCommand::SyncPs { warm });
+        if target == "-h" || target == "--help" {
+            return Ok(CliCommand::Help);
+        }
+        let parsed = ShellInitTarget::parse(target)?;
+        if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
+            return Ok(CliCommand::Help);
+        }
+        if let Some(extra) = args.get(2) {
+            anyhow::bail!("Unexpected argument '{extra}' for `init`");
+        }
+        return Ok(CliCommand::Init(parsed));
     }
 
     let mut initial_buffer = String::new();
     let mut out_file: Option<PathBuf> = None;
     let mut fallback_width: usize = 120;
     let mut fallback_height: usize = 30;
-    let mut runtime_context = RuntimeContext::default();
+    let mut context_args: Vec<ContextArg<'_>> = Vec::new();
+    let mut git_branch_override: Option<String> = None;
+    let mut history_overrides: Vec<String> = Vec::new();
+    let mut mode_cmd: Option<CliCommand> = None;
 
+    let mut saw_double_dash = false;
+    let mut has_positional = false;
     let mut i = 0;
+
     while i < args.len() {
-        let flag = args[i].as_str();
-        match flag {
-            "--initial" | "--out-file" | "--width" | "--height" | "--context"
-            | "--context-file" | "--git-branch" | "--history" => {
-                let Some(val) = args.get(i + 1) else {
-                    anyhow::bail!("Missing value for option {flag}");
-                };
-                match flag {
-                    "--initial" => initial_buffer = val.clone(),
-                    "--out-file" => out_file = Some(PathBuf::from(val)),
-                    "--width" => {
-                        fallback_width = parse_dimension(flag, val, ui::Viewport::MIN_WIDTH)?;
-                    }
-                    "--height" => {
-                        fallback_height = parse_dimension(flag, val, ui::Viewport::MIN_HEIGHT)?;
-                    }
-                    "--context" => {
-                        let parsed = parse_context_json(val)?;
-                        merge_runtime_context(&mut runtime_context, parsed);
-                    }
-                    "--context-file" => {
-                        let raw = fs::read_to_string(val).map_err(|e| {
-                            anyhow::anyhow!("Failed to read context file '{val}': {e}")
-                        })?;
-                        let parsed = parse_context_json(&raw)?;
-                        merge_runtime_context(&mut runtime_context, parsed);
-                    }
-                    "--git-branch" => {
-                        let trimmed = val.trim();
-                        if !trimmed.is_empty() {
-                            runtime_context.git_branch = Some(trimmed.to_string());
-                        }
-                    }
-                    "--history" => {
-                        let trimmed = val.trim();
-                        if !trimmed.is_empty() {
-                            runtime_context.history.push(trimmed.to_string());
-                        }
-                    }
-                    _ => unreachable!(),
-                }
-                i += 2;
+        let arg = args[i].as_str();
+        if !saw_double_dash && !has_positional && arg == "--" {
+            saw_double_dash = true;
+            i += 1;
+            continue;
+        }
+
+        if saw_double_dash || has_positional || !arg.starts_with('-') || arg == "-" {
+            if mode_cmd.is_some() {
+                anyhow::bail!(
+                    "Unexpected positional argument '{arg}' with standalone command flag"
+                );
             }
-            other => {
-                if !initial_buffer.is_empty() {
-                    initial_buffer.push(' ');
+            has_positional = true;
+            if !initial_buffer.is_empty() {
+                initial_buffer.push(' ');
+            }
+            initial_buffer.push_str(arg);
+            i += 1;
+            continue;
+        }
+
+        let (flag, inline_val) = if arg.starts_with("--") {
+            match arg.split_once('=') {
+                Some((f, v)) => (f, Some(v)),
+                None => (arg, None),
+            }
+        } else {
+            (arg, None)
+        };
+
+        match flag {
+            "-V" | "--version" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                return Ok(CliCommand::Version);
+            }
+            "-h" | "--help" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                return Ok(CliCommand::Help);
+            }
+            "--clear-cache" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                if mode_cmd.is_some() {
+                    anyhow::bail!("Conflicting command mode option {flag}");
                 }
-                initial_buffer.push_str(other);
+                mode_cmd = Some(CliCommand::ClearCache);
                 i += 1;
+            }
+            "--init" => {
+                if mode_cmd.is_some() {
+                    anyhow::bail!("Conflicting command mode option {flag}");
+                }
+                let target = take_flag_value(flag, inline_val, args, &mut i)?;
+                mode_cmd = Some(CliCommand::Init(ShellInitTarget::parse(target)?));
+            }
+            "--sync-ps" | "--warm" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                let warm = flag == "--warm";
+                match mode_cmd {
+                    None => mode_cmd = Some(CliCommand::SyncPs { warm }),
+                    Some(CliCommand::SyncPs { warm: prev_warm }) => {
+                        mode_cmd = Some(CliCommand::SyncPs {
+                            warm: prev_warm || warm,
+                        });
+                    }
+                    Some(_) => anyhow::bail!("Conflicting command mode option {flag}"),
+                }
+                i += 1;
+            }
+            "--initial" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                initial_buffer = val.to_string();
+            }
+            "--out-file" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                if val.trim().is_empty() {
+                    anyhow::bail!("Option --out-file path must not be empty");
+                }
+                out_file = Some(PathBuf::from(val));
+            }
+            "--width" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                fallback_width = parse_dimension(flag, val, ui::Viewport::MIN_WIDTH)?;
+            }
+            "--height" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                fallback_height = parse_dimension(flag, val, ui::Viewport::MIN_HEIGHT)?;
+            }
+            "--context" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                context_args.push(ContextArg::Inline(val));
+            }
+            "--context-file" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                context_args.push(ContextArg::File(val));
+            }
+            "--git-branch" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    git_branch_override = Some(trimmed.to_string());
+                }
+            }
+            "--history" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                let trimmed = val.trim();
+                if !trimmed.is_empty() {
+                    history_overrides.push(trimmed.to_string());
+                }
+            }
+            _ => {
+                anyhow::bail!(
+                    "Unknown option '{arg}' (use '--' before positional tokens starting with '-')"
+                );
             }
         }
     }
+
+    if let Some(cmd) = mode_cmd {
+        return Ok(cmd);
+    }
+
+    let mut runtime_context = RuntimeContext::default();
+    for src in context_args {
+        match src {
+            ContextArg::Inline(raw) => {
+                merge_runtime_context(&mut runtime_context, parse_context_json(raw)?);
+            }
+            ContextArg::File(path) => {
+                let raw = fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+                merge_runtime_context(&mut runtime_context, parse_context_json(&raw)?);
+            }
+        }
+    }
+    if let Some(branch) = git_branch_override {
+        runtime_context.git_branch = Some(branch);
+    }
+    runtime_context.history.extend(history_overrides);
 
     Ok(CliCommand::Interactive(CliOptions {
         initial_buffer,
@@ -483,7 +635,10 @@ fn main() -> anyhow::Result<()> {
     let pane1_entries = load_catalog(dialect, &runtime_ctx);
     let introspector = CliIntrospector::new(dialect, &runtime_ctx);
 
-    let (tw, th) = size().unwrap_or((opts.fallback_width as u16, opts.fallback_height as u16));
+    let (tw, th) = size().unwrap_or((
+        opts.fallback_width.min(u16::MAX as usize) as u16,
+        opts.fallback_height.min(u16::MAX as usize) as u16,
+    ));
     let viewport =
         ui::Viewport::from_terminal_size(tw, th, opts.fallback_width, opts.fallback_height);
 
@@ -543,7 +698,9 @@ fn main() -> anyhow::Result<()> {
         let trimmed = cmd.trim();
         if !trimmed.is_empty() {
             if let Some(ref f) = opts.out_file {
-                let _ = fs::write(f, trimmed.as_bytes());
+                fs::write(f, trimmed.as_bytes()).map_err(|e| {
+                    anyhow::anyhow!("Failed to write output file '{}': {e}", f.display())
+                })?;
             } else {
                 println!("{trimmed}");
             }
@@ -725,6 +882,101 @@ mod tests {
 
         let err_unknown = parse_cli_args(&s(&["init", "nushell"])).unwrap_err();
         assert!(err_unknown.to_string().contains("Unknown shell target"));
+
+        let err_extra = parse_cli_args(&s(&["init", "pwsh", "extra"])).unwrap_err();
+        assert!(err_extra.to_string().contains("Unexpected argument"));
+
+        assert_eq!(
+            parse_cli_args(&s(&["init", "--help"])).unwrap(),
+            CliCommand::Help
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--init=fish"])).unwrap(),
+            CliCommand::Init(ShellInitTarget::Fish)
+        );
+
+        let pwsh = render_shell_init(ShellInitTarget::Pwsh);
+        assert!(pwsh.contains("@(Get-Content -LiteralPath $histPath"));
+        assert!(pwsh.contains("ReadAllText($tmp"));
+        assert!(pwsh.contains("if (-not [string]::IsNullOrEmpty($line))"));
+
+        let fish = render_shell_init(ShellInitTarget::Fish);
+        assert!(fish.contains("if test (count $buf) -gt 0"));
+        assert!(fish.contains("zpane --initial \"\" --out-file"));
+
+        assert!(render_shell_init(ShellInitTarget::Zsh).contains("tmp=\"$(mktemp)\" || return"));
+        assert!(render_shell_init(ShellInitTarget::Bash).contains("tmp=\"$(mktemp)\" || return"));
+    }
+
+    #[test]
+    fn test_parse_cli_args_flag_values_double_dash_and_error_cases() {
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+
+        // Values matching mode flags must not hijack the CLI command
+        assert_eq!(
+            parse_cli_args(&s(&["--initial", "--help", "--history", "--warm"])).unwrap(),
+            CliCommand::Interactive(CliOptions {
+                initial_buffer: "--help".to_string(),
+                out_file: None,
+                fallback_width: 120,
+                fallback_height: 30,
+                runtime_context: RuntimeContext {
+                    history: vec!["--warm".to_string()],
+                    ..RuntimeContext::default()
+                },
+            })
+        );
+
+        // `--flag=value` syntax and `--` end-of-options separator
+        assert_eq!(
+            parse_cli_args(&s(&[
+                "--width=80",
+                "--height=24",
+                "--out-file=/tmp/zpane_out",
+                "--",
+                "-Id",
+                "--help",
+            ]))
+            .unwrap(),
+            CliCommand::Interactive(CliOptions {
+                initial_buffer: "-Id --help".to_string(),
+                out_file: Some(PathBuf::from("/tmp/zpane_out")),
+                fallback_width: 80,
+                fallback_height: 24,
+                runtime_context: RuntimeContext::default(),
+            })
+        );
+
+        // Flags following a positional command token remain part of INITIAL_TOKENS
+        assert_eq!(
+            parse_cli_args(&s(&["git", "commit", "--amend", "--help"])).unwrap(),
+            CliCommand::Interactive(CliOptions {
+                initial_buffer: "git commit --amend --help".to_string(),
+                out_file: None,
+                fallback_width: 120,
+                fallback_height: 30,
+                runtime_context: RuntimeContext::default(),
+            })
+        );
+
+        let err_unknown = parse_cli_args(&s(&["--widht", "80"])).unwrap_err();
+        assert!(err_unknown.to_string().contains("Unknown option"));
+
+        let err_max = parse_cli_args(&s(&["--width", "70000"])).unwrap_err();
+        assert!(err_max.to_string().contains("at most 65535"));
+
+        let err_empty_out = parse_cli_args(&s(&["--out-file="])).unwrap_err();
+        assert!(err_empty_out.to_string().contains("must not be empty"));
+
+        let err_inline_bool = parse_cli_args(&s(&["--help=1"])).unwrap_err();
+        assert!(err_inline_bool
+            .to_string()
+            .contains("does not take a value"));
+
+        let err_conflict = parse_cli_args(&s(&["--clear-cache", "--warm"])).unwrap_err();
+        assert!(err_conflict
+            .to_string()
+            .contains("Conflicting command mode"));
     }
 
     #[test]

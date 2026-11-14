@@ -2,7 +2,7 @@ use crate::discovery::ShellDialect;
 use crate::fuzzy::PaneList;
 use crate::model::{Entry, EntryKind, Pane};
 use std::fmt::Write as FmtWrite;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const C_BORDER_DIM: &str = "\x1b[38;5;240m";
 const C_HEADER_ACT: &str = "\x1b[38;5;75;1m";
@@ -91,30 +91,53 @@ impl Viewport {
 }
 
 #[inline]
-fn sanitize_char(c: char) -> char {
+fn sanitize_char(c: char) -> Option<char> {
     if matches!(c, '\r' | '\n' | '\t') {
-        ' '
+        Some(' ')
+    } else if c.is_control() {
+        None
     } else {
-        c
+        Some(c)
     }
 }
 
-/// Appends plain text truncated to at most `max_width` display columns, returning the written width.
-fn push_truncated_text(out: &mut String, text: &str, max_width: usize) -> usize {
+fn display_width_sanitized(s: &str) -> usize {
+    s.chars()
+        .filter_map(sanitize_char)
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
+}
+
+/// Appends sanitized text truncated to at most `max_width` display columns, optionally
+/// highlighting `match_positions` on top of `base_style`, and returns the written width.
+fn push_sanitized_truncated(
+    out: &mut String,
+    text: &str,
+    max_width: usize,
+    match_positions: &[usize],
+    base_style: Option<&str>,
+) -> usize {
     if max_width == 0 {
         return 0;
     }
     let mut cur_w = 0usize;
-    let mut last_w = 0usize;
+    let mut last_non_zero_start = out.len();
+    let mut last_non_zero_base_w = 0usize;
+    let mut match_cursor = 0usize;
 
-    for raw_ch in text.chars() {
-        let ch = sanitize_char(raw_ch);
+    for (idx, raw_ch) in text.chars().enumerate() {
+        let Some(ch) = sanitize_char(raw_ch) else {
+            continue;
+        };
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w == 0 && cur_w == 0 {
+            continue;
+        }
         if cur_w + w > max_width {
             if max_width > 1 {
                 if cur_w == max_width {
-                    out.pop();
-                    cur_w = cur_w.saturating_sub(last_w);
+                    out.truncate(last_non_zero_start);
+                    cur_w = last_non_zero_base_w;
                 }
                 if cur_w < max_width {
                     out.push('…');
@@ -123,18 +146,82 @@ fn push_truncated_text(out: &mut String, text: &str, max_width: usize) -> usize 
             }
             break;
         }
-        out.push(ch);
+        if w > 0 {
+            last_non_zero_start = out.len();
+            last_non_zero_base_w = cur_w;
+        }
+        if let Some(base) = base_style {
+            while match_cursor < match_positions.len() && match_positions[match_cursor] < idx {
+                match_cursor += 1;
+            }
+            if match_cursor < match_positions.len() && match_positions[match_cursor] == idx {
+                out.push_str(C_MATCH_HL);
+                out.push(ch);
+                out.push_str(base);
+                match_cursor += 1;
+            } else {
+                out.push(ch);
+            }
+        } else {
+            out.push(ch);
+        }
         cur_w += w;
-        last_w = w;
     }
 
     cur_w
+}
+
+/// Appends plain text truncated to at most `max_width` display columns, returning the written width.
+fn push_truncated_text(out: &mut String, text: &str, max_width: usize) -> usize {
+    push_sanitized_truncated(out, text, max_width, &[], None)
 }
 
 /// Appends plain text truncated or space-padded to exact terminal display columns (`max_width`).
 fn push_padded_text(out: &mut String, text: &str, max_width: usize) {
     let cur_w = push_truncated_text(out, text, max_width);
     for _ in cur_w..max_width {
+        out.push(' ');
+    }
+}
+
+/// Appends `prefix` + `body` padded to `max_width`, tail-scrolling `body` with a leading `'…'`
+/// when it overflows so the active tail remains visible.
+fn push_tail_truncated_padded(out: &mut String, prefix: &str, body: &str, max_width: usize) {
+    let prefix_w = display_width_sanitized(prefix);
+    let clean_body: String = body.chars().filter_map(sanitize_char).collect();
+    let body_w = display_width_sanitized(&clean_body);
+
+    if prefix_w + body_w <= max_width || max_width <= prefix_w + 1 {
+        let mut combined = String::with_capacity(prefix.len() + clean_body.len());
+        combined.push_str(prefix);
+        combined.push_str(&clean_body);
+        push_padded_text(out, &combined, max_width);
+        return;
+    }
+
+    let target_w = max_width - prefix_w - 1;
+    let mut w_so_far = 0usize;
+    let mut suffix_start = clean_body.len();
+    for (idx, ch) in clean_body.char_indices() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if w > 0 && body_w - w_so_far <= target_w {
+            suffix_start = idx;
+            break;
+        }
+        w_so_far += w;
+    }
+
+    let mut written = push_truncated_text(out, prefix, max_width);
+    if written < max_width {
+        out.push('…');
+        written += 1;
+    }
+    written += push_truncated_text(
+        out,
+        &clean_body[suffix_start..],
+        max_width.saturating_sub(written),
+    );
+    for _ in written..max_width {
         out.push(' ');
     }
 }
@@ -163,7 +250,7 @@ fn push_miller_cell(
         return;
     }
     let badge = entry.kind.badge();
-    let badge_w = badge.len();
+    let badge_w = UnicodeWidthStr::width(badge);
     let ptr = if is_selected { "❯ " } else { "  " };
     let ptr_w = if col_width >= 2 { 2 } else { 0 };
 
@@ -186,31 +273,13 @@ fn push_miller_cell(
     let show_badge = rem >= badge_w + 3;
     let avail_label_w = if show_badge { rem - badge_w - 1 } else { rem };
 
-    let mut match_cursor = 0usize;
-    let mut cur_w = 0usize;
-    for (idx, raw_ch) in entry.label.chars().enumerate() {
-        let ch = sanitize_char(raw_ch);
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if cur_w + w > avail_label_w {
-            if avail_label_w > 1 && cur_w < avail_label_w {
-                out.push('…');
-                cur_w += 1;
-            }
-            break;
-        }
-        while match_cursor < match_positions.len() && match_positions[match_cursor] < idx {
-            match_cursor += 1;
-        }
-        if match_cursor < match_positions.len() && match_positions[match_cursor] == idx {
-            out.push_str(C_MATCH_HL);
-            out.push(ch);
-            out.push_str(base_style);
-            match_cursor += 1;
-        } else {
-            out.push(ch);
-        }
-        cur_w += w;
-    }
+    let cur_w = push_sanitized_truncated(
+        out,
+        &entry.label,
+        avail_label_w,
+        match_positions,
+        Some(base_style),
+    );
 
     for _ in cur_w..avail_label_w {
         out.push(' ');
@@ -296,9 +365,13 @@ fn wrap_display_lines(text: &str, max_width: usize) -> Vec<String> {
         let mut cur = String::new();
         let mut cur_w = 0usize;
         for word in raw_line.split_whitespace() {
-            let word_w: usize = word
+            let clean_word: String = word.chars().filter_map(sanitize_char).collect();
+            if clean_word.is_empty() {
+                continue;
+            }
+            let word_w: usize = clean_word
                 .chars()
-                .map(|c| UnicodeWidthChar::width(sanitize_char(c)).unwrap_or(0))
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
                 .sum();
             let space_w = usize::from(!cur.is_empty());
             if cur_w + space_w + word_w <= max_width {
@@ -306,7 +379,7 @@ fn wrap_display_lines(text: &str, max_width: usize) -> Vec<String> {
                     cur.push(' ');
                     cur_w += 1;
                 }
-                cur.push_str(word);
+                cur.push_str(&clean_word);
                 cur_w += word_w;
             } else {
                 if !cur.is_empty() {
@@ -314,14 +387,20 @@ fn wrap_display_lines(text: &str, max_width: usize) -> Vec<String> {
                     cur_w = 0;
                 }
                 if word_w <= max_width {
-                    cur.push_str(word);
+                    cur.push_str(&clean_word);
                     cur_w = word_w;
                 } else {
-                    for ch in word.chars().map(sanitize_char) {
+                    for ch in clean_word.chars() {
                         let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if cw > max_width {
+                            continue;
+                        }
                         if cur_w + cw > max_width && !cur.is_empty() {
                             lines.push(std::mem::take(&mut cur));
                             cur_w = 0;
+                        }
+                        if cw == 0 && cur.is_empty() {
+                            continue;
                         }
                         cur.push(ch);
                         cur_w += cw;
@@ -331,58 +410,114 @@ fn wrap_display_lines(text: &str, max_width: usize) -> Vec<String> {
         }
         if !cur.is_empty() {
             lines.push(cur);
-        } else if lines.is_empty() {
+        } else {
             lines.push(String::new());
         }
     }
     lines
 }
 
+fn push_inspector_field(
+    rows: &mut Vec<(&'static str, String)>,
+    color: &'static str,
+    raw: &str,
+    w3: usize,
+    wrap_w: usize,
+) {
+    let single = format!(" {raw}");
+    if display_width_sanitized(&single) <= w3 {
+        rows.push((color, single));
+    } else {
+        for line in wrap_display_lines(raw, wrap_w) {
+            rows.push((color, format!(" {line}")));
+        }
+    }
+}
+
 fn build_expanded_inspector_rows(entry: Option<&Entry>, w3: usize) -> Vec<(&'static str, String)> {
     let mut rows = Vec::new();
     let Some(it) = entry else {
-        rows.push((C_HEADER_ACT, " ℹ No selection [F1 Close]".to_string()));
+        let msg = if w3 >= 26 {
+            " ℹ No selection [F1 Close]"
+        } else {
+            " ℹ No selection"
+        };
+        rows.push((C_HEADER_ACT, msg.to_string()));
         return rows;
     };
 
-    rows.push((
-        C_HEADER_ACT,
-        format!(" ℹ {} {} [F1 Close]", it.label, it.kind.badge()),
-    ));
-    let mut token_line = if it.text.is_empty() {
-        " Token: (placeholder)".to_string()
+    let full_hdr = format!(" ℹ {} {} [F1 Close]", it.label, it.kind.badge());
+    let hdr = if display_width_sanitized(&full_hdr) <= w3 {
+        full_hdr
     } else {
-        format!(" Token: {}", it.text)
+        format!(" ℹ {} {}", it.label, it.kind.badge())
     };
-    if !it.aliases.is_empty() {
-        token_line.push_str(&format!("  Aliases: {}", it.aliases.join(", ")));
-    }
-    rows.push((C_FILTER, token_line));
-
-    let sets_line = if !it.parameter_sets.is_empty() {
-        format!(" Sets : {}", it.parameter_sets.join(", "))
-    } else {
-        format!(" Kind : {}", it.kind.badge())
-    };
-    rows.push((C_DIM, sets_line));
-    rows.push((C_BORDER_DIM, "─".repeat(w3)));
+    rows.push((C_HEADER_ACT, hdr));
 
     let wrap_w = w3.saturating_sub(2).max(1);
+    let tok_val = if it.text.is_empty() {
+        "(placeholder)"
+    } else {
+        it.text.as_str()
+    };
+    if it.aliases.is_empty() {
+        push_inspector_field(
+            &mut rows,
+            C_FILTER,
+            &format!("Token: {tok_val}"),
+            w3,
+            wrap_w,
+        );
+    } else {
+        let aliases = it.aliases.join(", ");
+        let single = format!(" Token: {tok_val}  Aliases: {aliases}");
+        if display_width_sanitized(&single) <= w3 {
+            rows.push((C_FILTER, single));
+        } else {
+            push_inspector_field(
+                &mut rows,
+                C_FILTER,
+                &format!("Token: {tok_val}"),
+                w3,
+                wrap_w,
+            );
+            push_inspector_field(
+                &mut rows,
+                C_FILTER,
+                &format!("Aliases: {aliases}"),
+                w3,
+                wrap_w,
+            );
+        }
+    }
+
+    let sets_raw = if !it.parameter_sets.is_empty() {
+        format!("Sets : {}", it.parameter_sets.join(", "))
+    } else {
+        format!("Kind : {}", it.kind.badge())
+    };
+    push_inspector_field(&mut rows, C_DIM, &sets_raw, w3, wrap_w);
+    rows.push((C_BORDER_DIM, "─".repeat(w3)));
+
     for line in wrap_display_lines(&it.desc, wrap_w) {
         rows.push((C_TEXT, format!(" {line}")));
     }
 
     if !it.children.is_empty() {
-        let preview: Vec<&str> = it
+        let all_children: Vec<&str> = it
             .children
             .iter()
-            .filter(|c| !c.is_placeholder())
-            .take(8)
+            .filter(|c| !c.is_placeholder() && !c.text.is_empty())
             .map(|c| c.text.as_str())
             .collect();
-        if !preview.is_empty() {
+        if !all_children.is_empty() {
             rows.push((C_BORDER_DIM, "─".repeat(w3)));
-            for line in wrap_display_lines(&format!("Children: {}", preview.join(", ")), wrap_w) {
+            let shown = all_children.len().min(8);
+            let mut summary = format!("Children: {}", all_children[..shown].join(", "));
+            if all_children.len() > shown {
+                summary.push_str(&format!(", … (+{} more)", all_children.len() - shown));
+            }
+            for line in wrap_display_lines(&summary, wrap_w) {
                 rows.push((C_DIM, format!(" {line}")));
             }
         }
@@ -402,20 +537,16 @@ fn split_pane_widths(inner_w: usize) -> (usize, usize, usize) {
 }
 
 pub fn render_frame(st: &RenderState<'_>) -> String {
-    let win_w = st.viewport.width.max(Viewport::MIN_WIDTH);
+    let win_w = st.viewport.width.max(Viewport::MIN_WIDTH.saturating_sub(1));
     let list_rows = st.viewport.rows(Pane::First);
+    let inner_w = win_w.saturating_sub(4);
+    let (w1, w2, w3) = split_pane_widths(inner_w);
     let (info_title, info_desc) = inspector_header(st);
     let expanded_rows = if st.inspector_expanded {
-        build_expanded_inspector_rows(
-            selected_info_entry(st),
-            split_pane_widths(win_w.saturating_sub(4)).2,
-        )
+        build_expanded_inspector_rows(selected_info_entry(st), w3)
     } else {
         Vec::new()
     };
-
-    let inner_w = win_w.saturating_sub(4);
-    let (w1, w2, w3) = split_pane_widths(inner_w);
 
     let mut sb = String::with_capacity(32768);
     sb.push_str("\x1b[?2026h\x1b[H"); // Begin synchronized update + Cursor to home (0,0) for flicker-free overwrite
@@ -452,7 +583,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     push_pane_header(&mut sb, header_color(Pane::Third), &h3_txt, w3);
     sb.push('╮');
     sb.push_str(RST);
-    sb.push_str("\r\n");
+    sb.push_str("\x1b[K\r\n");
 
     for r in 0..list_rows {
         sb.push_str(C_BORDER_DIM);
@@ -511,13 +642,13 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         sb.push_str(C_BORDER_DIM);
         sb.push('│');
         sb.push_str(RST);
-        sb.push_str("\r\n");
+        sb.push_str("\x1b[K\r\n");
     }
 
     // Divider above status bars
-    let _ = writeln!(
+    let _ = write!(
         sb,
-        "{C_BORDER_DIM}├{}┴{}┴{}┤{RST}\r",
+        "{C_BORDER_DIM}├{}┴{}┴{}┤{RST}\x1b[K\r\n",
         "─".repeat(w1),
         "─".repeat(w2),
         "─".repeat(w3)
@@ -525,18 +656,38 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     let full_inner = win_w.saturating_sub(2);
 
-    let filter_line = format!(
-        " Filter (Pane {}): {}█   [P1: '{}' | P2: '{}' | P3: '{}']",
-        st.active_pane.index() + 1,
-        st.panes[st.active_pane.index()].filter(),
+    let active_filter = st.panes[st.active_pane.index()].filter();
+    let filter_prefix = format!(" Filter (Pane {}): ", st.active_pane.index() + 1);
+    let filter_active = format!("{active_filter}█");
+    let filter_summary = format!(
+        "   [P1: '{}' | P2: '{}' | P3: '{}']",
         st.panes[0].filter(),
         st.panes[1].filter(),
         st.panes[2].filter()
     );
-    push_status_row(&mut sb, C_FILTER, &filter_line, full_inner);
+    let filter_full = format!("{filter_prefix}{filter_active}{filter_summary}");
+    if display_width_sanitized(&filter_full) <= full_inner
+        || display_width_sanitized(&filter_prefix) + display_width_sanitized(&filter_active)
+            <= full_inner
+    {
+        push_status_row(&mut sb, C_FILTER, &filter_full, full_inner);
+    } else {
+        push_tail_status_row(
+            &mut sb,
+            C_FILTER,
+            &filter_prefix,
+            &filter_active,
+            full_inner,
+        );
+    }
 
-    let cmd_line = format!(" Command Line  : {}", st.command_line);
-    push_status_row(&mut sb, C_CMD_BAR, &cmd_line, full_inner);
+    push_tail_status_row(
+        &mut sb,
+        C_CMD_BAR,
+        " Command Line  : ",
+        &st.command_line,
+        full_inner,
+    );
 
     let reload_action = if st.dialect.is_powershell() {
         "Sync PS"
@@ -550,30 +701,45 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     let _ = write!(
         sb,
-        "{C_BORDER_DIM}╰{}╯{RST}\x1b[?2026l",
+        "{C_BORDER_DIM}╰{}╯{RST}\x1b[K\x1b[J\x1b[?2026l",
         "─".repeat(full_inner)
     );
 
     sb
 }
 
-fn push_status_row(out: &mut String, color: &str, text: &str, inner_width: usize) {
+fn push_framed_status_row(out: &mut String, color: &str, write_inner: impl FnOnce(&mut String)) {
     out.push_str(C_BORDER_DIM);
     out.push('│');
     out.push_str(RST);
     out.push_str(color);
-    push_padded_text(out, text, inner_width);
+    write_inner(out);
     out.push_str(RST);
     out.push_str(C_BORDER_DIM);
     out.push('│');
     out.push_str(RST);
-    out.push_str("\r\n");
+    out.push_str("\x1b[K\r\n");
+}
+
+fn push_status_row(out: &mut String, color: &str, text: &str, inner_width: usize) {
+    push_framed_status_row(out, color, |buf| push_padded_text(buf, text, inner_width));
+}
+
+fn push_tail_status_row(
+    out: &mut String,
+    color: &str,
+    prefix: &str,
+    body: &str,
+    inner_width: usize,
+) {
+    push_framed_status_row(out, color, |buf| {
+        push_tail_truncated_padded(buf, prefix, body, inner_width);
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unicode_width::UnicodeWidthStr;
 
     fn strip_ansi(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -852,5 +1018,115 @@ mod tests {
         assert!(plain.contains("Gets processes that are identified by"));
         assert!(plain.contains("one or more process IDs on the local"));
         assert!(plain.contains("host."));
+    }
+
+    #[test]
+    fn test_combining_marks_and_control_chars_sanitize_and_truncate_cleanly() {
+        let mut buf = String::new();
+        // 'ab' + combining acute + 'c' in width 2 must roll back the 'b\u{0301}' cluster to 'a…'
+        push_padded_text(&mut buf, "ab\u{0301}c", 2);
+        assert_eq!(UnicodeWidthStr::width(buf.as_str()), 2);
+        assert_eq!(buf, "a…");
+
+        buf.clear();
+        // Control chars such as ESC/BEL must be stripped so terminal escape injection cannot occur
+        push_padded_text(&mut buf, "\x1bfoo\x07bar", 8);
+        assert_eq!(buf, "foobar  ");
+        assert!(!buf.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_miller_cell_exact_overflow_emits_ellipsis_with_match_highlights() {
+        let mut pane = PaneList::new(vec![Entry::new(
+            "Get-Process",
+            "Get-Process",
+            EntryKind::Cmdlet,
+            "",
+        )]);
+        pane.push_filter_char('g');
+        pane.push_filter_char('p');
+
+        // Width 20 -> ptr(2) + label(9) + space(1) + [Cmdlet](8) = 20
+        let mut raw = String::new();
+        let (entry, matches) = pane.row_at(0).unwrap();
+        push_miller_cell(&mut raw, entry, matches, 20, true, true);
+        let plain = strip_ansi(&raw);
+        assert_eq!(UnicodeWidthStr::width(plain.as_str()), 20);
+        assert_eq!(plain, "❯ Get-Proc… [Cmdlet]");
+        assert!(raw.contains(C_MATCH_HL));
+        assert!(raw.ends_with(RST));
+
+        // Exact-width wide-char label truncation keeps valid ANSI reset and width
+        let wide_entry = Entry::new("中文abc", "中文abc", EntryKind::Arg, "");
+        raw.clear();
+        push_miller_cell(&mut raw, &wide_entry, &[1], 6, false, false);
+        let wide_plain = strip_ansi(&raw);
+        assert_eq!(UnicodeWidthStr::width(wide_plain.as_str()), 6);
+        assert_eq!(wide_plain, "  中… ");
+        assert!(raw.ends_with(RST));
+    }
+
+    #[test]
+    fn test_wrap_display_lines_preserves_blank_lines_and_handles_narrow_wide_chars() {
+        let wrapped = wrap_display_lines("First line.\n\nSecond line.", 20);
+        assert_eq!(wrapped, vec!["First line.", "", "Second line."]);
+
+        let narrow_wide = wrap_display_lines("中文a", 1);
+        assert_eq!(narrow_wide, vec!["a"]);
+    }
+
+    #[test]
+    fn test_narrow_expanded_inspector_wraps_metadata_and_tail_scrolls_status_bars() {
+        let mut param = Entry::new(
+            "-VeryLongParameterName",
+            "-VeryLongParameterName",
+            EntryKind::Param,
+            "First paragraph.\n\nSecond paragraph with detail.",
+        )
+        .with_aliases(vec!["VLP".to_string(), "AliasTwo".to_string()])
+        .with_parameter_sets(vec!["SetAlpha".to_string(), "SetBeta".to_string()]);
+        param.children = (0..10)
+            .map(|i| Entry::new(format!("val{i}"), format!("val{i}"), EntryKind::Value, ""))
+            .collect();
+
+        let pane1 = PaneList::new(vec![Entry::new("cmd", "cmd", EntryKind::Cli, "")]);
+        let mut pane2 = PaneList::new(vec![param]);
+        for ch in "very".chars() {
+            pane2.push_filter_char(ch);
+        }
+        let empty = PaneList::default();
+
+        // Actual 40x18 terminal clamps to Viewport(39, 17) and must render exact width 39
+        let vp = Viewport::from_terminal_size(40, 18, 120, 30);
+        assert_eq!(vp, Viewport::new(39, 17));
+
+        let raw = render_frame(&RenderState {
+            viewport: vp,
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "cmd -VeryLongParameterName value-at-the-very-end".to_string(),
+            active_param_set: None,
+            dialect: ShellDialect::Posix,
+            inspector_expanded: true,
+        });
+        assert!(raw.contains("\x1b[K\r\n"));
+        assert!(raw.contains("\x1b[K\x1b[J\x1b[?2026l"));
+
+        let plain = strip_ansi(&raw);
+        let lines: Vec<&str> = plain.lines().collect();
+        assert_eq!(lines.len(), 17);
+        for line in &lines {
+            assert_eq!(UnicodeWidthStr::width(*line), 39);
+        }
+
+        // Aliases & Parameter Sets wrap instead of silently disappearing on narrow Pane 3
+        assert!(plain.contains("Aliases:"));
+        assert!(plain.contains("VLP,"));
+        assert!(plain.contains("AliasTwo"));
+        assert!(plain.contains("Sets :"));
+        assert!(plain.contains("SetBeta"));
+        // Long Command Line and active Filter preserve their trailing active content
+        assert!(plain.contains("…") && plain.contains("very-end"));
+        assert!(plain.contains("very█"));
     }
 }
