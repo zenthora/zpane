@@ -1,5 +1,0 @@
-interface:
-  display_name: "Setup Rust Deep Modules"
-  short_description: "Enforce deep Rust module boundaries"
-policy:
-  allow_implicit_invocation: false
