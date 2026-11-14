@@ -1,4 +1,6 @@
+use crate::discovery::ShellDialect;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 const ALL_PARAMETER_SETS: &str = "__AllParameterSets";
@@ -102,55 +104,312 @@ pub struct RuntimeContext {
     pub history: Vec<String>,
 }
 
-fn format_path_token(raw: &str, is_dir: bool) -> (String, String) {
+#[inline]
+pub(crate) fn is_disallowed_control(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+#[inline]
+pub(crate) fn has_disallowed_control(s: &str) -> bool {
+    if s.is_ascii() {
+        s.bytes().any(|b| b < 0x20 || b == 0x7f)
+    } else {
+        s.chars().any(is_disallowed_control)
+    }
+}
+
+pub(crate) fn strip_disallowed_controls(s: &str) -> Cow<'_, str> {
+    if !has_disallowed_control(s) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.chars().filter(|&ch| !is_disallowed_control(ch)).collect())
+    }
+}
+
+#[inline]
+pub(crate) fn is_safe_unquoted_char(ch: char, allow_ps_backslash: bool) -> bool {
+    if ch.is_ascii() {
+        matches!(
+            ch,
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' | '/' | '+' | ':' | '='
+        ) || (allow_ps_backslash && ch == '\\')
+    } else {
+        !ch.is_whitespace()
+            && !is_disallowed_control(ch)
+            && !matches!(
+                ch,
+                '\u{00AB}'
+                    | '\u{00BB}'
+                    | '\u{2013}'..='\u{2015}'
+                    | '\u{2018}'..='\u{201F}'
+                    | '\u{2039}'
+                    | '\u{203A}'
+            )
+    }
+}
+
+#[inline]
+pub(crate) fn is_safe_unquoted_token(s: &str, dialect: Option<ShellDialect>) -> bool {
+    if s.is_empty() || s.starts_with('=') {
+        return false;
+    }
+    let allow_ps_backslash = dialect == Some(ShellDialect::PowerShell);
+    s.chars()
+        .all(|ch| is_safe_unquoted_char(ch, allow_ps_backslash))
+}
+
+#[inline]
+pub(crate) fn is_benign_double_quotable(s: &str, dialect: Option<ShellDialect>) -> bool {
+    let allow_ps_backslash = dialect == Some(ShellDialect::PowerShell);
+    s.chars().all(|ch| {
+        ch == '"'
+            || (ch.is_whitespace() && !is_disallowed_control(ch))
+            || is_safe_unquoted_char(ch, allow_ps_backslash)
+    })
+}
+
+pub(crate) fn quote_single_for_dialect(raw: &str, dialect: Option<ShellDialect>) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
+    out.push('\'');
+    match dialect {
+        Some(ShellDialect::PowerShell) => {
+            for ch in raw.chars() {
+                if ch == '\'' {
+                    out.push_str("''");
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+        Some(ShellDialect::Fish) => {
+            for ch in raw.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\'' => out.push_str("\\'"),
+                    _ => out.push(ch),
+                }
+            }
+        }
+        Some(ShellDialect::Posix) | None => {
+            for ch in raw.chars() {
+                if ch == '\'' {
+                    out.push_str("'\\''");
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out.push('\'');
+    out
+}
+
+pub(crate) fn quote_literal_for_dialect(
+    raw: &str,
+    dialect: Option<ShellDialect>,
+    allow_double_for_spaces_only: bool,
+) -> String {
+    if is_safe_unquoted_token(raw, dialect) {
+        return raw.to_string();
+    }
+    if allow_double_for_spaces_only
+        && !raw.contains('"')
+        && !raw.contains('\\')
+        && raw.chars().all(|ch| {
+            (ch.is_whitespace() && !is_disallowed_control(ch)) || is_safe_unquoted_char(ch, false)
+        })
+    {
+        return format!("\"{raw}\"");
+    }
+    quote_single_for_dialect(raw, dialect)
+}
+
+#[inline]
+fn is_ascii_ident(s: &str) -> bool {
+    let mut bytes = s.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Validates and normalizes a shell variable token (`$env:X`, `$X`, `${env:X}`, special vars)
+/// for `dialect`, rejecting injected metacharacters or control/newline/NUL characters.
+pub fn sanitize_variable_token(token: &str, dialect: ShellDialect) -> Option<String> {
+    if token.is_empty() || has_disallowed_control(token) || token.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if !token.starts_with('$') {
+        return None;
+    }
+
+    match dialect {
+        ShellDialect::PowerShell => {
+            if matches!(
+                token,
+                "$_" | "$?" | "$^" | "$$" | "$true" | "$false" | "$null"
+            ) {
+                return Some(token.to_string());
+            }
+            if let Some(inner) = token.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+                if let Some((prefix, name)) = inner.split_once(':') {
+                    if prefix.eq_ignore_ascii_case("env")
+                        && !name.is_empty()
+                        && name.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '(' | ')')
+                        })
+                    {
+                        return Some(token.to_string());
+                    }
+                    return None;
+                }
+                return is_ascii_ident(inner).then(|| token.to_string());
+            }
+            if token
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("$env:"))
+            {
+                let name = &token[5..];
+                if name.is_empty() {
+                    return None;
+                }
+                if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    return Some(token.to_string());
+                }
+                if name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '(' | ')'))
+                {
+                    return Some(format!("${{env:{name}}}"));
+                }
+                return None;
+            }
+            let rest = &token[1..];
+            if let Some((scope, ident)) = rest.split_once(':') {
+                if matches!(
+                    scope.to_ascii_lowercase().as_str(),
+                    "global" | "script" | "local" | "private"
+                ) && is_ascii_ident(ident)
+                {
+                    return Some(token.to_string());
+                }
+                return None;
+            }
+            is_ascii_ident(rest).then(|| token.to_string())
+        }
+        ShellDialect::Posix => {
+            if matches!(token, "$?" | "$!" | "$$" | "$_" | "$-" | "$#" | "$@" | "$*") {
+                return Some(token.to_string());
+            }
+            let rest = &token[1..];
+            if rest.len() == 1 && rest.as_bytes()[0].is_ascii_digit() {
+                return Some(token.to_string());
+            }
+            if let Some(inner) = token.strip_prefix("${").and_then(|s| s.strip_suffix('}')) {
+                return is_ascii_ident(inner).then(|| token.to_string());
+            }
+            is_ascii_ident(rest).then(|| token.to_string())
+        }
+        ShellDialect::Fish => {
+            let rest = &token[1..];
+            (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+                .then(|| token.to_string())
+        }
+    }
+}
+
+/// Returns `true` when `token` is a safe, syntactically valid variable reference for `dialect`.
+pub fn is_safe_variable_token(token: &str, dialect: ShellDialect) -> bool {
+    sanitize_variable_token(token, dialect).as_deref() == Some(token)
+}
+
+fn format_path_token(
+    raw: &str,
+    is_dir: bool,
+    dialect: Option<ShellDialect>,
+) -> Option<(String, String)> {
+    if has_disallowed_control(raw) {
+        return None;
+    }
     let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
     let display = if is_dir {
         format!("{}/", trimmed.trim_end_matches(['/', '\\']))
     } else {
         trimmed.to_string()
     };
-    let token = if display.chars().any(char::is_whitespace) {
-        let escaped = display.replace('"', "\\\"");
-        format!("\"{escaped}\"")
+    let token_src = if display.starts_with('-') {
+        Cow::Owned(format!("./{display}"))
     } else {
-        display.clone()
+        Cow::Borrowed(display.as_str())
     };
+    let token = quote_literal_for_dialect(&token_src, dialect, true);
     let label = if is_dir {
         format!("📁 {display}")
     } else {
         display
     };
-    (token, label)
+    Some((token, label))
+}
+
+fn push_git_branch_entry(
+    raw: &str,
+    is_current: bool,
+    dialect: Option<ShellDialect>,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<Entry>,
+) {
+    if has_disallowed_control(raw) {
+        return;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') || !seen.insert(trimmed.to_string()) {
+        return;
+    }
+    let token = quote_literal_for_dialect(trimmed, dialect, true);
+    let (label, desc) = if is_current {
+        (
+            format!("⎇ {trimmed} (current branch)"),
+            "Current Git branch from runtime context",
+        )
+    } else {
+        (format!("⎇ {trimmed}"), "Local Git branch")
+    };
+    out.push(Entry::new(token, label, EntryKind::Arg, desc));
 }
 
 impl RuntimeContext {
     /// Returns Git branch [`Entry`] values derived from `git_branch` and `git_branches` (current branch first).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn git_branch_entries(&self) -> Vec<Entry> {
-        let mut out = Vec::new();
-        let mut seen = HashSet::new();
+        self.git_branch_entries_impl(None)
+    }
+
+    /// Returns shell-dialect-quoted Git branch [`Entry`] values derived from `git_branch` and `git_branches`.
+    pub fn git_branch_entries_for_dialect(&self, dialect: ShellDialect) -> Vec<Entry> {
+        self.git_branch_entries_impl(Some(dialect))
+    }
+
+    fn git_branch_entries_impl(&self, dialect: Option<ShellDialect>) -> Vec<Entry> {
+        let mut out = Vec::with_capacity(self.git_branches.len() + 1);
+        let mut seen = HashSet::with_capacity(self.git_branches.len() + 1);
 
         if let Some(ref cur) = self.git_branch {
-            let trimmed = cur.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                out.push(Entry::new(
-                    trimmed,
-                    format!("⎇ {trimmed} (current branch)"),
-                    EntryKind::Arg,
-                    "Current Git branch from runtime context",
-                ));
-            }
+            push_git_branch_entry(cur, true, dialect, &mut seen, &mut out);
         }
 
         for branch in &self.git_branches {
-            let trimmed = branch.trim();
-            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                out.push(Entry::new(
-                    trimmed,
-                    format!("⎇ {trimmed}"),
-                    EntryKind::Arg,
-                    "Local Git branch",
-                ));
-            }
+            push_git_branch_entry(branch, false, dialect, &mut seen, &mut out);
         }
 
         out
@@ -158,17 +417,30 @@ impl RuntimeContext {
 
     /// Returns current directory file/folder [`Entry`] values, optionally filtered to directories only.
     pub fn cwd_path_entries(&self, dirs_only: bool) -> Vec<Entry> {
+        self.cwd_path_entries_impl(dirs_only, None)
+    }
+
+    /// Returns shell-dialect-quoted current directory file/folder [`Entry`] values.
+    pub fn cwd_path_entries_for_dialect(
+        &self,
+        dirs_only: bool,
+        dialect: ShellDialect,
+    ) -> Vec<Entry> {
+        self.cwd_path_entries_impl(dirs_only, Some(dialect))
+    }
+
+    fn cwd_path_entries_impl(&self, dirs_only: bool, dialect: Option<ShellDialect>) -> Vec<Entry> {
         self.cwd_entries
             .iter()
-            .filter(|e| (!dirs_only || e.is_dir) && !e.name.trim().is_empty())
-            .map(|e| {
-                let (token, label) = format_path_token(&e.name, e.is_dir);
+            .filter(|e| !dirs_only || e.is_dir)
+            .filter_map(|e| {
+                let (token, label) = format_path_token(&e.name, e.is_dir, dialect)?;
                 let kind_desc = if e.is_dir {
                     "Current directory folder"
                 } else {
                     "Current directory file"
                 };
-                Entry::new(token, label, EntryKind::Path, kind_desc)
+                Some(Entry::new(token, label, EntryKind::Path, kind_desc))
             })
             .collect()
     }
@@ -303,10 +575,12 @@ impl Entry {
     /// parameter flags and structured Parameter Aliases. Only cmdlets, functions, and
     /// command aliases carry Parameter Set metadata.
     pub fn active_parameter_sets(&self, tokens: &[String]) -> Option<HashSet<String>> {
-        if !matches!(
-            self.kind,
-            EntryKind::Cmdlet | EntryKind::Func | EntryKind::Alias
-        ) {
+        if tokens.len() <= 1
+            || !matches!(
+                self.kind,
+                EntryKind::Cmdlet | EntryKind::Func | EntryKind::Alias
+            )
+        {
             return None;
         }
         let mut active_sets: Option<HashSet<String>> = None;
@@ -321,27 +595,30 @@ impl Entry {
 
             for param in &self.children {
                 if param.matches_parameter_token(tok) {
-                    let non_all: HashSet<String> = param
-                        .parameter_sets
-                        .iter()
-                        .filter(|s| s.as_str() != ALL_PARAMETER_SETS)
-                        .cloned()
-                        .collect();
-
-                    if !non_all.is_empty() {
-                        active_sets = match active_sets {
-                            None => Some(non_all),
-                            Some(cur) => {
-                                let inter: HashSet<String> =
-                                    cur.intersection(&non_all).cloned().collect();
-                                if inter.is_empty() {
-                                    Some(cur)
-                                } else {
-                                    Some(inter)
+                    active_sets = match active_sets {
+                        None => {
+                            let mut first = HashSet::new();
+                            for s in &param.parameter_sets {
+                                if s.as_str() != ALL_PARAMETER_SETS {
+                                    first.insert(s.clone());
                                 }
                             }
-                        };
-                    }
+                            if first.is_empty() {
+                                None
+                            } else {
+                                Some(first)
+                            }
+                        }
+                        Some(mut cur) => {
+                            if cur
+                                .iter()
+                                .any(|s| param.parameter_sets.iter().any(|p| p == s))
+                            {
+                                cur.retain(|s| param.parameter_sets.iter().any(|p| p == s));
+                            }
+                            Some(cur)
+                        }
+                    };
                     break;
                 }
             }
@@ -350,27 +627,30 @@ impl Entry {
         active_sets
     }
 
+    /// Formats the sorted display label for the active Parameter Sets implied by `tokens`
+    /// without cloning child [`Entry`] values.
+    pub(crate) fn active_parameter_set_label(&self, tokens: &[String]) -> Option<String> {
+        let active_sets = self.active_parameter_sets(tokens)?;
+        Some(format_parameter_set_label(&active_sets))
+    }
+
     /// Returns this Entry's Pane 2 children narrowed to the active Parameter Sets implied
     /// by `tokens`, along with a sorted display label for the active Parameter Set(s).
     pub fn children_for_tokens(&self, tokens: &[String]) -> (Vec<Entry>, Option<String>) {
         let active_sets = self.active_parameter_sets(tokens);
-        let label = active_sets.as_ref().map(|sets| {
-            let mut sorted: Vec<String> = sets.iter().cloned().collect();
-            sorted.sort();
-            sorted.join(", ")
-        });
+        let label = active_sets.as_ref().map(format_parameter_set_label);
 
         if let Some(sets) = active_sets {
-            let filtered: Vec<Entry> = self
-                .children
-                .iter()
-                .filter(|p| {
-                    p.parameter_sets.is_empty()
-                        || p.parameter_sets.iter().any(|s| s == ALL_PARAMETER_SETS)
-                        || p.parameter_sets.iter().any(|s| sets.contains(s))
-                })
-                .cloned()
-                .collect();
+            let mut filtered = Vec::with_capacity(self.children.len());
+            for p in &self.children {
+                if p.parameter_sets.is_empty()
+                    || p.parameter_sets
+                        .iter()
+                        .any(|s| s == ALL_PARAMETER_SETS || sets.contains(s))
+                {
+                    filtered.push(p.clone());
+                }
+            }
             if !filtered.is_empty() {
                 return (filtered, label);
             }
@@ -378,6 +658,15 @@ impl Entry {
 
         (self.children.clone(), label)
     }
+}
+
+fn format_parameter_set_label(sets: &HashSet<String>) -> String {
+    if sets.len() == 1 {
+        return sets.iter().next().cloned().unwrap_or_default();
+    }
+    let mut sorted: Vec<&str> = sets.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted.join(", ")
 }
 
 #[cfg(test)]
@@ -557,6 +846,236 @@ mod tests {
 
         let paths = ctx.cwd_path_entries(false);
         let texts: Vec<&str> = paths.iter().map(|e| e.text.as_str()).collect();
-        assert_eq!(texts, vec![r#""dir \"1\"/""#, r#""my \"quote\".txt""#]);
+        assert_eq!(texts, vec![r#"'dir "1"/'"#, r#"'my "quote".txt'"#]);
+    }
+
+    #[test]
+    fn test_pentest_cwd_and_git_branch_neutralize_shell_metacharacters_and_controls() {
+        let hostile_names = [
+            "$(id)",
+            "`id`",
+            "'; evil; '",
+            r#""$(evil)""#,
+            "$env:x; evil",
+            "; | & > <",
+        ];
+
+        let mut cwd_entries: Vec<CwdEntry> = hostile_names
+            .iter()
+            .map(|name| CwdEntry {
+                name: (*name).to_string(),
+                is_dir: false,
+            })
+            .collect();
+        // Control/newline/NUL entries must be rejected, and leading `-` prefixed with `./`.
+        cwd_entries.extend([
+            CwdEntry {
+                name: "bad\nid.txt".to_string(),
+                is_dir: false,
+            },
+            CwdEntry {
+                name: "bad\rid.txt".to_string(),
+                is_dir: false,
+            },
+            CwdEntry {
+                name: "bad\0id.txt".to_string(),
+                is_dir: false,
+            },
+            CwdEntry {
+                name: "\x1b]52;c;YQ==\x07".to_string(),
+                is_dir: false,
+            },
+            CwdEntry {
+                name: "--checkpoint-action=exec=id".to_string(),
+                is_dir: false,
+            },
+            CwdEntry {
+                name: "-rf; $(id)".to_string(),
+                is_dir: false,
+            },
+        ]);
+
+        let mut git_branches: Vec<String> =
+            hostile_names.iter().map(|s| (*s).to_string()).collect();
+        git_branches.extend([
+            "feat\nid".to_string(),
+            "feat\rid".to_string(),
+            "feat\0id".to_string(),
+            "--upload-pack=evil".to_string(),
+        ]);
+
+        let ctx = RuntimeContext {
+            git_branch: Some("$(whoami)".to_string()),
+            git_branches,
+            cwd_entries,
+            history: Vec::new(),
+        };
+
+        // PowerShell dialect
+        let ps_paths: Vec<String> = ctx
+            .cwd_path_entries_for_dialect(false, ShellDialect::PowerShell)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            ps_paths,
+            vec![
+                "'$(id)'",
+                "'`id`'",
+                "'''; evil; '''",
+                r#"'"$(evil)"'"#,
+                "'$env:x; evil'",
+                "'; | & > <'",
+                "./--checkpoint-action=exec=id",
+                "'./-rf; $(id)'",
+            ]
+        );
+
+        // POSIX dialect
+        let posix_paths: Vec<String> = ctx
+            .cwd_path_entries_for_dialect(false, ShellDialect::Posix)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            posix_paths,
+            vec![
+                "'$(id)'",
+                "'`id`'",
+                r"''\''; evil; '\'''",
+                r#"'"$(evil)"'"#,
+                "'$env:x; evil'",
+                "'; | & > <'",
+                "./--checkpoint-action=exec=id",
+                "'./-rf; $(id)'",
+            ]
+        );
+
+        // Fish dialect
+        let fish_paths: Vec<String> = ctx
+            .cwd_path_entries_for_dialect(false, ShellDialect::Fish)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            fish_paths,
+            vec![
+                "'$(id)'",
+                "'`id`'",
+                r"'\'; evil; \''",
+                r#"'"$(evil)"'"#,
+                "'$env:x; evil'",
+                "'; | & > <'",
+                "./--checkpoint-action=exec=id",
+                "'./-rf; $(id)'",
+            ]
+        );
+
+        // Git branches across all dialects
+        let ps_branches: Vec<String> = ctx
+            .git_branch_entries_for_dialect(ShellDialect::PowerShell)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            ps_branches,
+            vec![
+                "'$(whoami)'",
+                "'$(id)'",
+                "'`id`'",
+                "'''; evil; '''",
+                r#"'"$(evil)"'"#,
+                "'$env:x; evil'",
+                "'; | & > <'",
+            ]
+        );
+        let posix_branches: Vec<String> = ctx
+            .git_branch_entries_for_dialect(ShellDialect::Posix)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            posix_branches,
+            vec![
+                "'$(whoami)'",
+                "'$(id)'",
+                "'`id`'",
+                r"''\''; evil; '\'''",
+                r#"'"$(evil)"'"#,
+                "'$env:x; evil'",
+                "'; | & > <'",
+            ]
+        );
+        let fish_branches: Vec<String> = ctx
+            .git_branch_entries_for_dialect(ShellDialect::Fish)
+            .into_iter()
+            .map(|e| e.text)
+            .collect();
+        assert_eq!(
+            fish_branches,
+            vec![
+                "'$(whoami)'",
+                "'$(id)'",
+                "'`id`'",
+                r"'\'; evil; \''",
+                r#"'"$(evil)"'"#,
+                "'$env:x; evil'",
+                "'; | & > <'",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_pentest_variable_token_validation_and_parameter_set_intersection() {
+        for dialect in [
+            ShellDialect::PowerShell,
+            ShellDialect::Posix,
+            ShellDialect::Fish,
+        ] {
+            assert!(!is_safe_variable_token("$env:x; evil", dialect));
+            assert!(!is_safe_variable_token("$x; evil", dialect));
+            assert!(!is_safe_variable_token("$(id)", dialect));
+            assert!(!is_safe_variable_token("$`id`", dialect));
+            assert!(!is_safe_variable_token("$x\nevil", dialect));
+            assert!(!is_safe_variable_token("$x\revil", dialect));
+            assert!(!is_safe_variable_token("$x\0evil", dialect));
+        }
+
+        assert!(is_safe_variable_token(
+            "$env:USER",
+            ShellDialect::PowerShell
+        ));
+        assert!(is_safe_variable_token("$_", ShellDialect::PowerShell));
+        assert_eq!(
+            sanitize_variable_token("$env:ProgramFiles(x86)", ShellDialect::PowerShell).as_deref(),
+            Some("${env:ProgramFiles(x86)}")
+        );
+        assert!(is_safe_variable_token("$USER", ShellDialect::Posix));
+        assert!(is_safe_variable_token("$?", ShellDialect::Posix));
+        assert!(!is_safe_variable_token("$?", ShellDialect::Fish));
+        assert!(is_safe_variable_token("$status", ShellDialect::Fish));
+
+        let mut cmd = Entry::new("Get-Item", "Get-Item", EntryKind::Cmdlet, "");
+        cmd.children = vec![
+            Entry::new("-Path", "-Path", EntryKind::Param, "")
+                .with_parameter_sets(vec!["Path".to_string(), "PathForce".to_string()]),
+            Entry::new("-Force", "-Force", EntryKind::Flag, "")
+                .with_parameter_sets(vec!["PathForce".to_string(), "LiteralForce".to_string()]),
+            Entry::new("-LiteralPath", "-LiteralPath", EntryKind::Param, "")
+                .with_parameter_sets(vec!["LiteralForce".to_string()]),
+        ];
+        let tokens = vec![
+            "Get-Item".to_string(),
+            "-Path".to_string(),
+            "-Force".to_string(),
+        ];
+        assert_eq!(
+            cmd.active_parameter_set_label(&tokens).as_deref(),
+            Some("PathForce")
+        );
+        let (children, label) = cmd.children_for_tokens(&tokens);
+        assert_eq!(label.as_deref(), Some("PathForce"));
+        let names: Vec<&str> = children.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(names, vec!["-Path", "-Force"]);
     }
 }

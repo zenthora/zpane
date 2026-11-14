@@ -1,9 +1,15 @@
 use crate::discovery::{CliIntrospector, Introspect, ShellDialect};
 use crate::fuzzy::PaneList;
-use crate::model::{Entry, EntryKind, Pane, RuntimeContext};
+use crate::model::{
+    has_disallowed_control, is_benign_double_quotable, is_disallowed_control,
+    is_safe_unquoted_char, is_safe_unquoted_token, is_safe_variable_token,
+    quote_literal_for_dialect, quote_single_for_dialect, sanitize_variable_token,
+    strip_disallowed_controls, Entry, EntryKind, Pane, RuntimeContext,
+};
 use crate::ui::{render_frame, RenderState, Viewport};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use std::collections::VecDeque;
+use std::borrow::Cow;
+use std::collections::{HashSet, VecDeque};
 
 /// Semantic user actions accepted by [`MillerSession`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,35 +261,106 @@ fn tokenize_shell_words_impl(segment: &str, dialect: Option<ShellDialect>) -> Ve
     tokens
 }
 
-fn join_command_tokens(tokens: &[String]) -> String {
-    let mut out = String::new();
+fn sanitize_initial_buffer(raw: &str, dialect: ShellDialect) -> Cow<'_, str> {
+    if !has_disallowed_control(raw) {
+        return Cow::Borrowed(raw);
+    }
+    let ps_mode = dialect.is_powershell();
+    let fish_mode = dialect == ShellDialect::Fish;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut out = String::with_capacity(raw.len());
+
+    for ch in raw.chars() {
+        if escaped {
+            escaped = false;
+            if !is_disallowed_control(ch) {
+                out.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '`' if ps_mode && !in_single => {
+                escaped = true;
+                out.push(ch);
+            }
+            '\\' if !ps_mode && (!in_single || fish_mode) => {
+                escaped = true;
+                out.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                out.push(ch);
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                out.push(ch);
+            }
+            '\n' | '\t' if !in_single && !in_double => out.push(' '),
+            c if is_disallowed_control(c) => {}
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+#[inline]
+fn is_safe_entry_for_emit(entry: &Entry, dialect: ShellDialect) -> bool {
+    entry.is_emittable()
+        && !has_disallowed_control(&entry.text)
+        && (!matches!(entry.kind, EntryKind::Env | EntryKind::Var)
+            || is_safe_variable_token(&entry.text, dialect))
+}
+
+fn join_command_tokens_cow(pipeline_prefix: Option<&str>, tokens: &[Cow<'_, str>]) -> String {
+    let prefix_clean = pipeline_prefix
+        .map(strip_disallowed_controls)
+        .filter(|s| !s.is_empty());
+    let mut cap = prefix_clean.as_ref().map_or(0, |p| p.len() + 1);
+    for tok in tokens {
+        cap += tok.len() + 1;
+    }
+    let mut out = String::with_capacity(cap);
+    if let Some(ref prefix) = prefix_clean {
+        out.push_str(prefix);
+    }
+
     let mut prev_tok: Option<&str> = None;
     for tok in tokens {
-        if out.is_empty() {
-            out.push_str(tok);
-            prev_tok = Some(tok.as_str());
+        let clean = strip_disallowed_controls(tok.as_ref());
+        let tok_str = clean.as_ref();
+        if tok_str.is_empty() {
+            continue;
+        }
+        if prev_tok.is_none() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(tok_str);
+            prev_tok = Some(tok.as_ref());
             continue;
         }
         let prev = prev_tok.unwrap_or("");
         let prev_is_param_eq = prev.starts_with('-') && prev.ends_with('=');
         let prev_is_param_colon = prev.starts_with('-') && prev.ends_with(':');
-        let is_ps_switch_val = prev.starts_with('-') && tok.starts_with(":$");
+        let is_ps_switch_val = prev.starts_with('-') && tok_str.starts_with(":$");
 
-        if prev_is_param_eq && !tok.starts_with('-') {
-            out.push_str(tok);
-        } else if prev_is_param_colon && !tok.starts_with('-') {
-            if let Some(rest) = tok.strip_prefix(':') {
+        if prev_is_param_eq && !tok_str.starts_with('-') {
+            out.push_str(tok_str);
+        } else if prev_is_param_colon && !tok_str.starts_with('-') {
+            if let Some(rest) = tok_str.strip_prefix(':') {
                 out.push_str(rest);
             } else {
-                out.push_str(tok);
+                out.push_str(tok_str);
             }
         } else if is_ps_switch_val {
-            out.push_str(tok);
+            out.push_str(tok_str);
         } else {
             out.push(' ');
-            out.push_str(tok);
+            out.push_str(tok_str);
         }
-        prev_tok = Some(tok.as_str());
+        prev_tok = Some(tok.as_ref());
     }
     out
 }
@@ -350,8 +427,9 @@ impl CommandLine {
         dialect: ShellDialect,
     ) -> (Self, Pane) {
         let mut active_pane = Pane::First;
+        let sanitized = sanitize_initial_buffer(initial_buffer, dialect);
         let (pipeline_prefix, active_segment) =
-            split_pipeline_prefix_for_dialect(initial_buffer, dialect);
+            split_pipeline_prefix_for_dialect(sanitized.as_ref(), dialect);
         let tokens = tokenize_shell_words_for_dialect(active_segment, dialect);
 
         if let Some(first_tok) = tokens.first() {
@@ -407,18 +485,25 @@ impl CommandLine {
     }
 
     fn push_token_dedup(&mut self, token: String) {
+        let clean = strip_disallowed_controls(&token);
+        if clean.is_empty() {
+            return;
+        }
         if self
             .tokens
             .last()
-            .is_some_and(|last| last.eq_ignore_ascii_case(&token))
+            .is_some_and(|last| last.eq_ignore_ascii_case(clean.as_ref()))
         {
             return;
         }
-        self.tokens.push(token);
+        self.tokens.push(clean.into_owned());
         self.tokens_rev += 1;
     }
 
-    fn push_pane2_token_dedup(&mut self, p2: &Entry) {
+    fn push_pane2_token_dedup(&mut self, p2: &Entry, dialect: ShellDialect) {
+        if !is_safe_entry_for_emit(p2, dialect) {
+            return;
+        }
         if self
             .tokens
             .last()
@@ -431,25 +516,29 @@ impl CommandLine {
     }
 
     fn replace_last_token(&mut self, token: String) {
+        let clean = strip_disallowed_controls(&token);
+        if clean.is_empty() {
+            return;
+        }
         if let Some(last) = self.tokens.last_mut() {
-            *last = token;
+            *last = clean.into_owned();
         } else {
-            self.tokens.push(token);
+            self.tokens.push(clean.into_owned());
         }
         self.tokens_rev += 1;
     }
 
-    fn ensure_pane1_token(&mut self, p1: Option<&Entry>) {
+    fn ensure_pane1_token(&mut self, p1: Option<&Entry>, dialect: ShellDialect) {
         if let Some(p1) = p1 {
-            if p1.is_emittable() && self.tokens.is_empty() {
+            if is_safe_entry_for_emit(p1, dialect) && self.tokens.is_empty() {
                 self.tokens.push(p1.text.clone());
                 self.tokens_rev += 1;
             }
         }
     }
 
-    fn commit_pane1_entry(&mut self, p1: &Entry) {
-        if !p1.is_emittable() {
+    fn commit_pane1_entry(&mut self, p1: &Entry, dialect: ShellDialect) {
+        if !is_safe_entry_for_emit(p1, dialect) {
             return;
         }
         if self.tokens.is_empty() {
@@ -464,12 +553,12 @@ impl CommandLine {
         }
     }
 
-    fn commit_pane2_entry(&mut self, p1: Option<&Entry>, p2: &Entry) {
-        self.ensure_pane1_token(p1);
+    fn commit_pane2_entry(&mut self, p1: Option<&Entry>, p2: &Entry, dialect: ShellDialect) {
+        self.ensure_pane1_token(p1, dialect);
         let is_scope_leaf = p1.is_some_and(Entry::is_scope_root) && p2.children.is_empty();
         let allow_commit = !p1.is_some_and(Entry::is_scope_root) || is_scope_leaf;
-        if allow_commit && p2.is_emittable() && !p2.is_loading() {
-            self.push_pane2_token_dedup(p2);
+        if allow_commit && !p2.is_loading() {
+            self.push_pane2_token_dedup(p2, dialect);
         }
     }
 
@@ -532,15 +621,18 @@ impl CommandLine {
         pane3_filter: &str,
         dialect: ShellDialect,
     ) -> String {
-        let mut out = self.tokens.clone();
+        let mut out: Vec<Cow<'_, str>> = Vec::with_capacity(self.tokens.len() + 3);
+        for tok in &self.tokens {
+            out.push(Cow::Borrowed(tok.as_str()));
+        }
 
         if out.is_empty() {
-            if let Some(p1) = p1.filter(|e| e.is_emittable()) {
-                out.push(p1.text.clone());
+            if let Some(p1) = p1.filter(|e| is_safe_entry_for_emit(e, dialect)) {
+                out.push(Cow::Borrowed(p1.text.as_str()));
             }
         } else if active_pane == Pane::First && out.len() == 1 && !self.suppress_pane1_preview {
-            if let Some(p1) = p1.filter(|e| e.is_emittable()) {
-                out[0] = p1.text.clone();
+            if let Some(p1) = p1.filter(|e| is_safe_entry_for_emit(e, dialect)) {
+                out[0] = Cow::Borrowed(p1.text.as_str());
             }
         }
 
@@ -548,9 +640,14 @@ impl CommandLine {
             Pane::First => {}
             Pane::Second => {
                 if !self.suppress_pane2_preview {
-                    if let Some(p2) = p2.filter(|e| e.is_emittable() && !e.is_loading()) {
-                        if !out.last().is_some_and(|last| token_matches_entry(last, p2)) {
-                            out.push(p2.text.clone());
+                    if let Some(p2) =
+                        p2.filter(|e| !e.is_loading() && is_safe_entry_for_emit(e, dialect))
+                    {
+                        if !out
+                            .last()
+                            .is_some_and(|last| token_matches_entry(last.as_ref(), p2))
+                        {
+                            out.push(Cow::Borrowed(p2.text.as_str()));
                         }
                     }
                 }
@@ -558,33 +655,35 @@ impl CommandLine {
             Pane::Third => {
                 if let (Some(p1), Some(p2)) = (p1, p2) {
                     if !p1.is_scope_root()
-                        && p2.is_emittable()
                         && !p2.is_loading()
+                        && is_safe_entry_for_emit(p2, dialect)
                         && out.len() <= self.min_pane3_tokens()
-                        && !out.last().is_some_and(|last| token_matches_entry(last, p2))
+                        && !out
+                            .last()
+                            .is_some_and(|last| token_matches_entry(last.as_ref(), p2))
                     {
-                        out.push(p2.text.clone());
+                        out.push(Cow::Borrowed(p2.text.as_str()));
                     }
                 }
                 if !self.suppress_pane3_preview {
-                    if let Some(v) = resolve_pane3_token(p3, pane3_filter, dialect) {
+                    if let Some(v) = resolve_pane3_token_cow(p3, pane3_filter, dialect) {
                         let replaced_inline = p2
                             .filter(|e| matches!(e.kind, EntryKind::Param | EntryKind::Flag))
                             .and_then(|e| {
                                 let last = out.last()?;
-                                if e.matches_parameter_token(last) {
-                                    replace_inline_param_value(last, &v)
+                                if e.matches_parameter_token(last.as_ref()) {
+                                    replace_inline_param_value(last.as_ref(), v.as_ref())
                                 } else {
                                     None
                                 }
                             });
                         if let Some(updated) = replaced_inline {
                             if let Some(last) = out.last_mut() {
-                                *last = updated;
+                                *last = Cow::Owned(updated);
                             }
                         } else if !out.last().is_some_and(|last| {
-                            last.eq_ignore_ascii_case(&v)
-                                || p3.is_some_and(|e| token_matches_entry(last, e))
+                            last.as_ref().eq_ignore_ascii_case(v.as_ref())
+                                || p3.is_some_and(|e| token_matches_entry(last.as_ref(), e))
                         }) {
                             out.push(v);
                         }
@@ -593,57 +692,112 @@ impl CommandLine {
             }
         }
 
-        let cmd_body = join_command_tokens(&out);
-        match (&self.pipeline_prefix, cmd_body.is_empty()) {
-            (Some(prefix), true) => prefix.clone(),
-            (Some(prefix), false) => format!("{prefix} {cmd_body}"),
-            (None, _) => cmd_body,
+        join_command_tokens_cow(self.pipeline_prefix.as_deref(), &out)
+    }
+}
+
+#[inline]
+fn same_dedup_key(a: &str, b: &str) -> bool {
+    if a.starts_with('-') || b.starts_with('-') {
+        a == b
+    } else {
+        a.eq_ignore_ascii_case(b)
+    }
+}
+
+#[inline]
+fn entry_dedup_cow(text: &str) -> Cow<'_, str> {
+    if text.starts_with('-') || !text.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.to_ascii_lowercase())
+    }
+}
+
+fn dedup_entries_in_place(entries: &mut Vec<Entry>) {
+    if entries.len() <= 1 {
+        return;
+    }
+    let mut seen: HashSet<String> = HashSet::with_capacity(entries.len());
+    entries.retain(|entry| seen.insert(entry_dedup_cow(&entry.text).into_owned()));
+}
+
+fn extend_dedup_slice(target: &mut Vec<Entry>, additions: &[Entry], additions_pre_deduped: bool) {
+    if additions.is_empty() {
+        return;
+    }
+    if additions_pre_deduped && target.iter().all(|e| e.text.is_empty()) {
+        target.extend(additions.iter().cloned());
+        return;
+    }
+    if target.len() <= 24 && additions.len() <= 24 {
+        for entry in additions {
+            if !target.iter().any(|e| same_dedup_key(&e.text, &entry.text)) {
+                target.push(entry.clone());
+            }
+        }
+        return;
+    }
+    let mut existing: HashSet<String> = target
+        .iter()
+        .map(|e| entry_dedup_cow(&e.text).into_owned())
+        .collect();
+    for entry in additions {
+        if existing.insert(entry_dedup_cow(&entry.text).into_owned()) {
+            target.push(entry.clone());
         }
     }
 }
 
-fn entry_dedup_key(text: &str) -> String {
-    if text.starts_with('-') {
-        text.to_string()
-    } else {
-        text.to_ascii_lowercase()
+fn extend_dedup_owned(target: &mut Vec<Entry>, additions: Vec<Entry>) {
+    if additions.is_empty() {
+        return;
     }
-}
-
-fn extend_dedup(target: &mut Vec<Entry>, additions: Vec<Entry>) {
-    let mut existing: std::collections::HashSet<String> =
-        target.iter().map(|e| entry_dedup_key(&e.text)).collect();
+    if target.len() <= 24 && additions.len() <= 24 {
+        for entry in additions {
+            if !target.iter().any(|e| same_dedup_key(&e.text, &entry.text)) {
+                target.push(entry);
+            }
+        }
+        return;
+    }
+    let mut existing: HashSet<String> = target
+        .iter()
+        .map(|e| entry_dedup_cow(&e.text).into_owned())
+        .collect();
     for entry in additions {
-        if existing.insert(entry_dedup_key(&entry.text)) {
+        if existing.insert(entry_dedup_cow(&entry.text).into_owned()) {
             target.push(entry);
         }
     }
 }
 
-fn expand_runtime_entries(children: &[Entry], ctx: &RuntimeContext) -> Vec<Entry> {
+fn expand_runtime_entries_cached(
+    children: &[Entry],
+    cwd_all: &[Entry],
+    cwd_dirs: &[Entry],
+) -> Vec<Entry> {
     let mut out = Vec::with_capacity(children.len());
     for child in children {
         if child.is_placeholder() && child.label == "$files" {
-            let cwd = ctx.cwd_path_entries(false);
-            if cwd.is_empty() {
+            if cwd_all.is_empty() {
                 out.push(Entry::placeholder(
                     "(No files in current directory)",
                     EntryKind::Path,
                     "Expanded from spec $files macro",
                 ));
             } else {
-                out.extend(cwd);
+                out.extend(cwd_all.iter().cloned());
             }
         } else if child.is_placeholder() && child.label == "$directories" {
-            let dirs = ctx.cwd_path_entries(true);
-            if dirs.is_empty() {
+            if cwd_dirs.is_empty() {
                 out.push(Entry::placeholder(
                     "(No directories in current directory)",
                     EntryKind::Path,
                     "Expanded from spec $directories macro",
                 ));
             } else {
-                out.extend(dirs);
+                out.extend(cwd_dirs.iter().cloned());
             }
         } else {
             out.push(child.clone());
@@ -679,24 +833,27 @@ fn is_git_branch_target(exe: &str, p2: &Entry) -> bool {
     if !exe.eq_ignore_ascii_case("git") {
         return false;
     }
-    matches!(
-        p2.text.to_ascii_lowercase().as_str(),
-        "checkout"
-            | "switch"
-            | "branch"
-            | "merge"
-            | "rebase"
-            | "diff"
-            | "log"
-            | "push"
-            | "pull"
-            | "reset"
-            | "cherry-pick"
-            | "show"
-            | "tag"
-            | "-b"
-            | "--track"
-    ) || p2.text == "-B"
+    let t = p2.text.as_str();
+    t == "-B"
+        || [
+            "checkout",
+            "switch",
+            "branch",
+            "merge",
+            "rebase",
+            "diff",
+            "log",
+            "push",
+            "pull",
+            "reset",
+            "cherry-pick",
+            "show",
+            "tag",
+            "-b",
+            "--track",
+        ]
+        .iter()
+        .any(|kw| t.eq_ignore_ascii_case(kw))
 }
 
 fn walk_entry_chain<'a>(root: &'a Entry, chain: &[String]) -> Option<&'a Entry> {
@@ -710,87 +867,12 @@ fn walk_entry_chain<'a>(root: &'a Entry, chain: &[String]) -> Option<&'a Entry> 
     Some(cur)
 }
 
-fn format_custom_value_token(raw: &str, dialect: ShellDialect) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    let is_ps = dialect == ShellDialect::PowerShell;
-    let escape_char = if is_ps { '`' } else { '\\' };
-
-    if trimmed.starts_with('"') || trimmed.starts_with('\'') {
-        let leading = trimmed.chars().next().unwrap_or('"');
-        let mut in_single = false;
-        let mut in_double = false;
-        let mut escaped = false;
-        for ch in trimmed.chars() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if ch == escape_char && (!in_single || dialect == ShellDialect::Fish) {
-                escaped = true;
-                continue;
-            }
-            match ch {
-                '\'' if !in_double => in_single = !in_single,
-                '"' if !in_single => in_double = !in_double,
-                _ => {}
-            }
-        }
-        if !in_single && !in_double {
-            return trimmed.to_string();
-        }
-        if (in_double && leading == '"') || (in_single && leading == '\'') {
-            return format!("{trimmed}{leading}");
-        }
-    }
-
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut has_unquoted_ws = false;
-    for ch in trimmed.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if ch == escape_char && (!in_single || dialect == ShellDialect::Fish) {
-            escaped = true;
-            continue;
-        }
-        match ch {
-            '\'' if !in_double => in_single = !in_single,
-            '"' if !in_single => in_double = !in_double,
-            c if c.is_whitespace() && !in_single && !in_double => {
-                has_unquoted_ws = true;
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    if !has_unquoted_ws {
-        return trimmed.to_string();
-    }
-
-    let mut out = String::with_capacity(trimmed.len() + 4);
+fn escape_benign_double_quoted(raw: &str, dialect: ShellDialect) -> String {
+    let mut out = String::with_capacity(raw.len() + 4);
     out.push('"');
-    let mut escaped = false;
-    for ch in trimmed.chars() {
-        if escaped {
-            out.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == escape_char {
-            out.push(ch);
-            escaped = true;
-            continue;
-        }
+    for ch in raw.chars() {
         if ch == '"' {
-            if is_ps {
+            if dialect.is_powershell() {
                 out.push_str("`\"");
             } else {
                 out.push_str("\\\"");
@@ -801,6 +883,56 @@ fn format_custom_value_token(raw: &str, dialect: ShellDialect) -> String {
     }
     out.push('"');
     out
+}
+
+fn format_custom_value_token(raw: &str, dialect: ShellDialect) -> String {
+    let cleaned = strip_disallowed_controls(raw);
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if trimmed.starts_with('"') {
+        let inner = trimmed
+            .strip_prefix('"')
+            .map(|rest| rest.strip_suffix('"').unwrap_or(rest))
+            .unwrap_or("");
+        if !inner.is_empty()
+            && !inner.contains('"')
+            && !inner.contains('\\')
+            && inner
+                .chars()
+                .all(|ch| ch.is_whitespace() || is_safe_unquoted_char(ch, false))
+        {
+            return format!("\"{inner}\"");
+        }
+    } else if trimmed.starts_with('\'') {
+        let inner = trimmed
+            .strip_prefix('\'')
+            .map(|rest| rest.strip_suffix('\'').unwrap_or(rest))
+            .unwrap_or("");
+        if !inner.is_empty()
+            && !inner.contains('\'')
+            && !inner.contains('\\')
+            && inner
+                .chars()
+                .all(|ch| ch.is_whitespace() || is_safe_unquoted_char(ch, false))
+        {
+            return format!("'{inner}'");
+        }
+    }
+
+    if is_safe_unquoted_token(trimmed, Some(dialect)) {
+        return trimmed.to_string();
+    }
+
+    if is_benign_double_quotable(trimmed, Some(dialect))
+        && !(dialect.is_powershell() && trimmed.contains('\\'))
+    {
+        return escape_benign_double_quoted(trimmed, dialect);
+    }
+
+    quote_single_for_dialect(trimmed, Some(dialect))
 }
 
 fn resolve_pane2_entries<I: Introspect>(
@@ -849,14 +981,167 @@ fn resolve_pane2_entries<I: Introspect>(
     (introspector.query(&[p1.text.as_str()]), None)
 }
 
+struct SessionRuntimeCache<'a> {
+    dialect: ShellDialect,
+    common_vars: &'a [Entry],
+    cwd_all: &'a [Entry],
+    cwd_dirs: &'a [Entry],
+    git_branches: &'a [Entry],
+}
+
+fn sanitize_literal_value_text(raw: &str, dialect: ShellDialect) -> Option<String> {
+    if has_disallowed_control(raw) {
+        return None;
+    }
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        let inner = &raw[1..raw.len() - 1];
+        if !inner.contains('"')
+            && is_benign_double_quotable(inner, Some(dialect))
+            && (dialect.is_powershell() || !inner.contains('\\'))
+        {
+            return Some(raw.to_string());
+        }
+        return Some(quote_single_for_dialect(inner, Some(dialect)));
+    }
+    Some(quote_literal_for_dialect(raw, Some(dialect), true))
+}
+
+fn is_valid_single_quoted(token: &str, dialect: ShellDialect) -> bool {
+    if token.len() < 2
+        || !token.starts_with('\'')
+        || !token.ends_with('\'')
+        || has_disallowed_control(token)
+    {
+        return false;
+    }
+    let inner = &token[1..token.len() - 1];
+    match dialect {
+        ShellDialect::PowerShell => {
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                if ch == '\'' && chars.next() != Some('\'') {
+                    return false;
+                }
+            }
+            true
+        }
+        ShellDialect::Posix => {
+            let mut rest = inner;
+            while let Some(pos) = rest.find('\'') {
+                if !rest[pos..].starts_with("'\\''") {
+                    return false;
+                }
+                rest = &rest[pos + 4..];
+            }
+            true
+        }
+        ShellDialect::Fish => {
+            let mut chars = inner.chars();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\'' => return false,
+                    '\\' if !matches!(chars.next(), Some('\\' | '\'')) => return false,
+                    _ => {}
+                }
+            }
+            true
+        }
+    }
+}
+
+fn sanitize_scope_children(entries: &mut Vec<Entry>, dialect: ShellDialect, in_var_scope: bool) {
+    let mut kept = Vec::with_capacity(entries.len());
+    for mut entry in std::mem::take(entries) {
+        if has_disallowed_control(&entry.text) {
+            continue;
+        }
+        match entry.kind {
+            EntryKind::Env | EntryKind::Var if !entry.is_scope_root() => {
+                let Some(safe_tok) = sanitize_variable_token(&entry.text, dialect) else {
+                    continue;
+                };
+                entry.text = safe_tok;
+                sanitize_scope_children(&mut entry.children, dialect, true);
+                kept.push(entry);
+            }
+            EntryKind::Value if in_var_scope => {
+                let Some(safe_val) = sanitize_literal_value_text(&entry.text, dialect) else {
+                    continue;
+                };
+                entry.text = safe_val;
+                kept.push(entry);
+            }
+            EntryKind::Path if !entry.is_scope_root() => {
+                if !is_safe_unquoted_token(&entry.text, Some(dialect))
+                    && !is_valid_single_quoted(&entry.text, dialect)
+                    && !(entry.text.len() >= 2
+                        && entry.text.starts_with('"')
+                        && entry.text.ends_with('"')
+                        && is_benign_double_quotable(
+                            &entry.text[1..entry.text.len() - 1],
+                            Some(dialect),
+                        ))
+                {
+                    entry.text = quote_literal_for_dialect(&entry.text, Some(dialect), true);
+                }
+                kept.push(entry);
+            }
+            _ => {
+                sanitize_scope_children(&mut entry.children, dialect, in_var_scope);
+                kept.push(entry);
+            }
+        }
+    }
+    *entries = kept;
+}
+
+fn sanitize_catalog_entries(
+    entries: &mut Vec<Entry>,
+    dialect: ShellDialect,
+    runtime_ctx: &RuntimeContext,
+) {
+    let mut i = 0;
+    while i < entries.len() {
+        let entry = &mut entries[i];
+        if entry.is_scope_root() {
+            if entry.text == "./" && !runtime_ctx.cwd_entries.is_empty() {
+                entry.children = runtime_ctx.cwd_path_entries_for_dialect(false, dialect);
+            } else {
+                let in_var_scope = matches!(entry.kind, EntryKind::Env | EntryKind::Var);
+                sanitize_scope_children(&mut entry.children, dialect, in_var_scope);
+            }
+            i += 1;
+            continue;
+        }
+        if matches!(entry.kind, EntryKind::Env | EntryKind::Var) {
+            if let Some(safe_tok) = sanitize_variable_token(&entry.text, dialect) {
+                entry.text = safe_tok;
+                sanitize_scope_children(&mut entry.children, dialect, true);
+                i += 1;
+            } else {
+                entries.swap_remove(i);
+            }
+            continue;
+        }
+        if has_disallowed_control(&entry.text) {
+            let cleaned = strip_disallowed_controls(&entry.text);
+            if cleaned.trim().is_empty() {
+                entries.swap_remove(i);
+                continue;
+            }
+            entry.text = cleaned.into_owned();
+        }
+        i += 1;
+    }
+}
+
 fn resolve_pane3_entries<I: Introspect>(
     pane1_entry: Option<&Entry>,
     pane2_entry: Option<&Entry>,
     subcmd_chain: &[String],
     introspector: &mut I,
     pane3_filter: &str,
-    dialect: ShellDialect,
-    runtime_ctx: &RuntimeContext,
+    cache: &SessionRuntimeCache<'_>,
 ) -> Vec<Entry> {
     let (Some(p1), Some(p2)) = (pane1_entry, pane2_entry) else {
         return Vec::new();
@@ -868,15 +1153,19 @@ fn resolve_pane3_entries<I: Introspect>(
 
     let p1_exe = primary_exe_for_entry(p1);
     let mut entries = Vec::new();
-    let trimmed_input = pane3_filter.trim();
+    let cleaned_filter = strip_disallowed_controls(pane3_filter);
+    let trimmed_input = cleaned_filter.trim();
 
     if !trimmed_input.is_empty() {
-        entries.push(Entry::new(
-            format_custom_value_token(trimmed_input, dialect),
-            format!("✏ Use \"{trimmed_input}\""),
-            EntryKind::Value,
-            format!("Insert custom value for {}", p2.label),
-        ));
+        let token = format_custom_value_token(trimmed_input, cache.dialect);
+        if !token.is_empty() {
+            entries.push(Entry::new(
+                token,
+                format!("✏ Use \"{trimmed_input}\""),
+                EntryKind::Value,
+                format!("Insert custom value for {}", p2.label),
+            ));
+        }
     } else if matches!(p2.kind, EntryKind::Param | EntryKind::Flag) && p2.children.is_empty() {
         entries.push(Entry::placeholder(
             "✏ (Type custom value / path)",
@@ -890,20 +1179,20 @@ fn resolve_pane3_entries<I: Introspect>(
 
     if !p2.children.is_empty() {
         if is_git_branch_target(p1_exe, p2) {
-            extend_dedup(&mut entries, runtime_ctx.git_branch_entries());
+            extend_dedup_slice(&mut entries, cache.git_branches, true);
         }
-        extend_dedup(
+        extend_dedup_owned(
             &mut entries,
-            expand_runtime_entries(&p2.children, runtime_ctx),
+            expand_runtime_entries_cached(&p2.children, cache.cwd_all, cache.cwd_dirs),
         );
         if matches!(p2.kind, EntryKind::Param | EntryKind::Flag) {
-            extend_dedup(&mut entries, dialect.common_var_entries());
+            extend_dedup_slice(&mut entries, cache.common_vars, true);
         }
         return entries;
     }
 
     if p1.is_scope_root() && p2.children.is_empty() {
-        if entries.is_empty() {
+        if entries.is_empty() && is_safe_entry_for_emit(p2, cache.dialect) {
             entries.push(Entry::new(
                 p2.text.clone(),
                 format!("Insert {}", p2.text),
@@ -925,24 +1214,50 @@ fn resolve_pane3_entries<I: Introspect>(
             return entries;
         }
         if is_git_branch_target(p1_exe, p2) {
-            extend_dedup(&mut entries, runtime_ctx.git_branch_entries());
+            extend_dedup_slice(&mut entries, cache.git_branches, true);
         }
-        extend_dedup(&mut entries, sub_entries);
-        extend_dedup(&mut entries, runtime_ctx.cwd_path_entries(false));
+        extend_dedup_owned(&mut entries, sub_entries);
+        extend_dedup_slice(&mut entries, cache.cwd_all, true);
         return entries;
     }
 
     if !p1.is_scope_root() {
         if is_git_branch_target(p1_exe, p2) {
-            extend_dedup(&mut entries, runtime_ctx.git_branch_entries());
+            extend_dedup_slice(&mut entries, cache.git_branches, true);
         }
         if p2.kind == EntryKind::Param {
-            extend_dedup(&mut entries, runtime_ctx.cwd_path_entries(false));
+            extend_dedup_slice(&mut entries, cache.cwd_all, true);
         }
     }
 
-    extend_dedup(&mut entries, dialect.common_var_entries());
+    extend_dedup_slice(&mut entries, cache.common_vars, true);
     entries
+}
+
+fn resolve_pane3_token_cow<'a>(
+    cur_p3: Option<&'a Entry>,
+    pane3_filter: &str,
+    dialect: ShellDialect,
+) -> Option<Cow<'a, str>> {
+    let cleaned_filter = strip_disallowed_controls(pane3_filter);
+    let trimmed_filter = cleaned_filter.trim();
+    if let Some(p3) = cur_p3 {
+        if p3.is_loading() {
+            None
+        } else if is_safe_entry_for_emit(p3, dialect) {
+            Some(Cow::Borrowed(p3.text.as_str()))
+        } else if !trimmed_filter.is_empty() {
+            let tok = format_custom_value_token(trimmed_filter, dialect);
+            (!tok.is_empty()).then_some(Cow::Owned(tok))
+        } else {
+            None
+        }
+    } else if !trimmed_filter.is_empty() {
+        let tok = format_custom_value_token(trimmed_filter, dialect);
+        (!tok.is_empty()).then_some(Cow::Owned(tok))
+    } else {
+        None
+    }
 }
 
 fn resolve_pane3_token(
@@ -950,22 +1265,7 @@ fn resolve_pane3_token(
     pane3_filter: &str,
     dialect: ShellDialect,
 ) -> Option<String> {
-    let trimmed_filter = pane3_filter.trim();
-    if let Some(p3) = cur_p3 {
-        if p3.is_loading() {
-            None
-        } else if p3.is_emittable() {
-            Some(p3.text.clone())
-        } else if !trimmed_filter.is_empty() {
-            Some(format_custom_value_token(trimmed_filter, dialect))
-        } else {
-            None
-        }
-    } else if !trimmed_filter.is_empty() {
-        Some(format_custom_value_token(trimmed_filter, dialect))
-    } else {
-        None
-    }
+    resolve_pane3_token_cow(cur_p3, pane3_filter, dialect).map(Cow::into_owned)
 }
 
 /// Deep interactive session state machine owning the 3-pane Miller catalogs,
@@ -982,6 +1282,10 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     introspector: I,
     catalog_loader: Option<CatalogLoader>,
     runtime_ctx: RuntimeContext,
+    cached_common_vars: Option<Vec<Entry>>,
+    cached_cwd_all: Vec<Entry>,
+    cached_cwd_dirs: Vec<Entry>,
+    cached_git_branches: Vec<Entry>,
     initial_buffer: String,
     active_pane: Pane,
     cmd: CommandLine,
@@ -994,12 +1298,14 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
 
 impl<I: Introspect> MillerSession<I> {
     pub fn new(
-        pane1_entries: Vec<Entry>,
+        mut pane1_entries: Vec<Entry>,
         introspector: I,
         initial_buffer: &str,
         viewport: Viewport,
         dialect: ShellDialect,
     ) -> Self {
+        let runtime_ctx = RuntimeContext::default();
+        sanitize_catalog_entries(&mut pane1_entries, dialect, &runtime_ctx);
         let mut pane1 = PaneList::new(pane1_entries);
         let (cmd, active_pane) =
             CommandLine::from_initial_buffer(initial_buffer, &mut pane1, dialect);
@@ -1014,7 +1320,11 @@ impl<I: Introspect> MillerSession<I> {
             skip_child_filter_clear_once: false,
             introspector,
             catalog_loader: None,
-            runtime_ctx: RuntimeContext::default(),
+            runtime_ctx,
+            cached_common_vars: None,
+            cached_cwd_all: Vec::new(),
+            cached_cwd_dirs: Vec::new(),
+            cached_git_branches: Vec::new(),
             initial_buffer: initial_buffer.to_string(),
             active_pane,
             cmd,
@@ -1028,10 +1338,59 @@ impl<I: Introspect> MillerSession<I> {
         session
     }
 
+    fn ensure_common_vars_cached(&mut self) {
+        if self.cached_common_vars.is_none() {
+            let mut vars = self.dialect.common_var_entries();
+            dedup_entries_in_place(&mut vars);
+            self.cached_common_vars = Some(vars);
+        }
+    }
+
+    fn rebuild_runtime_caches(&mut self) {
+        let mut branches = self
+            .runtime_ctx
+            .git_branch_entries_for_dialect(self.dialect);
+        dedup_entries_in_place(&mut branches);
+        self.cached_git_branches = branches;
+
+        let mut cwd_all = self
+            .runtime_ctx
+            .cwd_path_entries_for_dialect(false, self.dialect);
+        dedup_entries_in_place(&mut cwd_all);
+        self.cached_cwd_all = cwd_all;
+
+        let mut cwd_dirs = self
+            .runtime_ctx
+            .cwd_path_entries_for_dialect(true, self.dialect);
+        dedup_entries_in_place(&mut cwd_dirs);
+        self.cached_cwd_dirs = cwd_dirs;
+    }
+
     /// Attaches dynamic runtime context (Git branch, CWD files, shell history)
     /// used to enrich Pane 2 and Pane 3 completions.
     pub fn with_runtime_context(mut self, runtime_ctx: RuntimeContext) -> Self {
         self.runtime_ctx = runtime_ctx;
+        self.rebuild_runtime_caches();
+
+        if !self.runtime_ctx.cwd_entries.is_empty()
+            && self.panes[0]
+                .entries()
+                .iter()
+                .any(|e| e.is_scope_root() && e.text == "./")
+        {
+            let mut pane1_entries = self.panes[0].entries().to_vec();
+            let prev_p1 = self.selected_entry(Pane::First).map(|e| e.text.clone());
+            for entry in &mut pane1_entries {
+                if entry.is_scope_root() && entry.text == "./" {
+                    entry.children = self.cached_cwd_all.clone();
+                }
+            }
+            self.panes[0].set_entries(pane1_entries);
+            if let Some(txt) = prev_p1 {
+                self.panes[0].select_first_matching(|e| e.text == txt);
+            }
+        }
+
         if !self.initial_buffer.is_empty() {
             self.panes[0].clear_filter();
             self.panes[0].reset_cursor();
@@ -1080,7 +1439,8 @@ impl<I: Introspect> MillerSession<I> {
         true
     }
 
-    fn apply_catalog_update(&mut self, entries: Vec<Entry>) {
+    fn apply_catalog_update(&mut self, mut entries: Vec<Entry>) {
+        sanitize_catalog_entries(&mut entries, self.dialect, &self.runtime_ctx);
         let prev_p1_text = self.selected_entry(Pane::First).map(|e| e.text.clone());
         self.panes[0].set_entries(entries);
         let matched_prev = prev_p1_text
@@ -1172,6 +1532,7 @@ impl<I: Introspect> MillerSession<I> {
                     let exe = primary_exe_for_entry(p1).to_string();
                     self.introspector.invalidate_command(&exe);
                 }
+                self.cached_common_vars = None;
                 if let Some(loader) = self.catalog_loader.as_mut() {
                     let entries = loader(self.dialect);
                     self.apply_catalog_update(entries);
@@ -1194,8 +1555,10 @@ impl<I: Introspect> MillerSession<I> {
             UserAction::AcceptToken => self.accept_token(),
             UserAction::Backspace => self.handle_backspace(),
             UserAction::InsertChar(ch) => {
-                self.active_pane_mut().push_filter_char(ch);
-                self.finish_filter_edit();
+                if !is_disallowed_control(ch) {
+                    self.active_pane_mut().push_filter_char(ch);
+                    self.finish_filter_edit();
+                }
             }
             UserAction::ClearFilter => {
                 if self.active_pane_mut().clear_filter() {
@@ -1238,16 +1601,22 @@ impl<I: Introspect> MillerSession<I> {
         let Some(p1) = p1_opt else {
             return false;
         };
-        let mut sub_chain: Vec<String> = Vec::with_capacity(self.cmd.subcmd_chain.len() + 1);
-        sub_chain.extend(self.cmd.subcmd_chain.iter().cloned());
-        sub_chain.push(p2.text.clone());
-        if walk_entry_chain(p1, &sub_chain).is_some_and(|e| !e.children.is_empty()) {
+        if walk_entry_chain(p1, &self.cmd.subcmd_chain)
+            .and_then(|parent| {
+                parent
+                    .children
+                    .iter()
+                    .find(|c| c.text.eq_ignore_ascii_case(&p2.text))
+            })
+            .is_some_and(|e| !e.children.is_empty())
+        {
             return true;
         }
         let p1_exe = primary_exe_for_entry(p1);
-        let mut exe_chain: Vec<&str> = Vec::with_capacity(1 + sub_chain.len());
+        let mut exe_chain: Vec<&str> = Vec::with_capacity(2 + self.cmd.subcmd_chain.len());
         exe_chain.push(p1_exe);
-        exe_chain.extend(sub_chain.iter().map(String::as_str));
+        exe_chain.extend(self.cmd.subcmd_chain.iter().map(String::as_str));
+        exe_chain.push(p2.text.as_str());
         let queried = self.introspector.query(&exe_chain);
         !queried.is_empty() && !queried.iter().any(Entry::is_loading)
     }
@@ -1272,11 +1641,12 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn step_right(&mut self) {
+        let dialect = self.dialect;
         match self.active_pane {
             Pane::First => {
                 if let Some(p1) = self.selected_entry(Pane::First).cloned() {
                     if !p1.is_loading() {
-                        self.cmd.commit_pane1_entry(&p1);
+                        self.cmd.commit_pane1_entry(&p1, dialect);
                         self.active_pane = Pane::Second;
                         self.cmd.resume_preview(Pane::Second);
                         self.dirty = true;
@@ -1287,7 +1657,7 @@ impl<I: Introspect> MillerSession<I> {
                 let p1_opt = self.selected_entry(Pane::First).cloned();
                 if let Some(p2) = self.selected_entry(Pane::Second).cloned() {
                     if !p2.is_loading() {
-                        self.cmd.commit_pane2_entry(p1_opt.as_ref(), &p2);
+                        self.cmd.commit_pane2_entry(p1_opt.as_ref(), &p2, dialect);
                         self.active_pane = Pane::Third;
                         self.cmd.resume_preview(Pane::Second);
                         self.cmd.resume_preview(Pane::Third);
@@ -1307,9 +1677,10 @@ impl<I: Introspect> MillerSession<I> {
                     if p2.kind == EntryKind::Subcmd
                         && can_slide_p3
                         && p3.is_emittable()
+                        && is_safe_entry_for_emit(&p3, dialect)
                         && !p3.is_loading()
                     {
-                        self.cmd.commit_pane2_entry(Some(&p1), &p2);
+                        self.cmd.commit_pane2_entry(Some(&p1), &p2, dialect);
                         let parent_idx = self.cmd.find_subcmd_token_idx(&p2);
                         self.cmd.push_token_dedup(p3.text.clone());
                         self.cmd.pending_pane3_seeds.clear();
@@ -1358,9 +1729,10 @@ impl<I: Introspect> MillerSession<I> {
     fn accept_token(&mut self) {
         match self.active_pane {
             Pane::First => {
+                let dialect = self.dialect;
                 if let Some(p1) = self.selected_entry(Pane::First).cloned() {
                     if !p1.is_loading() {
-                        self.cmd.commit_pane1_entry(&p1);
+                        self.cmd.commit_pane1_entry(&p1, dialect);
                         if self.panes[0].clear_filter() {
                             self.panes[0].select_first_matching(|it| {
                                 it.text == p1.text && it.kind == p1.kind
@@ -1378,6 +1750,7 @@ impl<I: Introspect> MillerSession<I> {
                 if self.cmd.suppress_pane2_preview {
                     return;
                 }
+                let dialect = self.dialect;
                 let p1_opt = self.selected_entry(Pane::First).cloned();
                 let Some(p2) = self.selected_entry(Pane::Second).cloned() else {
                     return;
@@ -1390,7 +1763,7 @@ impl<I: Introspect> MillerSession<I> {
                     || p1_opt
                         .as_ref()
                         .is_some_and(|p1| p1.is_scope_root() && p2.children.is_empty());
-                self.cmd.commit_pane2_entry(p1_opt.as_ref(), &p2);
+                self.cmd.commit_pane2_entry(p1_opt.as_ref(), &p2, dialect);
                 if commit_without_value {
                     self.panes[1].clear_filter();
                     self.panes[1].reset_cursor();
@@ -1423,16 +1796,19 @@ impl<I: Introspect> MillerSession<I> {
                     });
                     if slide_into_p3 {
                         if let Some(p3) = p3_opt {
-                            self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2);
-                            let parent_idx = self.cmd.find_subcmd_token_idx(p2);
-                            self.cmd.push_token_dedup(p3.text.clone());
-                            self.cmd.pending_pane3_seeds.clear();
-                            self.slide_window_into_subcmd(
-                                p2.text.clone(),
-                                parent_idx,
-                                p3.text,
-                                false,
-                            );
+                            let dialect = self.dialect;
+                            if is_safe_entry_for_emit(&p3, dialect) {
+                                self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2, dialect);
+                                let parent_idx = self.cmd.find_subcmd_token_idx(p2);
+                                self.cmd.push_token_dedup(p3.text.clone());
+                                self.cmd.pending_pane3_seeds.clear();
+                                self.slide_window_into_subcmd(
+                                    p2.text.clone(),
+                                    parent_idx,
+                                    p3.text,
+                                    false,
+                                );
+                            }
                             return;
                         }
                     }
@@ -1473,10 +1849,11 @@ impl<I: Introspect> MillerSession<I> {
                     }
                 }
 
+                let dialect = self.dialect;
                 if let Some(ref p2) = p2_opt {
                     let should_slide_subcmd = p2.kind == EntryKind::Subcmd
                         && self.subcommand_has_pane2_children(p1_opt.as_ref(), p2);
-                    self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2);
+                    self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2, dialect);
                     if let Some(val) = val_to_add {
                         self.cmd.push_token_dedup(val);
                     }
@@ -1500,7 +1877,7 @@ impl<I: Introspect> MillerSession<I> {
                         return;
                     }
                 } else {
-                    self.cmd.ensure_pane1_token(p1_opt.as_ref());
+                    self.cmd.ensure_pane1_token(p1_opt.as_ref(), dialect);
                     if let Some(val) = val_to_add {
                         self.cmd.push_token_dedup(val);
                     }
@@ -1632,15 +2009,31 @@ impl<I: Introspect> MillerSession<I> {
 
     fn sync_pane2(&mut self, cur_p1_idx: Option<usize>) -> Option<usize> {
         let cur_p1 = cur_p1_idx.map(|idx| &self.panes[0].entries()[idx]);
-        let cur_p1_text = cur_p1.map(|e| e.text.clone());
+        let mut p1_or_depth_changed = true;
+        let mut tokens_changed_only = false;
 
-        let needs_resolve = self.pane2_cache_state.as_ref().is_none_or(|prev| {
-            prev.p1_entry_idx != cur_p1_idx
-                || prev.subcmd_chain != self.cmd.subcmd_chain
-                || self.pane2_tokens_rev != self.cmd.tokens_rev
-        });
+        if let Some(prev) = self.pane2_cache_state.as_ref() {
+            if prev.p1_entry_idx == cur_p1_idx && prev.subcmd_chain == self.cmd.subcmd_chain {
+                p1_or_depth_changed = false;
+                if self.pane2_tokens_rev == self.cmd.tokens_rev {
+                    tokens_changed_only = false;
+                } else {
+                    // `tokens` only affects Pane 2 when `p1` has parameter-set children at depth 0.
+                    let uses_param_sets = self.cmd.subcmd_chain.is_empty()
+                        && cur_p1.is_some_and(|p1| !p1.is_loading() && !p1.children.is_empty());
+                    if uses_param_sets {
+                        let next_label =
+                            cur_p1.and_then(|p1| p1.active_parameter_set_label(self.cmd.tokens()));
+                        tokens_changed_only = next_label != prev.active_param_set;
+                    }
+                    if !tokens_changed_only {
+                        self.pane2_tokens_rev = self.cmd.tokens_rev;
+                    }
+                }
+            }
+        }
 
-        if needs_resolve {
+        if p1_or_depth_changed || tokens_changed_only {
             let (entries, active_param_set) = resolve_pane2_entries(
                 cur_p1,
                 self.cmd.tokens(),
@@ -1656,7 +2049,14 @@ impl<I: Introspect> MillerSession<I> {
             };
 
             if self.pane2_cache_state.as_ref() != Some(&next_state) {
-                let p1_changed = self.last_p1_text != cur_p1_text;
+                let p1_changed = {
+                    let cur_p1_str = cur_p1.map(|e| e.text.as_str());
+                    let changed = self.last_p1_text.as_deref() != cur_p1_str;
+                    if changed {
+                        self.last_p1_text = cur_p1_str.map(str::to_string);
+                    }
+                    changed
+                };
                 let same_p1_depth = !p1_changed
                     && self.pane2_cache_state.as_ref().is_some_and(|prev| {
                         prev.p1_entry_idx == cur_p1_idx
@@ -1673,7 +2073,6 @@ impl<I: Introspect> MillerSession<I> {
                     self.panes[2].clear_filter();
                 }
                 self.skip_child_filter_clear_once = false;
-                self.last_p1_text = cur_p1_text;
 
                 self.panes[1].set_entries(entries);
                 if same_p1_depth && !self.cmd.suppress_pane2_preview {
@@ -1734,36 +2133,55 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn sync_pane3(&mut self, cur_p1_idx: Option<usize>, cur_p2_idx: Option<usize>) -> bool {
-        let cur_p2_text = cur_p2_idx.map(|idx| self.panes[1].entries()[idx].text.clone());
-
-        if self.last_p2_text != cur_p2_text {
-            self.panes[2].clear_filter();
-            self.last_p2_text = cur_p2_text;
-        }
-
-        let cur_p1 = cur_p1_idx.map(|idx| &self.panes[0].entries()[idx]);
-        let cur_p2 = cur_p2_idx.map(|idx| &self.panes[1].entries()[idx]);
-
-        let next_state = Pane3CacheState {
-            p1_entry_idx: cur_p1_idx,
-            p2_entry_idx: cur_p2_idx,
-            pane3_filter: self.panes[2].filter().to_string(),
-            subcmd_chain: self.cmd.subcmd_chain.clone(),
+        let p2_changed = {
+            let cur_p2_str = cur_p2_idx.map(|idx| self.panes[1].entries()[idx].text.as_str());
+            if self.last_p2_text.as_deref() != cur_p2_str {
+                self.last_p2_text = cur_p2_str.map(str::to_string);
+                true
+            } else {
+                false
+            }
         };
 
-        if self.pane3_cache_state.as_ref() != Some(&next_state) {
+        if p2_changed {
+            self.panes[2].clear_filter();
+        }
+
+        let cur_filter = self.panes[2].filter();
+        let cache_hit = self.pane3_cache_state.as_ref().is_some_and(|prev| {
+            prev.p1_entry_idx == cur_p1_idx
+                && prev.p2_entry_idx == cur_p2_idx
+                && prev.pane3_filter == cur_filter
+                && prev.subcmd_chain == self.cmd.subcmd_chain
+        });
+
+        if !cache_hit {
+            self.ensure_common_vars_cached();
+            let cur_p1 = cur_p1_idx.map(|idx| &self.panes[0].entries()[idx]);
+            let cur_p2 = cur_p2_idx.map(|idx| &self.panes[1].entries()[idx]);
+            let cache = SessionRuntimeCache {
+                dialect: self.dialect,
+                common_vars: self.cached_common_vars.as_deref().unwrap_or(&[]),
+                cwd_all: &self.cached_cwd_all,
+                cwd_dirs: &self.cached_cwd_dirs,
+                git_branches: &self.cached_git_branches,
+            };
             let entries = resolve_pane3_entries(
                 cur_p1,
                 cur_p2,
                 &self.cmd.subcmd_chain,
                 &mut self.introspector,
                 self.panes[2].filter(),
-                self.dialect,
-                &self.runtime_ctx,
+                &cache,
             );
             self.panes[2].set_entries(entries);
             self.panes[2].reset_cursor();
-            self.pane3_cache_state = Some(next_state);
+            self.pane3_cache_state = Some(Pane3CacheState {
+                p1_entry_idx: cur_p1_idx,
+                p2_entry_idx: cur_p2_idx,
+                pane3_filter: self.panes[2].filter().to_string(),
+                subcmd_chain: self.cmd.subcmd_chain.clone(),
+            });
         }
 
         if let Some(inline_rhs) = self.cmd.pending_inline_pane3_seed.take() {
@@ -3431,6 +3849,391 @@ mod tests {
                 KeyModifiers::NONE
             )),
             None
+        );
+    }
+
+    #[test]
+    fn test_pentest_pane3_custom_values_and_initial_buffer_across_dialects() {
+        let mut echo = Entry::new("echo", "echo", EntryKind::Cli, "Print");
+        echo.children = vec![Entry::new("--msg", "--msg", EntryKind::Param, "Message")];
+
+        let dialects = [
+            ShellDialect::PowerShell,
+            ShellDialect::Posix,
+            ShellDialect::Fish,
+        ];
+
+        for dialect in dialects {
+            let mut session = MillerSession::new(
+                vec![echo.clone()],
+                FakeIntrospector::empty(),
+                "",
+                Viewport::new(120, 30),
+                dialect,
+            );
+            session.apply(UserAction::StepRight);
+            session.apply(UserAction::StepRight);
+
+            let cases: [(&str, &str); 8] = [
+                ("$(id)", "echo --msg '$(id)'"),
+                ("`id`", "echo --msg '`id`'"),
+                (
+                    "'; evil; '",
+                    match dialect {
+                        ShellDialect::PowerShell => "echo --msg '''; evil; '''",
+                        ShellDialect::Posix => r"echo --msg ''\''; evil; '\'''",
+                        ShellDialect::Fish => r"echo --msg '\'; evil; \''",
+                    },
+                ),
+                (r#""$(evil)""#, r#"echo --msg '"$(evil)"'"#),
+                (
+                    r#""a\"; evil #""#,
+                    match dialect {
+                        ShellDialect::Fish => r#"echo --msg '"a\\"; evil #"'"#,
+                        _ => r#"echo --msg '"a\"; evil #"'"#,
+                    },
+                ),
+                ("$env:x; evil", "echo --msg '$env:x; evil'"),
+                ("; | & > <", "echo --msg '; | & > <'"),
+                ("(id)", "echo --msg '(id)'"),
+            ];
+
+            for (payload, expected_cmd) in cases {
+                session.apply(UserAction::ClearFilter);
+                for ch in payload.chars() {
+                    session.apply(UserAction::InsertChar(ch));
+                }
+                let cmd = session.command_line();
+                assert_eq!(cmd, expected_cmd, "dialect={dialect:?}, payload={payload}");
+            }
+
+            // Control, newline, NUL, and Bidi override chars injected via typing must be dropped.
+            session.apply(UserAction::ClearFilter);
+            for ch in "safe\n;\rid\0\x1b\u{202e}".chars() {
+                session.apply(UserAction::InsertChar(ch));
+            }
+            assert_eq!(session.command_line(), "echo --msg 'safe;id'");
+            assert!(
+                !session
+                    .command_line()
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{202e}'),
+                "control characters leaked into command line: {:?}",
+                session.command_line()
+            );
+
+            // Hostile `--initial` buffer with embedded CR/LF/NUL/ESC/Bidi must be sanitized.
+            let seeded = MillerSession::new(
+                vec![echo.clone()],
+                FakeIntrospector::empty(),
+                "echo --msg ok\n; id\r\n\0\x1b[31m\u{202e}",
+                Viewport::new(120, 30),
+                dialect,
+            );
+            let seeded_cmd = seeded.command_line();
+            assert!(
+                !seeded_cmd
+                    .chars()
+                    .any(|c| c.is_control() || c == '\u{202e}'),
+                "hostile initial buffer retained control characters: {seeded_cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_pentest_hostile_cwd_git_branch_and_env_var_selection_in_session() {
+        let ctx = RuntimeContext {
+            cwd_entries: vec![
+                crate::model::CwdEntry {
+                    name: "$(id)".to_string(),
+                    is_dir: false,
+                },
+                crate::model::CwdEntry {
+                    name: "`id`".to_string(),
+                    is_dir: false,
+                },
+                crate::model::CwdEntry {
+                    name: "'; evil; '".to_string(),
+                    is_dir: false,
+                },
+                crate::model::CwdEntry {
+                    name: r#""$(evil)""#.to_string(),
+                    is_dir: false,
+                },
+                crate::model::CwdEntry {
+                    name: "-rf; $(id)".to_string(),
+                    is_dir: false,
+                },
+                crate::model::CwdEntry {
+                    name: "bad\nfile".to_string(),
+                    is_dir: false,
+                },
+                crate::model::CwdEntry {
+                    name: "safe.txt".to_string(),
+                    is_dir: false,
+                },
+            ],
+            git_branches: vec![
+                "$(whoami)".to_string(),
+                "'; evil; '".to_string(),
+                "-leading".to_string(),
+                "bad\rbranch".to_string(),
+                "main".to_string(),
+            ],
+            ..RuntimeContext::default()
+        };
+
+        let mut var_root = Entry::scope_root("$", "Shell variables", EntryKind::Var, "");
+        var_root.children = vec![
+            Entry::new("$GIT_BRANCH", "GIT_BRANCH", EntryKind::Var, ""),
+            Entry::new("$x; evil", "bad3", EntryKind::Var, ""),
+            Entry::new("$x\nevil", "bad4", EntryKind::Var, ""),
+        ];
+
+        let cwd_root = Entry::scope_root("./", "Current directory", EntryKind::Subcmd, "");
+
+        let mut checkout = Entry::new("checkout", "checkout", EntryKind::Subcmd, "Checkout branch");
+        checkout.children = vec![Entry::new("-b", "-b", EntryKind::Param, "New branch")];
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git");
+        git.children = vec![checkout];
+
+        for dialect in [
+            ShellDialect::PowerShell,
+            ShellDialect::Posix,
+            ShellDialect::Fish,
+        ] {
+            let safe_env_name = if dialect == ShellDialect::PowerShell {
+                "$env:USER"
+            } else {
+                "$USER"
+            };
+            let mut env_root =
+                Entry::scope_root("$env:", "Environment variables", EntryKind::Env, "");
+            let mut safe_env = Entry::new(safe_env_name, "USER", EntryKind::Env, "");
+            safe_env.children = vec![
+                Entry::new("alice", "alice", EntryKind::Value, "Safe"),
+                Entry::new(r#""$(evil)""#, "hostile", EntryKind::Value, "Hostile"),
+            ];
+            env_root.children = vec![
+                safe_env,
+                Entry::new("$env:x; evil", "bad1", EntryKind::Env, ""),
+                Entry::new("$env:$(id)", "bad2", EntryKind::Env, ""),
+                Entry::new("$env:ProgramFiles(x86)", "pf", EntryKind::Env, ""),
+            ];
+
+            let mut session = MillerSession::new(
+                vec![env_root, var_root.clone(), cwd_root.clone(), git.clone()],
+                FakeIntrospector::empty(),
+                "",
+                Viewport::new(120, 30),
+                dialect,
+            )
+            .with_runtime_context(ctx.clone());
+
+            // 1. `$env:` scope drops hostile var names and sanitizes literal `"$(evil)"` child.
+            session.apply(UserAction::StepRight);
+            let env_texts: Vec<&str> = session.view().panes[1]
+                .entries()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect();
+            assert!(!env_texts.contains(&"$env:x; evil"));
+            assert!(!env_texts.contains(&"$env:$(id)"));
+            assert!(env_texts.contains(&safe_env_name));
+            if dialect == ShellDialect::PowerShell {
+                assert!(env_texts.contains(&"${env:ProgramFiles(x86)}"));
+            } else {
+                assert!(!env_texts.contains(&"$env:ProgramFiles(x86)"));
+            }
+
+            session.apply(UserAction::StepRight);
+            let env_vals: Vec<&str> = session.view().panes[2]
+                .entries()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect();
+            assert_eq!(env_vals, vec!["alice", "'$(evil)'"]);
+            session.apply(UserAction::MoveDown);
+            session.apply(UserAction::AcceptToken);
+            assert_eq!(session.command_line(), "'$(evil)'");
+
+            // 2. `$` variable scope drops hostile names while keeping `$GIT_BRANCH`.
+            session.apply(UserAction::StepLeft);
+            session.apply(UserAction::StepLeft);
+            session.apply(UserAction::MoveDown);
+            session.apply(UserAction::StepRight);
+            let var_texts: Vec<&str> = session.view().panes[1]
+                .entries()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect();
+            assert_eq!(var_texts, vec!["$GIT_BRANCH"]);
+
+            // 3. `./` CWD scope drops newline filenames, guards leading `-`, and quotes metacharacters.
+            session.apply(UserAction::StepLeft);
+            session.apply(UserAction::MoveDown);
+            session.apply(UserAction::StepRight);
+            let cwd_texts: Vec<&str> = session.view().panes[1]
+                .entries()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect();
+            assert_eq!(
+                cwd_texts,
+                vec![
+                    "'$(id)'",
+                    "'`id`'",
+                    match dialect {
+                        ShellDialect::PowerShell => "'''; evil; '''",
+                        ShellDialect::Posix => r"''\''; evil; '\'''",
+                        ShellDialect::Fish => r"'\'; evil; \''",
+                    },
+                    r#"'"$(evil)"'"#,
+                    "'./-rf; $(id)'",
+                    "safe.txt",
+                ]
+            );
+            session.apply(UserAction::AcceptToken);
+            assert_eq!(
+                session.apply(UserAction::Confirm),
+                SessionOutcome::Confirmed("'$(evil)' '$(id)'".to_string())
+            );
+
+            // 4. `git checkout` rejects leading `-` and `\r` branches and quotes hostile names.
+            let mut git_sess = MillerSession::new(
+                vec![git.clone()],
+                FakeIntrospector::empty(),
+                "",
+                Viewport::new(120, 30),
+                dialect,
+            )
+            .with_runtime_context(ctx.clone());
+            git_sess.apply(UserAction::StepRight);
+            git_sess.apply(UserAction::StepRight);
+            let branch_texts: Vec<&str> = git_sess.view().panes[2]
+                .entries()
+                .iter()
+                .filter(|e| e.kind == EntryKind::Arg)
+                .map(|e| e.text.as_str())
+                .collect();
+            assert_eq!(
+                branch_texts,
+                vec![
+                    "'$(whoami)'",
+                    match dialect {
+                        ShellDialect::PowerShell => "'''; evil; '''",
+                        ShellDialect::Posix => r"''\''; evil; '\'''",
+                        ShellDialect::Fish => r"'\'; evil; \''",
+                    },
+                    "main",
+                ]
+            );
+            assert_eq!(
+                git_sess.apply(UserAction::Confirm),
+                SessionOutcome::Confirmed("git checkout '$(whoami)'".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn test_perf_rapid_navigation_and_parameter_set_cache_stability() {
+        let mut catalog = Vec::with_capacity(5_000);
+        for cmd_idx in 0..5_000 {
+            let mut children = Vec::with_capacity(15);
+            children.push(
+                Entry::new("-Alpha", "-Alpha", EntryKind::Param, "Set A")
+                    .with_parameter_sets(vec!["SetA".to_string()]),
+            );
+            children.push(
+                Entry::new("-AlphaExtra", "-AlphaExtra", EntryKind::Flag, "Set A flag")
+                    .with_parameter_sets(vec!["SetA".to_string()]),
+            );
+            children.push(
+                Entry::new("-Beta", "-Beta", EntryKind::Param, "Set B")
+                    .with_parameter_sets(vec!["SetB".to_string()]),
+            );
+            children.push(Entry::new(
+                "-Verbose",
+                "-Verbose",
+                EntryKind::Flag,
+                "Common",
+            ));
+            for p_idx in 4..15 {
+                let name = format!("-Param{p_idx}");
+                children.push(
+                    Entry::new(name.clone(), name, EntryKind::Param, "Desc")
+                        .with_parameter_sets(vec!["SetA".to_string(), "SetB".to_string()]),
+                );
+            }
+            let cmd_name = format!("Invoke-Task{cmd_idx:04}");
+            let mut cmd = Entry::new(cmd_name.clone(), cmd_name, EntryKind::Cmdlet, "Task");
+            cmd.children = children;
+            catalog.push(cmd);
+        }
+
+        let ctx = RuntimeContext {
+            cwd_entries: (0..64)
+                .map(|i| crate::model::CwdEntry {
+                    name: format!("file_{i:02}.rs"),
+                    is_dir: false,
+                })
+                .collect(),
+            git_branches: (0..16).map(|i| format!("feature/{i:02}")).collect(),
+            ..RuntimeContext::default()
+        };
+
+        let mut session = MillerSession::new(
+            catalog,
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::PowerShell,
+        )
+        .with_runtime_context(ctx);
+
+        // Rapid Pane 1 navigation should keep runtime context cached and stay responsive.
+        for step in 1..=200 {
+            session.apply(UserAction::MoveDown);
+            let cmd = session.command_line();
+            assert_eq!(cmd, format!("Invoke-Task{step:04}"));
+        }
+
+        // Verify Parameter Set cache stability: committing universal `-Verbose` preserves all 15
+        // params; committing `-Alpha` narrows to SetA (`14` entries, excluding `-Beta`), and then
+        // accepting `-AlphaExtra` within the same SetA preserves the SetA view.
+        session.apply(UserAction::StepRight);
+        assert_eq!(session.view().panes[1].entries().len(), 15);
+        assert_eq!(session.view().active_param_set, None);
+
+        while session.view().panes[1]
+            .selected()
+            .is_some_and(|e| e.text != "-Verbose")
+        {
+            session.apply(UserAction::MoveDown);
+        }
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.view().panes[1].entries().len(), 15);
+        assert_eq!(session.view().active_param_set, None);
+
+        session.apply(UserAction::MoveHome);
+        session.apply(UserAction::StepRight); // Pane 3 of `-Alpha`
+        session.apply(UserAction::InsertChar('v'));
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.view().active_param_set, Some("SetA"));
+        let set_a_names: Vec<&str> = session.view().panes[1]
+            .entries()
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(set_a_names.len(), 14);
+        assert!(!set_a_names.contains(&"-Beta"));
+
+        session.apply(UserAction::MoveDown); // `-AlphaExtra` (Switch/Flag in SetA)
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.view().active_param_set, Some("SetA"));
+        assert_eq!(
+            session.command_line(),
+            "Invoke-Task0200 -Verbose -Alpha v -AlphaExtra"
         );
     }
 }
