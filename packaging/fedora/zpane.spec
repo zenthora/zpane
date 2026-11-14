@@ -1,5 +1,5 @@
 Name:           zpane
-Version:        0.3.0
+Version:        0.4.0
 Release:        1%{?dist}
 Summary:        3-pane Miller column command, subcommand, parameter & variable explorer
 License:        MIT
@@ -30,5 +30,8 @@ install -Dm0644 "%{_sourcedir}/LICENSE" "%{buildroot}%{_datadir}/licenses/zpane/
 %license %{_datadir}/licenses/zpane/LICENSE
 
 %changelog
+* Sat Nov 14 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.4.0-1
+- Release zpane 0.4.0 (multi-level subcommand sliding, shell init, cache freshness, inspector overlay)
+
 * Thu Nov 12 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.1.0-1
 - Initial release of zpane for Fedora / RHEL / openSUSE

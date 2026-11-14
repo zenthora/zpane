@@ -1,6 +1,6 @@
 # Maintainer: zenthora <105382125+zenthora@users.noreply.github.com>
 pkgname=zpane
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 pkgdesc="Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell and POSIX shells"
 arch=('x86_64' 'aarch64')

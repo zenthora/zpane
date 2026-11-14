@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-14
+
+### Features
+
+- Add multi-level subcommand sliding, shell init, cache freshness, and inspector overlay
+
+### Miscellaneous Tasks
+
+- *(skills)* Add project agent skills
+
 ## [0.3.0] - 2026-11-14
 
 ### Features
@@ -18,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous Tasks
 
 - *(cargo)* Restore .cargo/config.toml tracking
+- *(release)* Bump version to 0.3.0 and update CHANGELOG.md
 
 ## [0.2.0] - 2026-11-13
 
