@@ -12,10 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(discovery)* Harden spec, help, introspection cache, and shell catalog parsing
 - *(session)* Harden tokenization, subcommand sliding, parameter matching, and seeding
 - *(ui)* Harden Unicode rendering, CLI parsing, fuzzy scrolling, and init wrappers
+- *(scripts)* Add Python packaging fallback to package-linux.sh
 
 ### Miscellaneous Tasks
 
 - *(git)* Remove migrated .kilo skill
+- *(release)* Bump version to 0.4.1 and update CHANGELOG.md
 
 ## [0.4.0] - 2026-11-14
 
