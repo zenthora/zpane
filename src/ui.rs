@@ -1,6 +1,7 @@
 use crate::discovery::ShellDialect;
 use crate::fuzzy::PaneList;
 use crate::model::{Entry, EntryKind, Pane};
+use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 use unicode_width::UnicodeWidthChar;
 
@@ -112,29 +113,14 @@ pub(crate) fn is_disallowed_control(c: char) -> bool {
 
 #[inline]
 pub(crate) fn has_control_or_bidi(s: &str) -> bool {
-    if s.is_ascii() {
-        return s.bytes().any(|b| b < 0x20 || b == 0x7f);
-    }
     s.bytes()
         .any(|b| b < 0x20 || b == 0x7f || matches!(b, 0xc2 | 0xd8 | 0xe2))
-        && s.chars().any(is_disallowed_control)
+        && (s.is_ascii() || s.chars().any(is_disallowed_control))
 }
 
 #[inline]
 fn is_printable_ascii(s: &str) -> bool {
-    if !s.is_ascii() {
-        return false;
-    }
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b < 0x20 || b == 0x7f {
-            return false;
-        }
-        i += 1;
-    }
-    true
+    s.bytes().all(|b| (0x20..0x7f).contains(&b))
 }
 
 /// Returns `(byte_len, char_len)` when `rest` begins with a complete ANSI/ECMA-48
@@ -221,7 +207,9 @@ pub(crate) fn strip_escapes_and_controls_into(src: &str, dst: &mut String) {
     dst.reserve(src.len());
     let mut byte_idx = 0usize;
     while byte_idx < src.len() {
-        let ch = src[byte_idx..].chars().next().unwrap();
+        let Some(ch) = src[byte_idx..].chars().next() else {
+            break;
+        };
         if ch == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&ch) {
             if let Some((esc_bytes, _)) = next_escape_seq_len(&src[byte_idx..]) {
                 byte_idx += esc_bytes;
@@ -242,7 +230,9 @@ fn display_width_sanitized(s: &str) -> usize {
     let mut w = 0usize;
     let mut byte_idx = 0usize;
     while byte_idx < s.len() {
-        let ch = s[byte_idx..].chars().next().unwrap();
+        let Some(ch) = s[byte_idx..].chars().next() else {
+            break;
+        };
         if ch == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&ch) {
             if let Some((esc_bytes, _)) = next_escape_seq_len(&s[byte_idx..]) {
                 byte_idx += esc_bytes;
@@ -267,14 +257,26 @@ fn push_repeated_space(out: &mut String, mut count: usize) {
     }
 }
 
+const BAR_LINE: &str = "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────";
+const BAR_LINE_CHARS: usize = 128;
+
 #[inline]
 fn push_repeated_bar(out: &mut String, mut count: usize) {
-    const BARS: &str = "────────────────────────────────";
-    const BAR_CHARS: usize = 32;
     while count > 0 {
-        let chunk = count.min(BAR_CHARS);
-        out.push_str(&BARS[..chunk * 3]);
+        let chunk = count.min(BAR_LINE_CHARS);
+        out.push_str(&BAR_LINE[..chunk * 3]);
         count -= chunk;
+    }
+}
+
+#[inline]
+fn bar_cow(width: usize) -> Cow<'static, str> {
+    if width <= BAR_LINE_CHARS {
+        Cow::Borrowed(&BAR_LINE[..width * 3])
+    } else {
+        let mut s = String::with_capacity(width * 3);
+        push_repeated_bar(&mut s, width);
+        Cow::Owned(s)
     }
 }
 
@@ -343,7 +345,9 @@ fn push_sanitized_truncated(
     let mut byte_idx = 0usize;
     let mut char_idx = 0usize;
     while byte_idx < text.len() {
-        let raw_ch = text[byte_idx..].chars().next().unwrap();
+        let Some(raw_ch) = text[byte_idx..].chars().next() else {
+            break;
+        };
         if raw_ch == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&raw_ch) {
             if let Some((esc_bytes, esc_chars)) = next_escape_seq_len(&text[byte_idx..]) {
                 byte_idx += esc_bytes;
@@ -643,34 +647,63 @@ fn inspector_header(st: &RenderState<'_>) -> (String, String) {
     (info_title, info_desc)
 }
 
-fn split_unicode_lines(text: &str) -> Vec<&str> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    for (idx, ch) in text.char_indices() {
-        if matches!(ch, '\n' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
-            let slice = &text[start..idx];
-            out.push(if ch == '\n' {
-                slice.strip_suffix('\r').unwrap_or(slice)
-            } else {
-                slice
-            });
-            start = idx + ch.len_utf8();
+struct UnicodeLines<'a> {
+    rest: &'a str,
+}
+
+impl<'a> Iterator for UnicodeLines<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rest.is_empty() {
+            return None;
         }
+        let bytes = self.rest.as_bytes();
+        let len = bytes.len();
+        let mut i = 0usize;
+        while i < len {
+            match bytes[i] {
+                b'\n' => {
+                    let end = if i > 0 && bytes[i - 1] == b'\r' {
+                        i - 1
+                    } else {
+                        i
+                    };
+                    let line = &self.rest[..end];
+                    self.rest = &self.rest[i + 1..];
+                    return Some(line);
+                }
+                0xc2 if i + 1 < len && bytes[i + 1] == 0x85 => {
+                    let line = &self.rest[..i];
+                    self.rest = &self.rest[i + 2..];
+                    return Some(line);
+                }
+                0xe2 if i + 2 < len
+                    && bytes[i + 1] == 0x80
+                    && matches!(bytes[i + 2], 0xa8 | 0xa9) =>
+                {
+                    let line = &self.rest[..i];
+                    self.rest = &self.rest[i + 3..];
+                    return Some(line);
+                }
+                _ => i += 1,
+            }
+        }
+        let tail = self.rest;
+        self.rest = "";
+        Some(tail)
     }
-    if start < text.len() {
-        out.push(&text[start..]);
-    }
-    out
+}
+
+fn split_unicode_lines(text: &str) -> UnicodeLines<'_> {
+    UnicodeLines { rest: text }
 }
 
 fn wrap_display_lines_bounded(text: &str, max_width: usize, max_lines: usize) -> Vec<String> {
     if max_width == 0 || max_lines == 0 {
         return Vec::new();
     }
-    let mut lines = Vec::new();
+    let mut lines = Vec::with_capacity(max_lines.min(16));
     let mut clean_line = String::new();
     for raw_line in split_unicode_lines(text) {
         if lines.len() >= max_lines {
@@ -749,7 +782,7 @@ fn wrap_display_lines(text: &str, max_width: usize) -> Vec<String> {
 }
 
 fn push_inspector_field(
-    rows: &mut Vec<(&'static str, String)>,
+    rows: &mut Vec<(&'static str, Cow<'static, str>)>,
     color: &'static str,
     raw: &str,
     w3: usize,
@@ -761,11 +794,11 @@ fn push_inspector_field(
     }
     let single_w = 1 + display_width_sanitized(raw);
     if single_w <= w3 {
-        rows.push((color, format!(" {raw}")));
+        rows.push((color, Cow::Owned(format!(" {raw}"))));
     } else {
         let rem = max_rows - rows.len();
         for line in wrap_display_lines_bounded(raw, wrap_w, rem) {
-            rows.push((color, format!(" {line}")));
+            rows.push((color, Cow::Owned(format!(" {line}"))));
         }
     }
 }
@@ -774,7 +807,7 @@ fn build_expanded_inspector_rows(
     entry: Option<&Entry>,
     w3: usize,
     max_rows: usize,
-) -> Vec<(&'static str, String)> {
+) -> Vec<(&'static str, Cow<'static, str>)> {
     let mut rows = Vec::new();
     if max_rows == 0 {
         return rows;
@@ -785,7 +818,7 @@ fn build_expanded_inspector_rows(
         } else {
             " ℹ No selection"
         };
-        rows.push((C_HEADER_ACT, msg.to_string()));
+        rows.push((C_HEADER_ACT, Cow::Borrowed(msg)));
         return rows;
     };
 
@@ -795,7 +828,7 @@ fn build_expanded_inspector_rows(
     } else {
         format!(" ℹ {} {}", it.label, it.kind.badge())
     };
-    rows.push((C_HEADER_ACT, hdr));
+    rows.push((C_HEADER_ACT, Cow::Owned(hdr)));
 
     let wrap_w = w3.saturating_sub(2).max(1);
     let tok_val = if it.text.is_empty() {
@@ -817,7 +850,7 @@ fn build_expanded_inspector_rows(
         let single_raw = format!("Token: {tok_val}  Aliases: {aliases}");
         if display_width_sanitized(&single_raw) < w3 {
             if rows.len() < max_rows {
-                rows.push((C_FILTER, format!(" {single_raw}")));
+                rows.push((C_FILTER, Cow::Owned(format!(" {single_raw}"))));
             }
         } else {
             push_inspector_field(
@@ -846,34 +879,44 @@ fn build_expanded_inspector_rows(
     };
     push_inspector_field(&mut rows, C_DIM, &sets_raw, w3, wrap_w, max_rows);
     if rows.len() < max_rows {
-        rows.push((C_BORDER_DIM, "─".repeat(w3)));
+        rows.push((C_BORDER_DIM, bar_cow(w3)));
     }
 
     if rows.len() < max_rows {
         let rem = max_rows - rows.len();
         for line in wrap_display_lines_bounded(&it.desc, wrap_w, rem) {
-            rows.push((C_TEXT, format!(" {line}")));
+            rows.push((C_TEXT, Cow::Owned(format!(" {line}"))));
         }
     }
 
     if rows.len() < max_rows && !it.children.is_empty() {
-        let all_children: Vec<&str> = it
-            .children
-            .iter()
-            .filter(|c| !c.is_placeholder() && !c.text.is_empty())
-            .map(|c| c.text.as_str())
-            .collect();
-        if !all_children.is_empty() {
-            rows.push((C_BORDER_DIM, "─".repeat(w3)));
+        let mut shown = [""; 8];
+        let mut total_children = 0usize;
+        for c in &it.children {
+            if !c.is_placeholder() && !c.text.is_empty() {
+                if total_children < 8 {
+                    shown[total_children] = c.text.as_str();
+                }
+                total_children += 1;
+            }
+        }
+        if total_children > 0 {
+            rows.push((C_BORDER_DIM, bar_cow(w3)));
             if rows.len() < max_rows {
-                let shown = all_children.len().min(8);
-                let mut summary = format!("Children: {}", all_children[..shown].join(", "));
-                if all_children.len() > shown {
-                    let _ = write!(summary, ", … (+{} more)", all_children.len() - shown);
+                let shown_count = total_children.min(8);
+                let mut summary = String::from("Children: ");
+                for (i, child_text) in shown[..shown_count].iter().enumerate() {
+                    if i > 0 {
+                        summary.push_str(", ");
+                    }
+                    summary.push_str(child_text);
+                }
+                if total_children > shown_count {
+                    let _ = write!(summary, ", … (+{} more)", total_children - shown_count);
                 }
                 let rem = max_rows - rows.len();
                 for line in wrap_display_lines_bounded(&summary, wrap_w, rem) {
-                    rows.push((C_DIM, format!(" {line}")));
+                    rows.push((C_DIM, Cow::Owned(format!(" {line}"))));
                 }
             }
         }
@@ -1657,5 +1700,274 @@ mod tests {
         for line in plain.lines() {
             assert_eq!(UnicodeWidthStr::width(line), 80);
         }
+    }
+
+    #[test]
+    fn test_unicode_lines_iterator_and_bar_cow_preserve_boundaries() {
+        assert_eq!(BAR_LINE.chars().count(), BAR_LINE_CHARS);
+        assert_eq!(BAR_LINE.len(), BAR_LINE_CHARS * 3);
+        assert!(matches!(bar_cow(0), Cow::Borrowed("")));
+        let small = bar_cow(5);
+        assert!(matches!(small, Cow::Borrowed(_)));
+        assert_eq!(small.as_ref(), "─────");
+        let max_static = bar_cow(BAR_LINE_CHARS);
+        assert!(matches!(max_static, Cow::Borrowed(_)));
+        assert_eq!(max_static.chars().count(), BAR_LINE_CHARS);
+        let wide = bar_cow(BAR_LINE_CHARS + 22);
+        assert!(matches!(wide, Cow::Owned(_)));
+        assert_eq!(wide.chars().count(), BAR_LINE_CHARS + 22);
+
+        let empty: Vec<&str> = split_unicode_lines("").collect();
+        assert!(empty.is_empty());
+
+        let trailing: Vec<&str> = split_unicode_lines("a\r\nb\nc\n").collect();
+        assert_eq!(trailing, vec!["a", "b", "c"]);
+
+        let leading: Vec<&str> = split_unicode_lines("\n\r\n").collect();
+        assert_eq!(leading, vec!["", ""]);
+
+        let unicode_seps: Vec<&str> = split_unicode_lines("a\u{0085}b\u{2028}c\u{2029}d").collect();
+        assert_eq!(unicode_seps, vec!["a", "b", "c", "d"]);
+
+        let cr_before_nel: Vec<&str> = split_unicode_lines("a\r\u{0085}b").collect();
+        assert_eq!(cr_before_nel, vec!["a\r", "b"]);
+
+        let cjk: Vec<&str> = split_unicode_lines("中文\n日本語\r\n").collect();
+        assert_eq!(cjk, vec!["中文", "日本語"]);
+    }
+
+    #[test]
+    fn test_pentest_ecma48_bidi_wide_chars_and_edge_widths() {
+        let mut clean = String::new();
+        // 7-bit SOS, PM, APC, DCS and 8-bit C1 control strings must all be stripped cleanly.
+        let hostile_ctrl_strings = concat!(
+            "\x1bXsecret_sos\x1b\\",
+            "\x1b^secret_pm\x1b\\",
+            "\x1b_secret_apc\x1b\\",
+            "\x1bP1$rsecret_dcs\x1b\\",
+            "\u{0098}c1_sos\u{009c}",
+            "\u{009e}c1_pm\x1b\\",
+            "\u{009f}c1_apc\u{009c}",
+            "\u{0090}c1_dcs\u{009c}",
+            "safe",
+            "\u{061c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}",
+            "\u{0085}\u{2028}\u{2029}",
+            "text"
+        );
+        strip_escapes_and_controls_into(hostile_ctrl_strings, &mut clean);
+        assert_eq!(clean, "safe   text");
+        for hidden in [
+            "secret_sos",
+            "secret_pm",
+            "secret_apc",
+            "secret_dcs",
+            "c1_sos",
+            "c1_pm",
+            "c1_apc",
+            "c1_dcs",
+        ] {
+            assert!(!clean.contains(hidden), "leaked control payload {hidden}");
+        }
+
+        // Oversized (> MAX_STR_SCAN) OSC payload must stop scanning cleanly without DoS or panic.
+        let oversized_osc = format!("\x1b]52;c;{}\x07after", "A".repeat(5000));
+        strip_escapes_and_controls_into(&oversized_osc, &mut clean);
+        assert!(!clean.contains('\x1b'));
+        assert!(!clean.contains('\x07'));
+
+        // Edge widths on wide CJK, combining marks, and cells must never panic or exceed width.
+        let wide_entry = Entry::new(
+            "中文cmd",
+            "中文コマンド",
+            EntryKind::Cmdlet,
+            "e\u{0301}説明",
+        )
+        .with_aliases(vec!["alias1".to_string()])
+        .with_parameter_sets(vec!["SetOne".to_string()]);
+        let mut cell_buf = String::new();
+        for w in [0usize, 1, 2, 3, 12] {
+            cell_buf.clear();
+            push_padded_text(&mut cell_buf, "中文a", w);
+            assert_eq!(UnicodeWidthStr::width(cell_buf.as_str()), w);
+
+            cell_buf.clear();
+            push_miller_cell(&mut cell_buf, &wide_entry, &[0, 2], w, true, true);
+            let plain_cell = strip_ansi(&cell_buf);
+            assert_eq!(UnicodeWidthStr::width(plain_cell.as_str()), w);
+        }
+
+        // Degenerate inspector bounds and extra-wide viewport (> 128-char bar_cow owned path).
+        let mut many_children_entry = Entry::new(
+            "Get-Item",
+            "Get-Item\x1b_apc_payload\x1b\\\u{202e}",
+            EntryKind::Cmdlet,
+            "日本語の説明文。\n\nSecond\u{2028}line\u{0085}here.",
+        )
+        .with_aliases(vec!["gi".to_string()]);
+        many_children_entry.children = (0..15)
+            .map(|i| {
+                Entry::new(
+                    format!("child{i}"),
+                    format!("child{i}"),
+                    EntryKind::Param,
+                    "",
+                )
+            })
+            .collect();
+
+        for w3 in [0usize, 1, 2, 200] {
+            for max_rows in [0usize, 1, 2, 20] {
+                let rows = build_expanded_inspector_rows(Some(&many_children_entry), w3, max_rows);
+                assert!(rows.len() <= max_rows);
+            }
+        }
+
+        let pane1 = PaneList::new(vec![many_children_entry]);
+        let empty = PaneList::default();
+        for (vp, expect_exact_width) in [
+            (Viewport::new(0, 0), false),
+            (Viewport::new(1, 1), false),
+            (
+                Viewport::new(Viewport::MIN_WIDTH, Viewport::MIN_HEIGHT),
+                true,
+            ),
+            (Viewport::new(280, 24), true),
+        ] {
+            for expanded in [false, true] {
+                let raw = render_frame(&RenderState {
+                    viewport: vp,
+                    active_pane: Pane::First,
+                    panes: [&pane1, &empty, &empty],
+                    command_line: "Get-Item \u{202e}--evil\x1bPbad\x1b\\".to_string(),
+                    active_param_set: Some("Default\x1b^pm\x1b\\"),
+                    dialect: ShellDialect::PowerShell,
+                    inspector_expanded: expanded,
+                });
+                assert!(!raw.contains("apc_payload"));
+                assert!(!raw.contains("\x1bPbad"));
+                assert!(!raw.contains("\x1b^pm"));
+                assert!(!raw.chars().any(is_bidi_control));
+                if expect_exact_width {
+                    let plain = strip_ansi(&raw);
+                    let lines: Vec<&str> = plain.lines().collect();
+                    assert_eq!(lines.len(), vp.height);
+                    for line in lines {
+                        assert_eq!(UnicodeWidthStr::width(line), vp.width);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_perf_render_frame_and_inspector_throughput() {
+        let mut p1_entries: Vec<Entry> = (0..2000)
+            .map(|i| {
+                Entry::new(
+                    format!("Get-CmdletItem{i:04}"),
+                    format!("Get-CmdletItem{i:04}"),
+                    EntryKind::Cmdlet,
+                    "Synthetic Command Catalog entry for frame rendering throughput benchmark.",
+                )
+            })
+            .collect();
+        p1_entries[123] = Entry::new(
+            "Get-Process",
+            "Get-Process",
+            EntryKind::Cmdlet,
+            "Gets the processes that are running on the local computer.",
+        );
+        let mut pane1 = PaneList::new(p1_entries);
+        pane1.push_filter_char('g');
+        pane1.push_filter_char('p');
+
+        let mut p2_entries: Vec<Entry> = (0..200)
+            .map(|i| {
+                let mut e = Entry::new(
+                    format!("-ParameterName{i:03}"),
+                    format!("-ParameterName{i:03} (-P{i})"),
+                    EntryKind::Param,
+                    "Specifies a target configuration parameter.\n\nSupports multiple Parameter Sets and pipeline input.",
+                )
+                .with_aliases(vec![format!("P{i}"), format!("Alt{i}")])
+                .with_parameter_sets(vec!["DefaultSet".to_string(), "ExtendedSet".to_string()]);
+                e.children = (0..12)
+                    .map(|j| Entry::new(format!("val{j}"), format!("val{j}"), EntryKind::Value, ""))
+                    .collect();
+                e
+            })
+            .collect();
+        p2_entries.insert(
+            0,
+            Entry::new(
+                "-Name",
+                "-Name (-ProcessName)",
+                EntryKind::Param,
+                "Specifies one or more processes by process name.\n\nWildcard characters are permitted across local sessions.",
+            )
+            .with_aliases(vec!["ProcessName".to_string(), "PN".to_string()])
+            .with_parameter_sets(vec!["Name".to_string(), "NameWithUserName".to_string()]),
+        );
+        let mut pane2 = PaneList::new(p2_entries);
+        pane2.push_filter_char('n');
+
+        let pane3 = PaneList::new(
+            (0..50)
+                .map(|i| {
+                    Entry::new(
+                        format!("value-{i}"),
+                        format!("value-{i}"),
+                        EntryKind::Value,
+                        "Sample value",
+                    )
+                })
+                .collect(),
+        );
+
+        let vp = Viewport::new(120, 34);
+        const NORMAL_FRAMES: usize = 400;
+        const EXPANDED_FRAMES: usize = 400;
+        let total_frames = NORMAL_FRAMES + EXPANDED_FRAMES;
+
+        let start = std::time::Instant::now();
+        let mut total_bytes = 0usize;
+
+        for expanded in [false, true] {
+            let count = if expanded {
+                EXPANDED_FRAMES
+            } else {
+                NORMAL_FRAMES
+            };
+            let st = RenderState {
+                viewport: vp,
+                active_pane: Pane::Second,
+                panes: [&pane1, &pane2, &pane3],
+                command_line: "Get-Process -Name explorer".to_string(),
+                active_param_set: Some("Name"),
+                dialect: ShellDialect::PowerShell,
+                inspector_expanded: expanded,
+            };
+            for i in 0..count {
+                let frame = render_frame(std::hint::black_box(&st));
+                total_bytes += std::hint::black_box(frame.len());
+                if i == 0 {
+                    assert_eq!(frame.lines().count(), vp.height);
+                }
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        let fps = (total_frames as f64) / secs;
+        let us_per_frame = (secs * 1_000_000.0) / (total_frames as f64);
+        println!(
+            "test_perf_render_frame_and_inspector_throughput: {total_frames} frames ({total_bytes} bytes) in {:.2} ms ({fps:.0} frames/s, {us_per_frame:.1} us/frame)",
+            secs * 1000.0
+        );
+        assert!(total_bytes > 0);
+        assert!(
+            secs < 10.0,
+            "render_frame throughput regressed severely: {secs:.2}s for {total_frames} frames"
+        );
     }
 }

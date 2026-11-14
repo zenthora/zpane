@@ -165,6 +165,10 @@ impl PaneList {
             None => &q_chars_buf[..q_len],
         };
 
+        self.filtered.reserve(self.entries.len().min(4096));
+        self.positions_arena
+            .reserve(self.entries.len().saturating_mul(q_len.min(16)).min(65_536));
+
         let mut desc_scratch = String::new();
         for (idx, entry) in self.entries.iter().enumerate() {
             if let Some((score, pos_start, pos_len)) = fuzzy_match_precomputed(
@@ -203,6 +207,14 @@ impl PaneList {
             Some(ref vec) => vec.as_slice(),
             None => &q_chars_buf[..q_len],
         };
+
+        self.filtered_scratch.reserve(self.filtered.len());
+        self.positions_arena.reserve(
+            self.filtered
+                .len()
+                .saturating_mul(q_len.min(16))
+                .min(65_536),
+        );
 
         let mut desc_scratch = String::new();
         for prev in &self.filtered {
@@ -479,75 +491,98 @@ fn fuzzy_match_precomputed(
             let mut q_idx = 0usize;
             let mut target_lower = q_bytes[0];
             let mut target_upper = target_lower.to_ascii_uppercase();
-            let mut score: i32 = 0;
-            let mut prev_match_idx: Option<usize> = None;
-            let first_byte = l_bytes[0];
-            let mut ascii_clean = true;
-            let mut i = 0usize;
+            let first_match = if target_lower == target_upper {
+                l_bytes.iter().position(|&b| b == target_lower)
+            } else {
+                l_bytes
+                    .iter()
+                    .position(|&b| b == target_lower || b == target_upper)
+            };
 
-            while i < label_len {
-                let cur_byte = l_bytes[i];
-                if cur_byte < 0x20 || cur_byte == 0x7f {
-                    ascii_clean = false;
-                    positions_arena.truncate(pos_start);
-                    break;
-                }
-                if cur_byte == target_lower || cur_byte == target_upper {
-                    positions_arena.push(i);
+            if let Some(first_pos) = first_match {
+                if !l_bytes[..first_pos].iter().any(|&b| b < 0x20 || b == 0x7f) {
+                    if label_len - first_pos < q_len {
+                        ran_clean_ascii = true;
+                    } else {
+                        let mut score: i32 = 0;
+                        let mut prev_match_idx: Option<usize> = None;
+                        let first_byte = l_bytes[0];
+                        let mut ascii_clean = true;
+                        let mut i = first_pos;
 
-                    score += 10;
-                    if i == 0 {
-                        score += 45;
-                    } else if i == 1 && (first_byte == b'-' || first_byte == b'$') {
-                        score += 42;
-                    }
-
-                    if let Some(prev) = prev_match_idx {
-                        if i == prev + 1 {
-                            score += 28;
-                        } else {
-                            let gap = (i - prev - 1) as i32;
-                            score -= gap.min(12);
-                        }
-                    }
-
-                    if i > 0 {
-                        let prev = l_bytes[i - 1];
-                        if matches!(prev, b'-' | b'_' | b':' | b'.' | b' ' | b'/' | b'\\' | b'$') {
-                            score += 32;
-                        } else if prev.is_ascii_lowercase() && cur_byte.is_ascii_uppercase() {
-                            score += 30;
-                        }
-                    }
-
-                    prev_match_idx = Some(i);
-                    q_idx += 1;
-                    if q_idx == q_len {
-                        let mut j = i + 1;
-                        while j < label_len {
-                            let b = l_bytes[j];
-                            if b < 0x20 || b == 0x7f {
+                        while i < label_len {
+                            let cur_byte = l_bytes[i];
+                            if cur_byte < 0x20 || cur_byte == 0x7f {
                                 ascii_clean = false;
                                 positions_arena.truncate(pos_start);
                                 break;
                             }
-                            j += 1;
-                        }
-                        if ascii_clean {
-                            score += (40_i32.saturating_sub(label_len as i32)).max(0);
-                            return Some((score, pos_start, q_len));
-                        }
-                        break;
-                    }
-                    target_lower = q_bytes[q_idx];
-                    target_upper = target_lower.to_ascii_uppercase();
-                }
-                i += 1;
-            }
+                            if cur_byte == target_lower || cur_byte == target_upper {
+                                positions_arena.push(i);
 
-            if ascii_clean {
+                                score += 10;
+                                if i == 0 {
+                                    score += 45;
+                                } else if i == 1 && (first_byte == b'-' || first_byte == b'$') {
+                                    score += 42;
+                                }
+
+                                if let Some(prev) = prev_match_idx {
+                                    if i == prev + 1 {
+                                        score += 28;
+                                    } else {
+                                        let gap = (i - prev - 1) as i32;
+                                        score -= gap.min(12);
+                                    }
+                                }
+
+                                if i > 0 {
+                                    let prev = l_bytes[i - 1];
+                                    if matches!(
+                                        prev,
+                                        b'-' | b'_' | b':' | b'.' | b' ' | b'/' | b'\\' | b'$'
+                                    ) {
+                                        score += 32;
+                                    } else if prev.is_ascii_lowercase()
+                                        && cur_byte.is_ascii_uppercase()
+                                    {
+                                        score += 30;
+                                    }
+                                }
+
+                                prev_match_idx = Some(i);
+                                q_idx += 1;
+                                if q_idx == q_len {
+                                    let mut j = i + 1;
+                                    while j < label_len {
+                                        let b = l_bytes[j];
+                                        if b < 0x20 || b == 0x7f {
+                                            ascii_clean = false;
+                                            positions_arena.truncate(pos_start);
+                                            break;
+                                        }
+                                        j += 1;
+                                    }
+                                    if ascii_clean {
+                                        score += (40_i32.saturating_sub(label_len as i32)).max(0);
+                                        return Some((score, pos_start, q_len));
+                                    }
+                                    break;
+                                }
+                                target_lower = q_bytes[q_idx];
+                                target_upper = target_lower.to_ascii_uppercase();
+                            }
+                            i += 1;
+                        }
+
+                        if ascii_clean {
+                            ran_clean_ascii = true;
+                            positions_arena.truncate(pos_start);
+                        }
+                    }
+                }
+            } else if target_lower != b' ' {
                 ran_clean_ascii = true;
-                positions_arena.truncate(pos_start);
             }
         } else {
             ran_clean_ascii = true;
@@ -567,7 +602,9 @@ fn fuzzy_match_precomputed(
         let mut raw_char_idx = 0usize;
 
         while byte_idx < label.len() {
-            let raw_ch = label[byte_idx..].chars().next().unwrap();
+            let Some(raw_ch) = label[byte_idx..].chars().next() else {
+                break;
+            };
             if has_ctrl && (raw_ch == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&raw_ch)) {
                 if let Some((esc_bytes, esc_chars)) =
                     crate::ui::next_escape_seq_len(&label[byte_idx..])
@@ -903,5 +940,161 @@ mod tests {
             assert_eq!(a_entry.text, b_entry.text);
             assert_eq!(a_pos, b_pos);
         }
+    }
+
+    #[test]
+    fn test_pentest_fuzzy_fast_ascii_precheck_preserves_escape_and_control_fallback() {
+        let entries = vec![
+            Entry::new(
+                "osc-prefix",
+                "\x1b]52;c;abc\x07xyz",
+                EntryKind::Cli,
+                "Desc with \x1b]0;secret_desc\x07visible_note",
+            ),
+            Entry::new("csi-mid", "pre\x1b[31mfix", EntryKind::Cli, ""),
+            Entry::new("csi-tail", "git\x1b[31m", EntryKind::Cli, ""),
+            Entry::new("ctrl-nul", "m\x00n\x7fp", EntryKind::Cli, ""),
+            Entry::new(
+                "short-tail",
+                "zzza",
+                EntryKind::Cli,
+                "Fallback match target",
+            ),
+            Entry::new(
+                "bidi-unicode",
+                "\u{202e}café\u{2069}",
+                EntryKind::Arg,
+                "Bistro",
+            ),
+        ];
+
+        // Hidden escape bytes inside OSC/CSI payloads must not match even if ASCII bytes exist.
+        let mut pane = PaneList::new(entries.clone());
+        for hidden in ["abc", "31m", "secret_desc"] {
+            for ch in hidden.chars() {
+                pane.push_filter_char(ch);
+            }
+            assert_eq!(pane.visible_len(), 0, "hidden payload {hidden:?} matched");
+            pane.clear_filter();
+        }
+
+        // Visible text after OSC/CSI must still match with exact raw character positions.
+        for ch in "xyz".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        let (entry, pos) = pane.row_at(0).unwrap();
+        assert_eq!(entry.text, "osc-prefix");
+        assert_eq!(pos, &[11, 12, 13]);
+        pane.clear_filter();
+
+        for ch in "prefix".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        let (entry, pos) = pane.row_at(0).unwrap();
+        assert_eq!(entry.text, "csi-mid");
+        assert_eq!(pos, &[0, 1, 2, 8, 9, 10]);
+        pane.clear_filter();
+
+        // Trailing CSI must not inflate label length penalty vs clean "git".
+        let mut clean_vs_csi = PaneList::new(vec![
+            Entry::new("csi-git", "git\x1b[31m", EntryKind::Cli, ""),
+            Entry::new("clean-git", "git", EntryKind::Cli, ""),
+        ]);
+        for ch in "git".chars() {
+            clean_vs_csi.push_filter_char(ch);
+        }
+        assert_eq!(clean_vs_csi.visible_len(), 2);
+        // Same score -> tie-break preserves original index 0 ("csi-git") before 1 ("clean-git")
+        assert_eq!(clean_vs_csi.row_at(0).unwrap().0.text, "csi-git");
+        assert_eq!(clean_vs_csi.row_at(0).unwrap().1, &[0, 1, 2]);
+
+        // Control chars between ASCII characters fall back cleanly and track raw char positions.
+        for ch in "mnp".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        let (entry, pos) = pane.row_at(0).unwrap();
+        assert_eq!(entry.text, "ctrl-nul");
+        assert_eq!(pos, &[0, 2, 4]);
+        pane.clear_filter();
+
+        // Suffix shorter than query after first_pos ("zzza" vs "ab") skips label and matches desc.
+        for ch in "fallback".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        assert_eq!(pane.row_at(0).unwrap().0.text, "short-tail");
+        pane.clear_filter();
+
+        // BiDi controls around Unicode text must be ignored while case-folding still matches.
+        for ch in "CAFÉ".chars() {
+            pane.push_filter_char(ch);
+        }
+        assert_eq!(pane.visible_len(), 1);
+        let (entry, pos) = pane.row_at(0).unwrap();
+        assert_eq!(entry.text, "bidi-unicode");
+        assert_eq!(pos, &[1, 2, 3, 4]);
+        pane.clear_filter();
+
+        // Oversized (> 64 char) query exercises collect_query_chars overflow and arena cap safely.
+        for _ in 0..80 {
+            pane.push_filter_char('z');
+        }
+        assert_eq!(pane.visible_len(), 0);
+    }
+
+    #[test]
+    fn test_perf_fuzzy_pane_filtering_throughput() {
+        let mut entries: Vec<Entry> = (0..5000)
+            .map(|i| {
+                Entry::new(
+                    format!("Get-SyntheticResourceItem{i:04}"),
+                    format!("Get-SyntheticResourceItem{i:04}"),
+                    EntryKind::Cmdlet,
+                    "Synthetic Command Catalog provider entry",
+                )
+            })
+            .collect();
+        entries[4321] = Entry::new(
+            "Get-ItemProperty",
+            "Get-ItemProperty",
+            EntryKind::Cmdlet,
+            "Gets the properties of a specified item.",
+        );
+
+        let mut pane = PaneList::new(entries);
+        const CYCLES: usize = 20;
+        let start = std::time::Instant::now();
+        let mut matched_total = 0usize;
+
+        for _ in 0..CYCLES {
+            for ch in ['g', 'e', 't', '-', 'i', 't'] {
+                pane.push_filter_char(ch);
+            }
+            matched_total += std::hint::black_box(pane.visible_len());
+            assert!(pane.pop_filter_char());
+            matched_total += std::hint::black_box(pane.visible_len());
+            pane.clear_filter();
+
+            // Negative ASCII pre-check path across all 5000 entries
+            pane.push_filter_char('z');
+            assert_eq!(pane.visible_len(), 0);
+            pane.clear_filter();
+        }
+
+        let elapsed = start.elapsed();
+        let secs = elapsed.as_secs_f64().max(1e-9);
+        println!(
+            "test_perf_fuzzy_pane_filtering_throughput: {CYCLES} cycles over 5000 entries in {:.2} ms ({:.1} cycles/s, matched_total={matched_total})",
+            secs * 1000.0,
+            (CYCLES as f64) / secs
+        );
+        assert_eq!(matched_total, CYCLES * (5000 + 5000));
+        assert!(
+            secs < 10.0,
+            "PaneList filtering throughput regressed severely: {secs:.2}s"
+        );
     }
 }
