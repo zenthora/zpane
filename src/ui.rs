@@ -18,16 +18,18 @@ const RST: &str = "\x1b[0m";
 
 fn kind_color(kind: EntryKind) -> &'static str {
     match kind {
+        EntryKind::History => "\x1b[38;5;221m", // Warm gold
+        EntryKind::Path => "\x1b[38;5;116m",    // Soft teal
         EntryKind::Env | EntryKind::Var => "\x1b[38;5;216m", // Peach
-        EntryKind::Cli => "\x1b[38;5;114m",                  // Green
+        EntryKind::Cli => "\x1b[38;5;114m",     // Green
         EntryKind::Func | EntryKind::Alias => "\x1b[38;5;81m", // Cyan
-        EntryKind::Cmdlet => "\x1b[38;5;75m",                // Blue
-        EntryKind::Subcmd => "\x1b[38;5;141m",               // Purple
-        EntryKind::Flag => "\x1b[38;5;183m",                 // Lavender
-        EntryKind::Param => "\x1b[38;5;223m",                // Soft yellow
+        EntryKind::Cmdlet => "\x1b[38;5;75m",   // Blue
+        EntryKind::Subcmd => "\x1b[38;5;141m",  // Purple
+        EntryKind::Flag => "\x1b[38;5;183m",    // Lavender
+        EntryKind::Param => "\x1b[38;5;223m",   // Soft yellow
         EntryKind::Enum | EntryKind::Value => "\x1b[38;5;150m", // Mint green
-        EntryKind::Arg => "\x1b[38;5;250m",                  // Light gray
-        EntryKind::Loading => "\x1b[38;5;244m",              // Dim gray
+        EntryKind::Arg => "\x1b[38;5;250m",     // Light gray
+        EntryKind::Loading => "\x1b[38;5;244m", // Dim gray
     }
 }
 

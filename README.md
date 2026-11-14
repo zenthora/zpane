@@ -116,8 +116,18 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
 
     $tmp = [System.IO.Path]::GetTempFileName()
+    $ctxFile = [System.IO.Path]::GetTempFileName()
     try {
-        zpane --initial "$line" --out-file "$tmp"
+        $histPath = (Get-PSReadLineOption).HistorySavePath
+        $recent = @()
+        if ($histPath -and (Test-Path $histPath)) {
+            $recent = Get-Content -Path $histPath -Tail 15 -ErrorAction SilentlyContinue
+            [array]::Reverse($recent)
+        }
+        $ctxPayload = @{ history = @($recent) } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($ctxFile, $ctxPayload, [System.Text.UTF8Encoding]::new($false))
+
+        zpane --initial "$line" --context-file "$ctxFile" --out-file "$tmp"
         if (Test-Path $tmp) {
             $accepted = (Get-Content -Path $tmp -Raw -ErrorAction SilentlyContinue)
             if ($accepted) {
@@ -126,10 +136,15 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
             }
         }
     } finally {
-        Remove-Item -Path $tmp -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $tmp, $ctxFile -Force -ErrorAction SilentlyContinue
     }
 }
 ```
+
+### Declarative Specs & Carapace Bridge
+
+- Drop custom `carapace-spec` (`.yaml`/`.yml`/`.json`) or simplified Fig (`.json`) specs into `%LOCALAPPDATA%\zpane\specs\` (Windows) or `$XDG_CACHE_HOME/zpane/specs` / `~/.cache/zpane/specs` (Unix).
+- If [`carapace`](https://carapace.sh/) is installed on `PATH`, `zpane` queries `carapace <cmd> export` automatically whenever `--help`/`-h` parsing yields no entries.
 
 ### Zsh (`~/.zshrc`)
 
@@ -208,17 +223,21 @@ zpane - 3-pane Miller column command, parameter & variable explorer
 Usage: zpane [OPTIONS] [INITIAL_TOKENS]...
 
 Options:
-      --initial <TEXT>   Seed the command builder with an existing command buffer
-      --out-file <PATH>  Write the accepted command to <PATH> instead of stdout
-      --width <COLS>     Fallback terminal width (default: 120)
-      --height <ROWS>    Fallback terminal height (default: 30)
-      --sync-ps          Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
-      --warm             Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
-  -h, --help             Print help
-  -V, --version          Print version
+      --initial <TEXT>       Seed the command builder with an existing command buffer
+      --out-file <PATH>      Write the accepted command to <PATH> instead of stdout
+      --width <COLS>         Fallback terminal width (default: 120)
+      --height <ROWS>        Fallback terminal height (default: 30)
+      --context <JSON>       Dynamic runtime context JSON payload (git branch, cwd, history)
+      --context-file <PATH>  Read dynamic runtime context JSON payload from <PATH>
+      --git-branch <NAME>    Override current Git branch name for runtime context
+      --history <CMD>        Add a recent command to the top of Pane 1 (repeatable)
+      --sync-ps              Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
+      --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
+  -h, --help                 Print help
+  -V, --version              Print version
 
 Environment:
-  ZPANE_SHELL            Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($X, $status)
+  ZPANE_SHELL                Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($status)
 ```
 
 ---

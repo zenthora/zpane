@@ -3,8 +3,9 @@ use super::catalog::{
     sync_powershell_metadata, ShellDialect, PRIORITY_CLI_TOOLS,
 };
 use super::help_parser::parse_cli_help;
-use crate::model::{Entry, EntryKind};
+use crate::model::{Entry, EntryKind, RuntimeContext};
 use rayon::prelude::*;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -138,7 +139,91 @@ fn default_command_runner() -> Arc<CommandRunner> {
     })
 }
 
-fn introspect_cli_chain_with<F>(chain: &[&str], dialect: ShellDialect, run_cmd: &F) -> Vec<Entry>
+#[derive(Debug, Deserialize)]
+struct CarapaceExport {
+    #[serde(default)]
+    values: Vec<CarapaceValue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CarapaceValue {
+    value: String,
+    #[serde(default)]
+    display: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    tag: String,
+}
+
+fn is_carapace_installed() -> bool {
+    let Some(path_val) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let candidates: &[&str] = if cfg!(windows) {
+        &["carapace.exe", "carapace.cmd", "carapace.bat"]
+    } else {
+        &["carapace"]
+    };
+    std::env::split_paths(&path_val).any(|dir| candidates.iter().any(|bin| dir.join(bin).is_file()))
+}
+
+fn parse_carapace_export(json_str: &str) -> Vec<Entry> {
+    let trimmed = json_str.trim();
+    let Some(start) = trimmed.find('{') else {
+        return Vec::new();
+    };
+    let Ok(export) = serde_json::from_str::<CarapaceExport>(&trimmed[start..]) else {
+        return Vec::new();
+    };
+
+    let mut entries = Vec::with_capacity(export.values.len());
+    let mut seen = HashSet::new();
+    for item in export.values {
+        let text = item.value.trim().to_string();
+        if text.is_empty() || !seen.insert(text.to_ascii_lowercase()) {
+            continue;
+        }
+        let label = if item.display.trim().is_empty() {
+            text.clone()
+        } else {
+            item.display.trim().to_string()
+        };
+        let tag_lower = item.tag.to_ascii_lowercase();
+        let kind = if text.starts_with('-') || tag_lower.contains("flag") {
+            if text.ends_with('=') {
+                EntryKind::Param
+            } else {
+                EntryKind::Flag
+            }
+        } else if tag_lower.contains("command") || tag_lower.contains("subcommand") {
+            EntryKind::Subcmd
+        } else if tag_lower.contains("directory")
+            || tag_lower.contains("dir")
+            || tag_lower.contains("file")
+        {
+            EntryKind::Path
+        } else if tag_lower.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            EntryKind::Subcmd
+        } else {
+            EntryKind::Arg
+        };
+
+        entries.push(Entry::new(text, label, kind, item.description.trim()));
+    }
+    entries
+}
+
+fn introspect_cli_chain_with<F>(
+    chain: &[&str],
+    dialect: ShellDialect,
+    carapace_enabled: bool,
+    run_cmd: &F,
+) -> Vec<Entry>
 where
     F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
 {
@@ -168,6 +253,20 @@ where
     }
 
     let mut entries = parse_cli_help(&text);
+
+    // Secondary Introspection Bridge: query `carapace <exe> export <chain...> ""`
+    // when primary help parsing yields nothing and carapace-bin is available.
+    if entries.is_empty() && carapace_enabled && !exe.eq_ignore_ascii_case("carapace") {
+        let mut c_args = Vec::with_capacity(chain.len() + 3);
+        c_args.push(exe);
+        c_args.push("export");
+        c_args.extend_from_slice(chain);
+        c_args.push("");
+        if let Some(carapace_out) = run_cmd("carapace", &c_args) {
+            entries = parse_carapace_export(&carapace_out);
+        }
+    }
+
     let vars = dialect.common_var_entries();
 
     // If this is a subcommand or leaf level, also append helpful shell variables
@@ -203,6 +302,7 @@ pub struct CliIntrospector {
     pending_keys: HashSet<String>,
     dirty: bool,
     dialect: ShellDialect,
+    carapace_enabled: bool,
     cache_path: Option<PathBuf>,
     runner: Arc<CommandRunner>,
     req_tx: Option<Sender<BgRequest>>,
@@ -214,12 +314,21 @@ impl CliIntrospector {
     /// Creates a production `CliIntrospector` backed by `cli_cache.json` and a background OS worker thread.
     /// When running on PowerShell without cached `ps_metadata.json`, starts first-run metadata generation
     /// in the background so `poll_updates()` delivers the refreshed catalog live.
-    pub fn new(dialect: ShellDialect) -> Self {
+    pub fn new(dialect: ShellDialect, runtime_ctx: &RuntimeContext) -> Self {
         let path = cli_cache_path();
         let cache = load_cli_disk_cache_from(&path);
         let runner = default_command_runner();
-        let catalog_rx = maybe_spawn_ps_sync(dialect);
-        Self::build(dialect, cache, Some(path), runner, true, catalog_rx)
+        let carapace_enabled = is_carapace_installed();
+        let catalog_rx = maybe_spawn_ps_sync(dialect, runtime_ctx.clone());
+        Self::build_with_carapace(
+            dialect,
+            cache,
+            Some(path),
+            runner,
+            true,
+            carapace_enabled,
+            catalog_rx,
+        )
     }
 
     /// Creates a `CliIntrospector` tailored for synchronous batch cache warming (no worker threads).
@@ -227,7 +336,16 @@ impl CliIntrospector {
         let path = cli_cache_path();
         let cache = load_cli_disk_cache_from(&path);
         let runner = default_command_runner();
-        Self::build(dialect, cache, Some(path), runner, false, None)
+        let carapace_enabled = is_carapace_installed();
+        Self::build_with_carapace(
+            dialect,
+            cache,
+            Some(path),
+            runner,
+            false,
+            carapace_enabled,
+            None,
+        )
     }
 
     /// Creates a `CliIntrospector` with an injected command-output adapter and optional disk cache path.
@@ -236,13 +354,36 @@ impl CliIntrospector {
     where
         F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
     {
+        Self::with_runner_and_carapace(dialect, cache_path, false, runner)
+    }
+
+    /// Creates a `CliIntrospector` with an injected command-output adapter and configurable Carapace fallback.
+    #[cfg(test)]
+    fn with_runner_and_carapace<F>(
+        dialect: ShellDialect,
+        cache_path: Option<PathBuf>,
+        carapace_enabled: bool,
+        runner: F,
+    ) -> Self
+    where
+        F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
+    {
         let cache = cache_path
             .as_deref()
             .map(load_cli_disk_cache_from)
             .unwrap_or_default();
-        Self::build(dialect, cache, cache_path, Arc::new(runner), true, None)
+        Self::build_with_carapace(
+            dialect,
+            cache,
+            cache_path,
+            Arc::new(runner),
+            true,
+            carapace_enabled,
+            None,
+        )
     }
 
+    #[cfg(test)]
     fn build(
         dialect: ShellDialect,
         cache: HashMap<String, Vec<Entry>>,
@@ -251,11 +392,31 @@ impl CliIntrospector {
         spawn_worker: bool,
         catalog_rx: Option<Receiver<Vec<Entry>>>,
     ) -> Self {
+        Self::build_with_carapace(
+            dialect,
+            cache,
+            cache_path,
+            runner,
+            spawn_worker,
+            false,
+            catalog_rx,
+        )
+    }
+
+    fn build_with_carapace(
+        dialect: ShellDialect,
+        cache: HashMap<String, Vec<Entry>>,
+        cache_path: Option<PathBuf>,
+        runner: Arc<CommandRunner>,
+        spawn_worker: bool,
+        carapace_enabled: bool,
+        catalog_rx: Option<Receiver<Vec<Entry>>>,
+    ) -> Self {
         let (req_tx, res_rx) = if spawn_worker {
             let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
             let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
             let worker_runner = Arc::clone(&runner);
-            spawn_background_worker(req_rx, res_tx, dialect, worker_runner);
+            spawn_background_worker(req_rx, res_tx, dialect, carapace_enabled, worker_runner);
             (Some(req_tx), Some(res_rx))
         } else {
             (None, None)
@@ -266,6 +427,7 @@ impl CliIntrospector {
             pending_keys: HashSet::new(),
             dirty: false,
             dialect,
+            carapace_enabled,
             cache_path,
             runner,
             req_tx,
@@ -393,12 +555,14 @@ impl CliIntrospector {
             .collect();
 
         let dialect = self.dialect;
+        let carapace_enabled = self.carapace_enabled;
         let runner = Arc::clone(&self.runner);
         let results: Vec<(String, Vec<Entry>)> = available
             .par_iter()
             .map(|&tool| {
                 let chain = [tool];
-                let entries = introspect_cli_chain_with(&chain, dialect, &*runner);
+                let entries =
+                    introspect_cli_chain_with(&chain, dialect, carapace_enabled, &*runner);
                 (Self::chain_key(&chain), entries)
             })
             .collect();
@@ -447,14 +611,17 @@ impl Introspect for CliIntrospector {
     }
 }
 
-fn maybe_spawn_ps_sync(dialect: ShellDialect) -> Option<Receiver<Vec<Entry>>> {
+fn maybe_spawn_ps_sync(
+    dialect: ShellDialect,
+    runtime_ctx: RuntimeContext,
+) -> Option<Receiver<Vec<Entry>>> {
     if !dialect.is_powershell() || ps_metadata_path().exists() {
         return None;
     }
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         if sync_powershell_metadata().is_ok() {
-            let _ = tx.send(load_catalog(dialect));
+            let _ = tx.send(load_catalog(dialect, &runtime_ctx));
         }
     });
     Some(rx)
@@ -464,6 +631,7 @@ fn spawn_background_worker(
     rx: Receiver<BgRequest>,
     tx: Sender<BgResponse>,
     dialect: ShellDialect,
+    carapace_enabled: bool,
     runner: Arc<CommandRunner>,
 ) {
     thread::spawn(move || {
@@ -481,7 +649,8 @@ fn spawn_background_worker(
             }
             if let Some(req) = stack.pop() {
                 let chain_refs: Vec<&str> = req.cmd_chain.iter().map(|s| s.as_str()).collect();
-                let entries = introspect_cli_chain_with(&chain_refs, dialect, &*runner);
+                let entries =
+                    introspect_cli_chain_with(&chain_refs, dialect, carapace_enabled, &*runner);
                 if tx
                     .send(BgResponse {
                         cache_key: req.cache_key,
@@ -500,7 +669,7 @@ fn spawn_background_worker(
 /// priority tools in `dialect` using Rayon without spawning an extra worker thread.
 /// Returns the number of tools warmed.
 pub fn warm_cli_cache(dialect: ShellDialect) -> usize {
-    let col1_entries = load_catalog(dialect);
+    let col1_entries = load_catalog(dialect, &RuntimeContext::default());
     let mut introspector = CliIntrospector::new_for_warm(dialect);
     let warmed = introspector.warm_priority_tools(&col1_entries);
     introspector.flush();
@@ -808,5 +977,88 @@ CORE COMMANDS
 
         // Second poll after channel consumption returns no update
         assert!(!introspector.poll_updates().any());
+    }
+
+    #[test]
+    fn test_carapace_bridge_fallback_when_help_empty_and_skipped_when_help_succeeds() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let calls_ref = Arc::clone(&calls);
+
+        let mut introspector = CliIntrospector::with_runner_and_carapace(
+            ShellDialect::Posix,
+            None,
+            true,
+            move |exe, args| {
+                calls_ref.lock().unwrap().push((
+                    exe.to_string(),
+                    args.iter().map(|s| (*s).to_string()).collect(),
+                ));
+                match (exe, args) {
+                    ("carapace", ["fd", "export", "fd", ""]) => Some(
+                        r#"{
+  "version": "1.0.0",
+  "nospace": "=",
+  "values": [
+    { "value": "--extension=", "display": "-e, --extension=", "description": "Filter by file extension", "tag": "flags" },
+    { "value": "--hidden", "description": "Search hidden files", "tag": "flags" },
+    { "value": "src/", "description": "Source directory", "tag": "directories" },
+    { "value": "build", "description": "Build command", "tag": "commands" }
+  ]
+}"#
+                        .to_string(),
+                    ),
+                    ("git", ["-h"]) => Some(
+                        "\
+start a working area
+   clone      Clone a repository
+"
+                        .to_string(),
+                    ),
+                    _ => None,
+                }
+            },
+        );
+
+        // 1. Tool with empty --help/-h falls back to carapace export
+        let _ = introspector.query(&["fd"]);
+        assert!(introspector.poll_blocking());
+        let fd_entries = introspector.query(&["fd"]);
+        let ext = fd_entries
+            .iter()
+            .find(|e| e.text == "--extension=")
+            .expect("--extension= from carapace");
+        assert_eq!(ext.kind, EntryKind::Param);
+        assert_eq!(ext.label, "-e, --extension=");
+
+        let hidden = fd_entries
+            .iter()
+            .find(|e| e.text == "--hidden")
+            .expect("--hidden from carapace");
+        assert_eq!(hidden.kind, EntryKind::Flag);
+
+        let dir_entry = fd_entries
+            .iter()
+            .find(|e| e.text == "src/")
+            .expect("src/ path from carapace");
+        assert_eq!(dir_entry.kind, EntryKind::Path);
+
+        let cmd_entry = fd_entries
+            .iter()
+            .find(|e| e.text == "build")
+            .expect("build subcmd from carapace");
+        assert_eq!(cmd_entry.kind, EntryKind::Subcmd);
+
+        // 2. Tool with working primary help does NOT invoke carapace
+        let _ = introspector.query(&["git"]);
+        assert!(introspector.poll_blocking());
+        let recorded = calls.lock().unwrap();
+        assert!(recorded
+            .iter()
+            .any(|(exe, args)| exe == "carapace" && args == &["fd", "export", "fd", ""]));
+        assert!(!recorded.iter().any(
+            |(exe, args)| exe == "carapace" && args.first().map(String::as_str) == Some("git")
+        ));
     }
 }

@@ -9,9 +9,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use discovery::{
-    load_catalog, reload_catalog, sync_powershell_metadata, warm_cli_cache, CliIntrospector,
-    ShellDialect,
+    detect_runtime_context, load_catalog, reload_catalog, sync_powershell_metadata, warm_cli_cache,
+    CliIntrospector, ShellDialect,
 };
+use model::RuntimeContext;
 use session::{MillerSession, SessionOutcome};
 use std::env;
 use std::fs;
@@ -160,17 +161,21 @@ zpane - 3-pane Miller column command, parameter & variable explorer
 Usage: zpane [OPTIONS] [INITIAL_TOKENS]...
 
 Options:
-      --initial <TEXT>   Seed the command builder with an existing command buffer
-      --out-file <PATH>  Write the accepted command to <PATH> instead of stdout
-      --width <COLS>     Fallback terminal width (default: 120)
-      --height <ROWS>    Fallback terminal height (default: 30)
-      --sync-ps          Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
-      --warm             Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
-  -h, --help             Print help
-  -V, --version          Print version
+      --initial <TEXT>       Seed the command builder with an existing command buffer
+      --out-file <PATH>      Write the accepted command to <PATH> instead of stdout
+      --width <COLS>         Fallback terminal width (default: 120)
+      --height <ROWS>        Fallback terminal height (default: 30)
+      --context <JSON>       Dynamic runtime context JSON payload (git branch, cwd, history)
+      --context-file <PATH>  Read dynamic runtime context JSON payload from <PATH>
+      --git-branch <NAME>    Override current Git branch name for runtime context
+      --history <CMD>        Add a recent command to the top of Pane 1 (repeatable)
+      --sync-ps              Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
+      --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
+  -h, --help                 Print help
+  -V, --version              Print version
 
 Environment:
-  ZPANE_SHELL            Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($status)
+  ZPANE_SHELL                Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($status)
 ";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -179,6 +184,7 @@ struct CliOptions {
     out_file: Option<PathBuf>,
     fallback_width: usize,
     fallback_height: usize,
+    runtime_context: RuntimeContext,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -199,6 +205,27 @@ fn parse_dimension(flag: &str, raw: &str, min: usize) -> anyhow::Result<usize> {
     Ok(val)
 }
 
+fn parse_context_json(raw: &str) -> anyhow::Result<RuntimeContext> {
+    let cleaned = raw.trim_start_matches('\u{feff}');
+    serde_json::from_str::<RuntimeContext>(cleaned)
+        .map_err(|e| anyhow::anyhow!("Invalid runtime context JSON: {e}"))
+}
+
+fn merge_runtime_context(base: &mut RuntimeContext, incoming: RuntimeContext) {
+    if incoming.git_branch.is_some() {
+        base.git_branch = incoming.git_branch;
+    }
+    if !incoming.git_branches.is_empty() {
+        base.git_branches = incoming.git_branches;
+    }
+    if !incoming.cwd_entries.is_empty() {
+        base.cwd_entries = incoming.cwd_entries;
+    }
+    if !incoming.history.is_empty() {
+        base.history.extend(incoming.history);
+    }
+}
+
 fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     if args.iter().any(|a| a == "-V" || a == "--version") {
         return Ok(CliCommand::Version);
@@ -215,12 +242,14 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     let mut out_file: Option<PathBuf> = None;
     let mut fallback_width: usize = 120;
     let mut fallback_height: usize = 30;
+    let mut runtime_context = RuntimeContext::default();
 
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
         match flag {
-            "--initial" | "--out-file" | "--width" | "--height" => {
+            "--initial" | "--out-file" | "--width" | "--height" | "--context"
+            | "--context-file" | "--git-branch" | "--history" => {
                 let Some(val) = args.get(i + 1) else {
                     anyhow::bail!("Missing value for option {flag}");
                 };
@@ -232,6 +261,29 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                     }
                     "--height" => {
                         fallback_height = parse_dimension(flag, val, ui::Viewport::MIN_HEIGHT)?;
+                    }
+                    "--context" => {
+                        let parsed = parse_context_json(val)?;
+                        merge_runtime_context(&mut runtime_context, parsed);
+                    }
+                    "--context-file" => {
+                        let raw = fs::read_to_string(val).map_err(|e| {
+                            anyhow::anyhow!("Failed to read context file '{val}': {e}")
+                        })?;
+                        let parsed = parse_context_json(&raw)?;
+                        merge_runtime_context(&mut runtime_context, parsed);
+                    }
+                    "--git-branch" => {
+                        let trimmed = val.trim();
+                        if !trimmed.is_empty() {
+                            runtime_context.git_branch = Some(trimmed.to_string());
+                        }
+                    }
+                    "--history" => {
+                        let trimmed = val.trim();
+                        if !trimmed.is_empty() {
+                            runtime_context.history.push(trimmed.to_string());
+                        }
                     }
                     _ => unreachable!(),
                 }
@@ -252,6 +304,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         out_file,
         fallback_width,
         fallback_height,
+        runtime_context,
     }))
 }
 
@@ -294,13 +347,15 @@ fn main() -> anyhow::Result<()> {
         let _ = fs::remove_file(f);
     }
 
-    let pane1_entries = load_catalog(dialect);
-    let introspector = CliIntrospector::new(dialect);
+    let runtime_ctx = detect_runtime_context(opts.runtime_context);
+    let pane1_entries = load_catalog(dialect, &runtime_ctx);
+    let introspector = CliIntrospector::new(dialect, &runtime_ctx);
 
     let (tw, th) = size().unwrap_or((opts.fallback_width as u16, opts.fallback_height as u16));
     let viewport =
         ui::Viewport::from_terminal_size(tw, th, opts.fallback_width, opts.fallback_height);
 
+    let reload_ctx = runtime_ctx.clone();
     let mut session = MillerSession::new(
         pane1_entries,
         introspector,
@@ -308,7 +363,8 @@ fn main() -> anyhow::Result<()> {
         viewport,
         dialect,
     )
-    .with_catalog_loader(reload_catalog);
+    .with_runtime_context(runtime_ctx)
+    .with_catalog_loader(move |d| reload_catalog(d, &reload_ctx));
 
     let mut guard = TerminalGuard::enter()?;
     let accepted: Option<String>;
@@ -425,6 +481,7 @@ mod tests {
                 out_file: Some(PathBuf::from("/tmp/out")),
                 fallback_width: 80,
                 fallback_height: 24,
+                runtime_context: RuntimeContext::default(),
             })
         );
 
@@ -436,6 +493,59 @@ mod tests {
 
         let err_missing = parse_cli_args(&s(&["--initial"])).unwrap_err();
         assert!(err_missing.to_string().contains("Missing value"));
+    }
+
+    #[test]
+    fn test_parse_cli_args_runtime_context_flags_and_errors() {
+        use crate::model::CwdEntry;
+
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+        let ctx_path =
+            env::temp_dir().join(format!("zpane_cli_ctx_test_{}.json", std::process::id()));
+        fs::write(
+            &ctx_path,
+            "\u{feff}{\"git_branch\":\"main\",\"git_branches\":[\"main\",\"dev\"],\"cwd_entries\":[{\"name\":\"src\",\"is_dir\":true}],\"history\":[\"git status\"]}",
+        )
+        .unwrap();
+
+        let parsed = parse_cli_args(&s(&[
+            "--context-file",
+            ctx_path.to_str().unwrap(),
+            "--git-branch",
+            "feat/context",
+            "--history",
+            "cargo test --locked",
+        ]))
+        .unwrap();
+        let _ = fs::remove_file(&ctx_path);
+
+        assert_eq!(
+            parsed,
+            CliCommand::Interactive(CliOptions {
+                initial_buffer: String::new(),
+                out_file: None,
+                fallback_width: 120,
+                fallback_height: 30,
+                runtime_context: RuntimeContext {
+                    git_branch: Some("feat/context".to_string()),
+                    git_branches: vec!["main".to_string(), "dev".to_string()],
+                    cwd_entries: vec![CwdEntry {
+                        name: "src".to_string(),
+                        is_dir: true,
+                    }],
+                    history: vec!["git status".to_string(), "cargo test --locked".to_string()],
+                },
+            })
+        );
+
+        let err_json = parse_cli_args(&s(&["--context", "{not-json}"])).unwrap_err();
+        assert!(err_json
+            .to_string()
+            .contains("Invalid runtime context JSON"));
+
+        let err_file =
+            parse_cli_args(&s(&["--context-file", "/nonexistent/zpane_ctx.json"])).unwrap_err();
+        assert!(err_file.to_string().contains("Failed to read context file"));
     }
 
     #[test]

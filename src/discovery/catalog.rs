@@ -1,4 +1,5 @@
-use crate::model::{Entry, EntryKind};
+use super::specs::{is_spec_filename, parse_spec_str, specs_dir};
+use crate::model::{CwdEntry, Entry, EntryKind, RuntimeContext};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -313,6 +314,7 @@ pub(super) trait EnvSource {
     fn path_dirs(&self) -> Vec<PathBuf>;
     fn dir_executables(&self, dir: &Path) -> Vec<(String, PathBuf)>;
     fn read_ps_metadata(&self) -> Option<Vec<u8>>;
+    fn spec_files(&self) -> Vec<(String, String)>;
 }
 
 struct OsEnv;
@@ -345,6 +347,30 @@ impl EnvSource for OsEnv {
 
     fn read_ps_metadata(&self) -> Option<Vec<u8>> {
         fs::read(ps_metadata_path()).ok()
+    }
+
+    fn spec_files(&self) -> Vec<(String, String)> {
+        let dir = specs_dir();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<(String, PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let path = e.path();
+                if !path.is_file() {
+                    return None;
+                }
+                let name = path.file_name()?.to_str()?.to_string();
+                is_spec_filename(&name).then_some((name, path))
+            })
+            .collect();
+        files.sort_by(|a, b| a.0.cmp(&b.0));
+
+        files
+            .into_iter()
+            .filter_map(|(name, path)| fs::read_to_string(path).ok().map(|body| (name, body)))
+            .collect()
     }
 }
 
@@ -430,7 +456,7 @@ where
     root
 }
 
-fn build_var_scope_entry(dialect: ShellDialect) -> Entry {
+fn build_var_scope_entry(dialect: ShellDialect, ctx: &RuntimeContext) -> Entry {
     let (label, desc) = match dialect {
         ShellDialect::PowerShell => (
             "$global:Variables",
@@ -447,6 +473,20 @@ fn build_var_scope_entry(dialect: ShellDialect) -> Entry {
     };
     let mut root = Entry::scope_root("$", label, EntryKind::Var, desc);
     root.children = dialect.common_var_entries();
+    if let Some(ref branch) = ctx.git_branch {
+        let trimmed = branch.trim();
+        if !trimmed.is_empty() {
+            root.children.push(
+                Entry::new(
+                    "$GIT_BRANCH",
+                    format!("$GIT_BRANCH ({trimmed})"),
+                    EntryKind::Var,
+                    trimmed,
+                )
+                .with_literal(true),
+            );
+        }
+    }
     for child in &mut root.children {
         let tok = child.text.clone();
         let val = child.desc.clone();
@@ -466,6 +506,20 @@ fn build_var_scope_entry(dialect: ShellDialect) -> Entry {
         }
     }
     root
+}
+
+fn build_cwd_scope_entry(ctx: &RuntimeContext) -> Option<Entry> {
+    if ctx.cwd_entries.is_empty() {
+        return None;
+    }
+    let mut root = Entry::scope_root(
+        "./",
+        "./ Current Dir",
+        EntryKind::Path,
+        "Browse and insert current directory files & folders",
+    );
+    root.children = ctx.cwd_path_entries(false);
+    Some(root)
 }
 
 fn convert_ps_export_to_entry(exp: PsCommandExport) -> Entry {
@@ -555,18 +609,222 @@ fn drain_ordered(
     }
 }
 
-pub(super) fn load_catalog_with(dialect: ShellDialect, env_src: &dyn EnvSource) -> Vec<Entry> {
+/// Detects current Git branch/branches and shallow CWD entries to populate [`RuntimeContext`].
+/// Any fields already provided in `explicit` are preserved.
+pub fn detect_runtime_context(explicit: RuntimeContext) -> RuntimeContext {
+    let mut ctx = explicit;
+    let Ok(cwd) = std::env::current_dir() else {
+        return ctx;
+    };
+
+    if ctx.git_branch.is_none() || ctx.git_branches.is_empty() {
+        let (detected_branch, detected_branches) = detect_git_context_in(&cwd);
+        if ctx.git_branch.is_none() {
+            ctx.git_branch = detected_branch;
+        }
+        if ctx.git_branches.is_empty() {
+            ctx.git_branches = detected_branches;
+        }
+    }
+
+    if let Some(ref current) = ctx.git_branch {
+        if !ctx.git_branches.iter().any(|b| b == current) {
+            ctx.git_branches.insert(0, current.clone());
+        }
+    }
+
+    if ctx.cwd_entries.is_empty() {
+        ctx.cwd_entries = scan_cwd_entries(&cwd);
+    }
+
+    ctx
+}
+
+fn resolve_git_dir(start_dir: &Path) -> Option<PathBuf> {
+    let mut cur = Some(start_dir);
+    while let Some(dir) = cur {
+        let candidate = dir.join(".git");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+        if candidate.is_file() {
+            if let Ok(content) = fs::read_to_string(&candidate) {
+                if let Some(rest) = content.trim().strip_prefix("gitdir:") {
+                    let git_path = PathBuf::from(rest.trim());
+                    return Some(if git_path.is_absolute() {
+                        git_path
+                    } else {
+                        dir.join(git_path)
+                    });
+                }
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+fn collect_git_refs(base: &Path, dir: &Path, out: &mut Vec<String>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_git_refs(base, &path, out);
+        } else if path.is_file() {
+            if let Ok(rel) = path.strip_prefix(base) {
+                let branch = rel.to_string_lossy().replace('\\', "/");
+                if !branch.is_empty() {
+                    out.push(branch);
+                }
+            }
+        }
+    }
+}
+
+fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
+    let Some(git_dir) = resolve_git_dir(start_dir) else {
+        return (None, Vec::new());
+    };
+
+    let current = fs::read_to_string(git_dir.join("HEAD"))
+        .ok()
+        .and_then(|head| {
+            let trimmed = head.trim();
+            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+                Some(branch.to_string())
+            } else if let Some(other_ref) = trimmed.strip_prefix("ref: ") {
+                Some(other_ref.to_string())
+            } else if !trimmed.is_empty() {
+                Some(trimmed.chars().take(8).collect())
+            } else {
+                None
+            }
+        });
+
+    let mut branches = Vec::new();
+    let heads_dir = git_dir.join("refs").join("heads");
+    if heads_dir.is_dir() {
+        collect_git_refs(&heads_dir, &heads_dir, &mut branches);
+    }
+    if let Ok(packed) = fs::read_to_string(git_dir.join("packed-refs")) {
+        for line in packed.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((_, ref_name)) = line.split_once(' ') {
+                if let Some(branch) = ref_name.strip_prefix("refs/heads/") {
+                    if !branches.iter().any(|b| b == branch) {
+                        branches.push(branch.to_string());
+                    }
+                }
+            }
+        }
+    }
+    branches.sort();
+
+    if let Some(ref cur) = current {
+        branches.retain(|b| b != cur);
+        branches.insert(0, cur.clone());
+    }
+
+    (current, branches)
+}
+
+fn scan_cwd_entries(dir: &Path) -> Vec<CwdEntry> {
+    const MAX_CWD_ENTRIES: usize = 200;
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut items: Vec<CwdEntry> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+            Some(CwdEntry { name, is_dir })
+        })
+        .collect();
+    items.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir).then_with(|| {
+            a.name
+                .to_ascii_lowercase()
+                .cmp(&b.name.to_ascii_lowercase())
+        })
+    });
+    items.truncate(MAX_CWD_ENTRIES);
+    items
+}
+
+fn merge_spec_into_entry(target: &mut Entry, spec: Entry) {
+    if !spec.desc.is_empty() {
+        if target.desc.is_empty() {
+            target.desc = spec.desc;
+        } else if !target.desc.contains(&spec.desc) {
+            target.desc = format!("{} — {}", spec.desc, target.desc);
+        }
+    }
+    if target.aliases.is_empty() && !spec.aliases.is_empty() {
+        target.aliases = spec.aliases;
+    }
+    if !spec.children.is_empty() {
+        if target.children.is_empty() {
+            target.children = spec.children;
+        } else {
+            let mut existing: HashSet<String> = target
+                .children
+                .iter()
+                .map(|c| c.text.to_ascii_lowercase())
+                .collect();
+            for child in spec.children {
+                if existing.insert(child.text.to_ascii_lowercase()) {
+                    target.children.push(child);
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn load_catalog_with_context(
+    dialect: ShellDialect,
+    env_src: &dyn EnvSource,
+    ctx: &RuntimeContext,
+) -> Vec<Entry> {
     let mut list = Vec::with_capacity(5000);
     let mut seen = HashSet::new();
 
-    // 1. Variable scopes first
+    // 0. Active shell session history at the top of Pane 1
+    let mut hist_seen = HashSet::new();
+    for cmd in &ctx.history {
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() || !hist_seen.insert(trimmed.to_ascii_lowercase()) {
+            continue;
+        }
+        list.push(Entry::new(
+            trimmed.to_string(),
+            trimmed.to_string(),
+            EntryKind::History,
+            "Recent shell history",
+        ));
+    }
+
+    // 1. Variable and CWD scope roots first
     let env_scope = build_env_scope_entry_from_vars(dialect, env_src.env_vars());
     seen.insert(env_scope.text.to_ascii_lowercase());
     list.push(env_scope);
 
-    let var_scope = build_var_scope_entry(dialect);
+    let var_scope = build_var_scope_entry(dialect, ctx);
     seen.insert(var_scope.text.to_ascii_lowercase());
     list.push(var_scope);
+
+    if let Some(cwd_scope) = build_cwd_scope_entry(ctx) {
+        seen.insert(cwd_scope.text.to_ascii_lowercase());
+        list.push(cwd_scope);
+    }
 
     // 2. Load exported PowerShell metadata if available (PowerShell dialect only)
     let mut ps_map: HashMap<String, Entry> = HashMap::new();
@@ -602,6 +860,29 @@ pub(super) fn load_catalog_with(dialect: ShellDialect, env_src: &dyn EnvSource) 
                     path.display().to_string(),
                 ));
             }
+        }
+    }
+
+    // 3b. Load declarative specs (carapace-spec / Fig) and merge or register commands
+    for (file_name, content) in env_src.spec_files() {
+        let Ok(spec_entry) = parse_spec_str(&file_name, &content) else {
+            continue;
+        };
+        let key = spec_entry.text.to_ascii_lowercase();
+        if let Some(cli_entry) = cli_map.get_mut(&key) {
+            merge_spec_into_entry(cli_entry, spec_entry);
+        } else if let Some(ps_entry) = ps_map.get_mut(&key) {
+            merge_spec_into_entry(ps_entry, spec_entry);
+        } else {
+            cli_order.push(key.clone());
+            cli_map.insert(key, spec_entry);
+        }
+    }
+
+    // Enrich `git` description with detected current branch if available
+    if let Some(ref branch) = ctx.git_branch {
+        if let Some(git_entry) = cli_map.get_mut("git") {
+            git_entry.desc = format!("[branch: {branch}] {}", git_entry.desc);
         }
     }
 
@@ -641,6 +922,11 @@ pub(super) fn load_catalog_with(dialect: ShellDialect, env_src: &dyn EnvSource) 
     drain_ordered(&mut list, &mut seen, &ps_order, &mut ps_map);
 
     list
+}
+
+#[cfg(test)]
+pub(super) fn load_catalog_with(dialect: ShellDialect, env_src: &dyn EnvSource) -> Vec<Entry> {
+    load_catalog_with_context(dialect, env_src, &RuntimeContext::default())
 }
 
 /// Synchronizes PowerShell Cmdlets, Functions, Aliases, and Parameter Metadata to disk.
@@ -714,17 +1000,17 @@ $out | ConvertTo-Json -Depth 4 -Compress
 /// Loads the initial Pane 1 Command Catalog for `dialect` without spawning side-effect threads.
 /// Background PowerShell metadata generation on first run is driven by [`CliIntrospector`]
 /// and surfaced through [`Introspect::poll_updates`].
-pub fn load_catalog(dialect: ShellDialect) -> Vec<Entry> {
-    load_catalog_with(dialect, &OsEnv)
+pub fn load_catalog(dialect: ShellDialect, ctx: &RuntimeContext) -> Vec<Entry> {
+    load_catalog_with_context(dialect, &OsEnv, ctx)
 }
 
 /// Refreshes any dialect-specific metadata (e.g. PowerShell cmdlets) and reloads
 /// the Pane 1 Command Catalog.
-pub fn reload_catalog(dialect: ShellDialect) -> Vec<Entry> {
+pub fn reload_catalog(dialect: ShellDialect, ctx: &RuntimeContext) -> Vec<Entry> {
     if dialect.is_powershell() {
         let _ = sync_powershell_metadata();
     }
-    load_catalog_with(dialect, &OsEnv)
+    load_catalog_with_context(dialect, &OsEnv, ctx)
 }
 
 #[cfg(test)]
@@ -737,6 +1023,7 @@ mod tests {
         path_dirs: Vec<PathBuf>,
         bins: HashMap<PathBuf, Vec<(String, PathBuf)>>,
         ps_metadata: Option<Vec<u8>>,
+        specs: Vec<(String, String)>,
     }
 
     impl EnvSource for FakeEnv {
@@ -754,6 +1041,10 @@ mod tests {
 
         fn read_ps_metadata(&self) -> Option<Vec<u8>> {
             self.ps_metadata.clone()
+        }
+
+        fn spec_files(&self) -> Vec<(String, String)> {
+            self.specs.clone()
         }
     }
 
@@ -949,8 +1240,20 @@ mod tests {
 
     #[test]
     fn test_var_scope_uses_explicit_literal_flag_instead_of_text_sniffing() {
-        let ps_vars = build_var_scope_entry(ShellDialect::PowerShell);
+        let ctx = RuntimeContext {
+            git_branch: Some("feat/roadmap".to_string()),
+            ..Default::default()
+        };
+        let ps_vars = build_var_scope_entry(ShellDialect::PowerShell, &ctx);
         assert!(ps_vars.is_scope_root());
+
+        let git_var = ps_vars
+            .children
+            .iter()
+            .find(|c| c.text == "$GIT_BRANCH")
+            .expect("$GIT_BRANCH in var scope when git branch detected");
+        assert!(git_var.has_literal);
+        assert!(git_var.desc.contains("feat/roadmap"));
 
         let null_entry = ps_vars
             .children
@@ -1006,6 +1309,7 @@ mod tests {
                 ],
             )]),
             ps_metadata: Some(serde_json::to_vec(&ps_exports).unwrap()),
+            specs: Vec::new(),
         };
 
         let ps_catalog = load_catalog_with(ShellDialect::PowerShell, &fake);
@@ -1022,5 +1326,129 @@ mod tests {
             vec!["$", "$", "git", "cargo", "zzztool"],
             "Non-PowerShell dialects must ignore PS metadata"
         );
+    }
+
+    #[test]
+    fn test_load_catalog_with_context_places_history_first_merges_specs_and_enriches_git() {
+        let bin_dir = PathBuf::from("/fake/bin");
+        let kubectl_spec = r#"
+name: kubectl
+description: Kubernetes CLI
+flags:
+  -n, --namespace=: Target namespace
+commands:
+  - name: get
+    description: Display resources
+"#;
+        let standalone_spec = r#"{
+  "name": "mycustom",
+  "description": "Standalone spec command",
+  "options": [
+    { "name": "--verbose", "description": "Verbose output" }
+  ]
+}"#;
+        let fake = FakeEnv {
+            vars: vec![],
+            path_dirs: vec![bin_dir.clone()],
+            bins: HashMap::from([(
+                bin_dir,
+                vec![
+                    ("git".to_string(), PathBuf::from("/fake/bin/git")),
+                    ("kubectl".to_string(), PathBuf::from("/fake/bin/kubectl")),
+                ],
+            )]),
+            ps_metadata: None,
+            specs: vec![
+                ("kubectl.yaml".to_string(), kubectl_spec.to_string()),
+                ("mycustom.json".to_string(), standalone_spec.to_string()),
+            ],
+        };
+        let ctx = RuntimeContext {
+            git_branch: Some("main".to_string()),
+            git_branches: vec!["main".to_string(), "feat/ui".to_string()],
+            cwd_entries: vec![
+                CwdEntry {
+                    name: "src".to_string(),
+                    is_dir: true,
+                },
+                CwdEntry {
+                    name: "Cargo.toml".to_string(),
+                    is_dir: false,
+                },
+            ],
+            history: vec![
+                "cargo test --locked".to_string(),
+                "git status".to_string(),
+                "cargo test --locked".to_string(),
+            ],
+        };
+
+        let catalog = load_catalog_with_context(ShellDialect::PowerShell, &fake, &ctx);
+        let texts: Vec<&str> = catalog.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "cargo test --locked",
+                "git status",
+                "$env:",
+                "$",
+                "./",
+                "git",
+                "kubectl",
+                "mycustom",
+            ]
+        );
+        assert_eq!(catalog[0].kind, EntryKind::History);
+        assert_eq!(catalog[4].children.len(), 2);
+        assert!(catalog[5].desc.contains("[branch: main]"));
+        assert!(catalog[6]
+            .children
+            .iter()
+            .any(|c| c.text == "--namespace" && c.kind == EntryKind::Param));
+        assert!(catalog[6]
+            .children
+            .iter()
+            .any(|c| c.text == "get" && c.kind == EntryKind::Subcmd));
+    }
+
+    #[test]
+    fn test_detect_git_context_and_cwd_scan_in_temp_dir() {
+        let base = std::env::temp_dir().join(format!("zpane_ctx_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".git").join("refs").join("heads").join("feat")).unwrap();
+        fs::create_dir_all(base.join("subdir").join("nested")).unwrap();
+        fs::write(base.join("alpha.txt"), b"hello").unwrap();
+        fs::write(
+            base.join(".git").join("HEAD"),
+            b"ref: refs/heads/feat/demo\n",
+        )
+        .unwrap();
+        fs::write(
+            base.join(".git").join("refs").join("heads").join("main"),
+            b"0123456789abcdef\n",
+        )
+        .unwrap();
+        fs::write(
+            base.join(".git")
+                .join("refs")
+                .join("heads")
+                .join("feat")
+                .join("demo"),
+            b"fedcba9876543210\n",
+        )
+        .unwrap();
+
+        let (branch, branches) = detect_git_context_in(&base.join("subdir").join("nested"));
+        assert_eq!(branch.as_deref(), Some("feat/demo"));
+        assert_eq!(branches, vec!["feat/demo", "main"]);
+
+        let cwd = scan_cwd_entries(&base);
+        let names: Vec<(&str, bool)> = cwd.iter().map(|e| (e.name.as_str(), e.is_dir)).collect();
+        assert_eq!(
+            names,
+            vec![(".git", true), ("subdir", true), ("alpha.txt", false)]
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

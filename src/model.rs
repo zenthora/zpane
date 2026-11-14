@@ -37,6 +37,8 @@ pub enum EntryRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryKind {
+    History,
+    Path,
     Env,
     Var,
     Cli,
@@ -56,6 +58,8 @@ pub enum EntryKind {
 impl EntryKind {
     pub fn badge(self) -> &'static str {
         match self {
+            EntryKind::History => "[Hist]",
+            EntryKind::Path => "[Path]",
             EntryKind::Env => "[Env]",
             EntryKind::Var => "[Var]",
             EntryKind::Cli => "[CLI]",
@@ -70,6 +74,101 @@ impl EntryKind {
             EntryKind::Arg => "[Arg]",
             EntryKind::Loading => "[...]",
         }
+    }
+}
+
+/// An entry (directory or file) inside the active working directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CwdEntry {
+    pub name: String,
+    #[serde(default)]
+    pub is_dir: bool,
+}
+
+/// Dynamic runtime context captured from the host shell wrapper and/or working directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeContext {
+    /// Active Git branch name (e.g. `"main"`).
+    #[serde(default)]
+    pub git_branch: Option<String>,
+    /// Local Git branches in the current repository (current branch first when known).
+    #[serde(default)]
+    pub git_branches: Vec<String>,
+    /// Entries in the current working directory (folders first, then files).
+    #[serde(default)]
+    pub cwd_entries: Vec<CwdEntry>,
+    /// Recent shell session commands (newest first) surfaced at the top of Pane 1.
+    #[serde(default)]
+    pub history: Vec<String>,
+}
+
+fn format_path_token(raw: &str, is_dir: bool) -> (String, String) {
+    let display = if is_dir {
+        format!("{}/", raw.trim_end_matches(['/', '\\']))
+    } else {
+        raw.to_string()
+    };
+    let token = if display.contains(char::is_whitespace) {
+        format!("\"{display}\"")
+    } else {
+        display.clone()
+    };
+    let label = if is_dir {
+        format!("📁 {display}")
+    } else {
+        display
+    };
+    (token, label)
+}
+
+impl RuntimeContext {
+    /// Returns Git branch [`Entry`] values derived from `git_branch` and `git_branches` (current branch first).
+    pub fn git_branch_entries(&self) -> Vec<Entry> {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+
+        if let Some(ref cur) = self.git_branch {
+            let trimmed = cur.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                out.push(Entry::new(
+                    trimmed,
+                    format!("⎇ {trimmed} (current branch)"),
+                    EntryKind::Arg,
+                    "Current Git branch from runtime context",
+                ));
+            }
+        }
+
+        for branch in &self.git_branches {
+            let trimmed = branch.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                out.push(Entry::new(
+                    trimmed,
+                    format!("⎇ {trimmed}"),
+                    EntryKind::Arg,
+                    "Local Git branch",
+                ));
+            }
+        }
+
+        out
+    }
+
+    /// Returns current directory file/folder [`Entry`] values, optionally filtered to directories only.
+    pub fn cwd_path_entries(&self, dirs_only: bool) -> Vec<Entry> {
+        self.cwd_entries
+            .iter()
+            .filter(|e| !dirs_only || e.is_dir)
+            .map(|e| {
+                let (token, label) = format_path_token(&e.name, e.is_dir);
+                let kind_desc = if e.is_dir {
+                    "Current directory folder"
+                } else {
+                    "Current directory file"
+                };
+                Entry::new(token, label, EntryKind::Path, kind_desc)
+            })
+            .collect()
     }
 }
 
@@ -334,5 +433,39 @@ mod tests {
         let entry: Entry = serde_json::from_str(json).expect("deserialize legacy Switch kind");
         assert_eq!(entry.kind, EntryKind::Flag);
         assert_eq!(entry.role, EntryRole::Token);
+    }
+
+    #[test]
+    fn test_runtime_context_builds_branch_and_cwd_entries() {
+        let ctx = RuntimeContext {
+            git_branch: Some("feat/roadmap".to_string()),
+            git_branches: vec!["main".to_string(), "feat/roadmap".to_string()],
+            cwd_entries: vec![
+                CwdEntry {
+                    name: "src".to_string(),
+                    is_dir: true,
+                },
+                CwdEntry {
+                    name: "my file.txt".to_string(),
+                    is_dir: false,
+                },
+            ],
+            history: vec!["cargo test".to_string()],
+        };
+
+        let branches = ctx.git_branch_entries();
+        let branch_texts: Vec<&str> = branches.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(branch_texts, vec!["feat/roadmap", "main"]);
+        assert!(branches[0].label.contains("current branch"));
+
+        let all_paths = ctx.cwd_path_entries(false);
+        assert_eq!(all_paths.len(), 2);
+        assert_eq!(all_paths[0].text, "src/");
+        assert_eq!(all_paths[0].kind, EntryKind::Path);
+        assert_eq!(all_paths[1].text, "\"my file.txt\"");
+
+        let only_dirs = ctx.cwd_path_entries(true);
+        assert_eq!(only_dirs.len(), 1);
+        assert_eq!(only_dirs[0].text, "src/");
     }
 }

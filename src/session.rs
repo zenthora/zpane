@@ -1,6 +1,6 @@
 use crate::discovery::{CliIntrospector, Introspect, ShellDialect};
 use crate::fuzzy::PaneList;
-use crate::model::{Entry, EntryKind, Pane};
+use crate::model::{Entry, EntryKind, Pane, RuntimeContext};
 use crate::ui::{render_frame, RenderState, Viewport};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::collections::VecDeque;
@@ -240,6 +240,91 @@ impl CommandLine {
     }
 }
 
+fn extend_dedup(target: &mut Vec<Entry>, additions: Vec<Entry>) {
+    let mut existing: std::collections::HashSet<String> =
+        target.iter().map(|e| e.text.to_ascii_lowercase()).collect();
+    for entry in additions {
+        if existing.insert(entry.text.to_ascii_lowercase()) {
+            target.push(entry);
+        }
+    }
+}
+
+fn expand_runtime_entries(children: &[Entry], ctx: &RuntimeContext) -> Vec<Entry> {
+    let mut out = Vec::with_capacity(children.len());
+    for child in children {
+        if child.is_placeholder() && child.label == "$files" {
+            let cwd = ctx.cwd_path_entries(false);
+            if cwd.is_empty() {
+                out.push(Entry::placeholder(
+                    "(No files in current directory)",
+                    EntryKind::Path,
+                    "Expanded from spec $files macro",
+                ));
+            } else {
+                out.extend(cwd);
+            }
+        } else if child.is_placeholder() && child.label == "$directories" {
+            let dirs = ctx.cwd_path_entries(true);
+            if dirs.is_empty() {
+                out.push(Entry::placeholder(
+                    "(No directories in current directory)",
+                    EntryKind::Path,
+                    "Expanded from spec $directories macro",
+                ));
+            } else {
+                out.extend(dirs);
+            }
+        } else {
+            out.push(child.clone());
+        }
+    }
+    out
+}
+
+fn history_command_chain(cmd: &str) -> Vec<&str> {
+    cmd.split_whitespace()
+        .take_while(|tok| !tok.starts_with('-'))
+        .take(2)
+        .collect()
+}
+
+fn primary_exe_for_entry(entry: &Entry) -> &str {
+    if entry.kind == EntryKind::History {
+        entry
+            .text
+            .split_whitespace()
+            .next()
+            .unwrap_or(entry.text.as_str())
+    } else {
+        entry.text.as_str()
+    }
+}
+
+fn is_git_branch_target(exe: &str, p2: &Entry) -> bool {
+    if !exe.eq_ignore_ascii_case("git") {
+        return false;
+    }
+    matches!(
+        p2.text.to_ascii_lowercase().as_str(),
+        "checkout"
+            | "switch"
+            | "branch"
+            | "merge"
+            | "rebase"
+            | "diff"
+            | "log"
+            | "push"
+            | "pull"
+            | "reset"
+            | "cherry-pick"
+            | "show"
+            | "tag"
+            | "-b"
+            | "--track"
+    ) || p2.text == "-B"
+}
+
 fn resolve_pane2_entries<I: Introspect>(
     pane1_entry: Option<&Entry>,
     tokens: &[String],
@@ -257,6 +342,14 @@ fn resolve_pane2_entries<I: Introspect>(
         return p1.children_for_tokens(tokens);
     }
 
+    if p1.kind == EntryKind::History {
+        let chain = history_command_chain(&p1.text);
+        if chain.is_empty() {
+            return (Vec::new(), None);
+        }
+        return (introspector.query(&chain), None);
+    }
+
     (introspector.query(&[p1.text.as_str()]), None)
 }
 
@@ -266,6 +359,7 @@ fn resolve_pane3_entries<I: Introspect>(
     introspector: &mut I,
     pane3_filter: &str,
     dialect: ShellDialect,
+    runtime_ctx: &RuntimeContext,
 ) -> Vec<Entry> {
     let (Some(p1), Some(p2)) = (pane1_entry, pane2_entry) else {
         return Vec::new();
@@ -275,6 +369,7 @@ fn resolve_pane3_entries<I: Introspect>(
         return Vec::new();
     }
 
+    let p1_exe = primary_exe_for_entry(p1);
     let mut entries = Vec::new();
     let trimmed_input = pane3_filter.trim();
 
@@ -297,19 +392,43 @@ fn resolve_pane3_entries<I: Introspect>(
     }
 
     if !p2.children.is_empty() {
-        entries.extend_from_slice(&p2.children);
+        if is_git_branch_target(p1_exe, p2) {
+            extend_dedup(&mut entries, runtime_ctx.git_branch_entries());
+        }
+        extend_dedup(
+            &mut entries,
+            expand_runtime_entries(&p2.children, runtime_ctx),
+        );
         if matches!(p2.kind, EntryKind::Param | EntryKind::Flag) {
-            entries.extend(dialect.common_var_entries());
+            extend_dedup(&mut entries, dialect.common_var_entries());
         }
         return entries;
     }
 
     if p2.kind == EntryKind::Subcmd {
-        entries.extend(introspector.query(&[p1.text.as_str(), p2.text.as_str()]));
+        let sub_entries = introspector.query(&[p1_exe, p2.text.as_str()]);
+        if sub_entries.iter().any(Entry::is_loading) {
+            entries.extend(sub_entries);
+            return entries;
+        }
+        if is_git_branch_target(p1_exe, p2) {
+            extend_dedup(&mut entries, runtime_ctx.git_branch_entries());
+        }
+        extend_dedup(&mut entries, sub_entries);
+        extend_dedup(&mut entries, runtime_ctx.cwd_path_entries(false));
         return entries;
     }
 
-    entries.extend(dialect.common_var_entries());
+    if !p1.is_scope_root() {
+        if is_git_branch_target(p1_exe, p2) {
+            extend_dedup(&mut entries, runtime_ctx.git_branch_entries());
+        }
+        if p2.kind == EntryKind::Param {
+            extend_dedup(&mut entries, runtime_ctx.cwd_path_entries(false));
+        }
+    }
+
+    extend_dedup(&mut entries, dialect.common_var_entries());
     entries
 }
 
@@ -341,6 +460,7 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     pane3_cache_state: Option<Pane3CacheState>,
     introspector: I,
     catalog_loader: Option<CatalogLoader>,
+    runtime_ctx: RuntimeContext,
     active_pane: Pane,
     cmd: CommandLine,
     active_param_set_label: Option<String>,
@@ -366,6 +486,7 @@ impl<I: Introspect> MillerSession<I> {
             pane3_cache_state: None,
             introspector,
             catalog_loader: None,
+            runtime_ctx: RuntimeContext::default(),
             active_pane,
             cmd,
             active_param_set_label: None,
@@ -375,6 +496,16 @@ impl<I: Introspect> MillerSession<I> {
         };
         session.sync_panes();
         session
+    }
+
+    /// Attaches dynamic runtime context (Git branch, CWD files, shell history)
+    /// used to enrich Pane 2 and Pane 3 completions.
+    pub fn with_runtime_context(mut self, runtime_ctx: RuntimeContext) -> Self {
+        self.runtime_ctx = runtime_ctx;
+        self.pane2_cache_state = None;
+        self.pane3_cache_state = None;
+        self.sync_panes();
+        self
     }
 
     /// Configures a catalog loader invoked on [`UserAction::ReloadCatalog`].
@@ -810,6 +941,7 @@ impl<I: Introspect> MillerSession<I> {
                 &mut self.introspector,
                 self.panes[2].filter(),
                 self.dialect,
+                &self.runtime_ctx,
             );
             self.panes[2].set_entries(entries);
             self.panes[2].reset_cursor();
@@ -1606,5 +1738,151 @@ mod tests {
         session.apply(UserAction::MoveDown);
         session.apply(UserAction::StepRight);
         assert_eq!(session.command_line(), "cargo build");
+    }
+
+    #[test]
+    fn test_git_branch_entries_appear_in_pane3_for_git_checkout() {
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git VCS");
+        git.children = vec![Entry::new(
+            "checkout",
+            "checkout",
+            EntryKind::Subcmd,
+            "Switch branches",
+        )];
+
+        let fake = FakeIntrospector::with_chains([(
+            "git::checkout",
+            vec![Entry::new("--force", "--force", EntryKind::Flag, "Force")],
+        )]);
+        let ctx = RuntimeContext {
+            git_branch: Some("main".to_string()),
+            git_branches: vec!["main".to_string(), "feat/branches".to_string()],
+            cwd_entries: vec![crate::model::CwdEntry {
+                name: "README.md".to_string(),
+                is_dir: false,
+            }],
+            history: vec![],
+        };
+
+        let mut session = MillerSession::new(
+            vec![git],
+            fake.clone(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_runtime_context(ctx);
+
+        // Step into checkout -> Pane 3 initially waits for git::checkout introspection
+        session.apply(UserAction::StepRight);
+        fake.complete_next();
+        assert!(session.poll_discovery());
+
+        let p3_texts: Vec<&str> = session.view().panes[2]
+            .entries()
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(
+            p3_texts,
+            vec!["main", "feat/branches", "--force", "README.md"]
+        );
+
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::MoveDown);
+        assert_eq!(session.command_line(), "git checkout feat/branches");
+    }
+
+    #[test]
+    fn test_spec_files_and_directories_macros_expand_to_cwd_entries_in_pane3() {
+        let mut tool = Entry::new("tool", "tool", EntryKind::Cli, "Spec tool");
+        let mut file_param = Entry::new("--input", "--input", EntryKind::Param, "Input file");
+        file_param.children = vec![Entry::placeholder("$files", EntryKind::Path, "Spec macro")];
+        let mut dir_param = Entry::new("--dir", "--dir", EntryKind::Param, "Target directory");
+        dir_param.children = vec![Entry::placeholder(
+            "$directories",
+            EntryKind::Path,
+            "Spec macro",
+        )];
+        tool.children = vec![file_param, dir_param];
+
+        let ctx = RuntimeContext {
+            cwd_entries: vec![
+                crate::model::CwdEntry {
+                    name: "src".to_string(),
+                    is_dir: true,
+                },
+                crate::model::CwdEntry {
+                    name: "Cargo.toml".to_string(),
+                    is_dir: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut session = MillerSession::new(
+            vec![tool],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_runtime_context(ctx);
+
+        // --input expands $files (both dirs and files)
+        let p3_files: Vec<&str> = session.view().panes[2]
+            .entries()
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(p3_files.contains(&"src/"));
+        assert!(p3_files.contains(&"Cargo.toml"));
+        assert!(!p3_files.contains(&"$files"));
+
+        // Moving to --dir expands $directories (only dirs)
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::MoveDown);
+        let p3_dirs: Vec<&str> = session.view().panes[2]
+            .entries()
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert!(p3_dirs.contains(&"src/"));
+        assert!(!p3_dirs.contains(&"Cargo.toml"));
+        assert!(!p3_dirs.contains(&"$directories"));
+    }
+
+    #[test]
+    fn test_history_entry_in_pane1_introspects_leading_command_chain() {
+        let hist = Entry::new(
+            "cargo test --release",
+            "cargo test --release",
+            EntryKind::History,
+            "Recent shell history",
+        );
+        let fake = FakeIntrospector::with_chains([(
+            "cargo::test",
+            vec![Entry::new(
+                "--locked",
+                "--locked",
+                EntryKind::Flag,
+                "Locked",
+            )],
+        )]);
+
+        let mut session = MillerSession::new(
+            vec![hist],
+            fake.clone(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        fake.complete_next();
+        assert!(session.poll_discovery());
+
+        assert!(session.view().panes[1]
+            .entries()
+            .iter()
+            .any(|e| e.text == "--locked"));
     }
 }
