@@ -39,16 +39,76 @@ fn is_safe_spec_command_name(name: &str) -> bool {
     is_safe_command_token(name) && !name.contains(['/', '\\', ':', '\0']) && !name.contains("..")
 }
 
-fn clean_spec_token(raw: &str) -> Option<String> {
+fn clean_spec_token_cow(raw: &str) -> Option<Cow<'_, str>> {
     let cleaned = sanitize_single_line(raw.trim());
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty()
-        || trimmed.len() > 256
-        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
-    {
-        return None;
+    let valid = |s: &str| {
+        !s.is_empty() && s.len() <= 256 && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+    };
+    match cleaned {
+        Cow::Borrowed(s) => {
+            let trimmed = s.trim();
+            valid(trimmed).then_some(Cow::Borrowed(trimmed))
+        }
+        Cow::Owned(s) => {
+            let trimmed = s.trim();
+            valid(trimmed).then(|| Cow::Owned(trimmed.to_string()))
+        }
     }
-    Some(trimmed.to_string())
+}
+
+fn clean_spec_token(raw: &str) -> Option<String> {
+    clean_spec_token_cow(raw).map(Cow::into_owned)
+}
+
+#[inline]
+fn to_ascii_lower_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+#[inline]
+fn insert_ascii_lower_unique(set: &mut HashSet<String>, value: &str) -> bool {
+    if value.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = value.to_ascii_lowercase();
+        if set.contains(lower.as_str()) {
+            return false;
+        }
+        set.insert(lower)
+    } else {
+        if set.contains(value) {
+            return false;
+        }
+        set.insert(value.to_owned())
+    }
+}
+
+fn build_option_entry_from_tokens(
+    mut tokens: Vec<Cow<'_, str>>,
+    primary_idx: usize,
+    kind: EntryKind,
+    desc: &str,
+) -> Entry {
+    let primary_str = tokens.get(primary_idx).map(Cow::as_ref).unwrap_or_default();
+    let aliases: Vec<String> = tokens
+        .iter()
+        .filter(|t| t.as_ref() != primary_str)
+        .map(|t| t.as_ref().to_string())
+        .collect();
+    let primary = if primary_idx < tokens.len() {
+        tokens.swap_remove(primary_idx).into_owned()
+    } else {
+        String::new()
+    };
+    let label = if aliases.is_empty() {
+        primary.clone()
+    } else {
+        format!("{primary} ({})", aliases.join(", "))
+    };
+    let clean_desc = sanitize_multiline_desc(desc.trim());
+    Entry::new(primary, label, kind, clean_desc.as_ref()).with_aliases(aliases)
 }
 
 fn clean_spec_aliases(raw_aliases: &[String]) -> Vec<String> {
@@ -207,14 +267,19 @@ fn carapace_spec_to_entry(
     let mut entry = Entry::new(spec_name, label, kind, clean_desc.as_ref()).with_aliases(aliases);
 
     let sub_cap = spec.commands.len().min(MAX_SPEC_CHILDREN);
-    let mut children = Vec::with_capacity(sub_cap);
-    let mut seen_sub = HashSet::with_capacity(sub_cap);
+    let total_flags = spec.flags.len().saturating_add(effective_persistent.len());
+    let mut children = Vec::with_capacity(
+        sub_cap
+            .saturating_add(total_flags)
+            .min(MAX_SPEC_CHILDREN * 2),
+    );
 
     // 1. Subcommands first (matches CLI Explorer Pane 2 ergonomics)
-    if depth < MAX_SPEC_TREE_DEPTH {
+    if depth < MAX_SPEC_TREE_DEPTH && !spec.commands.is_empty() {
+        let mut seen_sub: HashSet<Cow<'_, str>> = HashSet::with_capacity(sub_cap);
         for sub in spec.commands.iter().take(MAX_SPEC_CHILDREN) {
             let sub_name = sub.name.trim();
-            if is_safe_spec_command_name(sub_name) && seen_sub.insert(sub_name.to_ascii_lowercase())
+            if is_safe_spec_command_name(sub_name) && seen_sub.insert(to_ascii_lower_cow(sub_name))
             {
                 children.push(carapace_spec_to_entry(
                     sub,
@@ -233,36 +298,41 @@ fn carapace_spec_to_entry(
         .first()
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    let mut seen_pos = HashSet::new();
-    for raw in first_pos
-        .iter()
-        .chain(spec.completion.positionalany.iter())
-        .take(MAX_SPEC_CHILDREN)
-    {
-        if let Some(val_entry) = carapace_completion_item_to_entry(raw, EntryKind::Arg) {
-            let dedup_key = if val_entry.is_placeholder() {
-                (true, val_entry.label.to_ascii_lowercase())
-            } else {
-                (false, val_entry.text.to_ascii_lowercase())
-            };
-            if seen_pos.insert(dedup_key) {
-                children.push(val_entry);
+    if !first_pos.is_empty() || !spec.completion.positionalany.is_empty() {
+        let mut seen_pos_placeholders = HashSet::new();
+        let mut seen_pos_values = HashSet::new();
+        for raw in first_pos
+            .iter()
+            .chain(spec.completion.positionalany.iter())
+            .take(MAX_SPEC_CHILDREN)
+        {
+            if let Some(val_entry) = carapace_completion_item_to_entry(raw, EntryKind::Arg) {
+                let is_new = if val_entry.is_placeholder() {
+                    insert_ascii_lower_unique(&mut seen_pos_placeholders, &val_entry.label)
+                } else {
+                    insert_ascii_lower_unique(&mut seen_pos_values, &val_entry.text)
+                };
+                if is_new {
+                    children.push(val_entry);
+                }
             }
         }
     }
 
     // 3. Local flags first, then inherited/persistent flags so local overrides win even when
     //    suffix markers (=, ?, *) or short-flag prefixes differ.
-    let mut seen_flags =
-        HashSet::with_capacity(spec.flags.len().saturating_add(effective_persistent.len()));
-    for (flag_spec, desc) in spec
-        .flags
-        .iter()
-        .chain(effective_persistent.iter())
-        .take(MAX_SPEC_CHILDREN)
-    {
-        if let Some(flag_entry) = parse_carapace_flag(flag_spec, desc, &spec.completion.flag) {
-            if seen_flags.insert(flag_entry.text.to_ascii_lowercase()) {
+    if total_flags > 0 {
+        let mut seen_flags: HashSet<Cow<'_, str>> =
+            HashSet::with_capacity(total_flags.min(MAX_SPEC_CHILDREN));
+        for (flag_spec, desc) in spec
+            .flags
+            .iter()
+            .chain(effective_persistent.iter())
+            .take(MAX_SPEC_CHILDREN)
+        {
+            if let Some(flag_entry) =
+                parse_carapace_flag_if_new(flag_spec, desc, &spec.completion.flag, &mut seen_flags)
+            {
                 children.push(flag_entry);
             }
         }
@@ -272,10 +342,11 @@ fn carapace_spec_to_entry(
     entry
 }
 
-fn parse_carapace_flag(
-    raw_spec: &str,
+fn parse_carapace_flag_if_new<'a>(
+    raw_spec: &'a str,
     desc: &str,
     flag_completions: &BTreeMap<String, Vec<String>>,
+    seen_flags: &mut HashSet<Cow<'a, str>>,
 ) -> Option<Entry> {
     let mut trimmed = raw_spec.trim();
     if trimmed.is_empty() {
@@ -294,36 +365,54 @@ fn parse_carapace_flag(
         }
     }
 
-    let parts: Vec<String> = trimmed.split(',').filter_map(clean_spec_token).collect();
+    let parts: Vec<Cow<'a, str>> = trimmed
+        .split(',')
+        .filter_map(clean_spec_token_cow)
+        .collect();
     if parts.is_empty() {
         return None;
     }
 
     // Prefer long option (--foo) as primary token; keep short/other variants as Parameter Aliases
-    let primary = parts
-        .iter()
-        .find(|p| p.starts_with("--"))
-        .unwrap_or(&parts[0])
-        .clone();
-    let aliases: Vec<String> = parts.iter().filter(|p| **p != primary).cloned().collect();
+    let primary_idx = parts.iter().position(|p| p.starts_with("--")).unwrap_or(0);
+    let primary_ref = parts[primary_idx].as_ref();
+    let dedup_key: Cow<'a, str> = if primary_ref.bytes().any(|b| b.is_ascii_uppercase()) {
+        let lower = primary_ref.to_ascii_lowercase();
+        if seen_flags.contains(lower.as_str()) {
+            return None;
+        }
+        Cow::Owned(lower)
+    } else {
+        if seen_flags.contains(primary_ref) {
+            return None;
+        }
+        match &parts[primary_idx] {
+            Cow::Borrowed(s) => Cow::Borrowed(*s),
+            Cow::Owned(s) => Cow::Owned(s.clone()),
+        }
+    };
+    seen_flags.insert(dedup_key);
 
     let mut children = Vec::new();
-    let mut seen_vals = HashSet::new();
-    for candidate_key in &parts {
-        let stripped = candidate_key.trim_start_matches('-');
-        if let Some(vals) = flag_completions
-            .get(stripped)
-            .or_else(|| flag_completions.get(candidate_key.as_str()))
-        {
-            for raw in vals.iter().take(MAX_SPEC_CHILDREN) {
-                if let Some(child) = carapace_completion_item_to_entry(raw, EntryKind::Enum) {
-                    let dedup_key = if child.is_placeholder() {
-                        (true, child.label.to_ascii_lowercase())
-                    } else {
-                        (false, child.text.to_ascii_lowercase())
-                    };
-                    if seen_vals.insert(dedup_key) {
-                        children.push(child);
+    if !flag_completions.is_empty() {
+        let mut seen_placeholders = HashSet::new();
+        let mut seen_vals = HashSet::new();
+        for candidate_key in &parts {
+            let stripped = candidate_key.trim_start_matches('-');
+            if let Some(vals) = flag_completions
+                .get(stripped)
+                .or_else(|| flag_completions.get(candidate_key.as_ref()))
+            {
+                for raw in vals.iter().take(MAX_SPEC_CHILDREN) {
+                    if let Some(child) = carapace_completion_item_to_entry(raw, EntryKind::Enum) {
+                        let is_new = if child.is_placeholder() {
+                            insert_ascii_lower_unique(&mut seen_placeholders, &child.label)
+                        } else {
+                            insert_ascii_lower_unique(&mut seen_vals, &child.text)
+                        };
+                        if is_new {
+                            children.push(child);
+                        }
                     }
                 }
             }
@@ -336,14 +425,7 @@ fn parse_carapace_flag(
         EntryKind::Flag
     };
 
-    let label = if aliases.is_empty() {
-        primary.clone()
-    } else {
-        format!("{primary} ({})", aliases.join(", "))
-    };
-
-    let clean_desc = sanitize_multiline_desc(desc.trim());
-    let mut entry = Entry::new(&primary, label, kind, clean_desc.as_ref()).with_aliases(aliases);
+    let mut entry = build_option_entry_from_tokens(parts, primary_idx, kind, desc);
     entry.children = children;
     Some(entry)
 }
@@ -497,20 +579,16 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool, depth: usize) -> Entry {
         let Some(ref names_raw) = opt.name else {
             continue;
         };
-        let names: Vec<String> = names_raw
+        let names: Vec<Cow<'_, str>> = names_raw
             .as_slice()
             .iter()
-            .filter_map(|s| clean_spec_token(s))
+            .take(64)
+            .filter_map(|s| clean_spec_token_cow(s))
             .collect();
         if names.is_empty() {
             continue;
         }
-        let primary = names
-            .iter()
-            .find(|n| n.starts_with("--"))
-            .unwrap_or(&names[0])
-            .clone();
-        let aliases: Vec<String> = names.into_iter().filter(|n| *n != primary).collect();
+        let primary_idx = names.iter().position(|n| n.starts_with("--")).unwrap_or(0);
         let arg_children = opt
             .args
             .as_ref()
@@ -523,15 +601,9 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool, depth: usize) -> Entry {
         } else {
             EntryKind::Flag
         };
-        let label = if aliases.is_empty() {
-            primary.clone()
-        } else {
-            format!("{primary} ({})", aliases.join(", "))
-        };
 
-        let opt_desc = sanitize_multiline_desc(opt.description.trim());
         let mut opt_entry =
-            Entry::new(&primary, label, opt_kind, opt_desc.as_ref()).with_aliases(aliases);
+            build_option_entry_from_tokens(names, primary_idx, opt_kind, &opt.description);
         opt_entry.children = arg_children;
         children.push(opt_entry);
     }
@@ -565,14 +637,14 @@ fn fig_args_to_entries(args: &[FigArg]) -> Vec<Entry> {
                 FigSuggestion::Plain(val) if !val.trim().is_empty() => {
                     let clean_v = sanitize_single_line(val.trim());
                     let v = clean_v.trim();
-                    if !v.is_empty() {
+                    if !v.is_empty() && v.len() <= 256 {
                         out.push(Entry::new(v, v, EntryKind::Enum, ""));
                     }
                 }
                 FigSuggestion::Detailed { name, description } if !name.trim().is_empty() => {
                     let clean_n = sanitize_single_line(name.trim());
                     let n = clean_n.trim();
-                    if !n.is_empty() {
+                    if !n.is_empty() && n.len() <= 256 {
                         let clean_d = sanitize_multiline_desc(description.trim());
                         out.push(Entry::new(n, n, EntryKind::Enum, clean_d.as_ref()));
                     }
@@ -595,6 +667,9 @@ struct YamlLine<'a> {
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
+    if !line.contains('#') {
+        return line;
+    }
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
@@ -622,7 +697,8 @@ fn strip_yaml_comment(line: &str) -> &str {
 }
 
 fn tokenize_yaml(input: &str) -> anyhow::Result<Vec<YamlLine<'_>>> {
-    let mut out = Vec::new();
+    let est = (input.len() / 32).clamp(8, 512);
+    let mut out = Vec::with_capacity(est);
     for raw in input.lines() {
         if out.len() >= MAX_YAML_LINES {
             anyhow::bail!("YAML spec exceeds maximum allowed lines ({MAX_YAML_LINES})");
@@ -720,6 +796,9 @@ fn consume_yaml_value(
 }
 
 fn find_mapping_colon(text: &str) -> Option<usize> {
+    if !text.contains(':') {
+        return None;
+    }
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
@@ -1315,5 +1394,133 @@ commands:
         }
         assert!(depth_seen <= MAX_SPEC_TREE_DEPTH + 1);
         assert!(depth_seen >= MAX_SPEC_TREE_DEPTH);
+    }
+
+    #[test]
+    fn test_pentest_specs_adversarial_yaml_json_escapes_and_bounds() {
+        // 1. Malformed YAML structures: tabs, >256 indent, > MAX_YAML_LINES, BOM-only.
+        assert!(parse_spec_str("tabs.yaml", "name: tool\n\tflags:\n").is_err());
+        let deep_indent = format!("name: tool\n{}k: v\n", " ".repeat(260));
+        assert!(parse_spec_str("indent260.yaml", &deep_indent).is_err());
+
+        let mut too_many_lines = String::from("name: lines\nflags:\n");
+        for i in 0..(MAX_YAML_LINES + 10) {
+            too_many_lines.push_str(&format!("  --f{i}: desc\n"));
+        }
+        assert!(parse_spec_str("many.yaml", &too_many_lines).is_err());
+        assert!(parse_spec_str("bom.yaml", "\u{feff}   \n  \n").is_err());
+
+        // 2. Deeply nested JSON beyond serde_json recursion limit must fail cleanly without panic.
+        let deep_json = format!(
+            "{{\"name\":\"deep\",\"options\":[{{\"name\":\"-x\",\"args\":{{\"suggestions\":{}1{}}}}}]}}",
+            "[".repeat(200),
+            "]".repeat(200)
+        );
+        assert!(parse_spec_str("deepjson.json", &deep_json).is_err());
+
+        // 3. Injection / Bidi / control chars in Carapace & Fig specs.
+        for bad_root in [
+            "tool\x1b[31m",
+            "tool\u{202e}evil",
+            "tool\u{061c}alm",
+            "tool\u{2028}sep",
+        ] {
+            let json = serde_json::json!({
+                "name": bad_root,
+                "flags": {"-v": "verbose"}
+            })
+            .to_string();
+            assert!(
+                parse_spec_str("badroot.json", &json).is_err(),
+                "must reject hostile root {bad_root:?}"
+            );
+        }
+
+        // 4. Case-insensitive dedup in seen_sub / seen_flags + local override + cap bounds.
+        let yaml_dedup = r#"
+name: deduptool
+persistentflags:
+  --Mode: Persistent flag
+  --Keep: Persistent keep
+flags:
+  -m, --mode=: Local override
+  --KEEP: Duplicate differing only by case
+commands:
+  - name: Deploy
+    description: First deploy
+  - name: deploy
+    description: Duplicate lowercase deploy
+  - name: "bad\u{202e}sub"
+"#;
+        let parsed = parse_spec_str("dedup.yaml", yaml_dedup).expect("dedup yaml");
+        let sub_names: Vec<&str> = parsed
+            .children
+            .iter()
+            .filter(|c| c.kind == EntryKind::Subcmd)
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(sub_names, vec!["Deploy"]);
+
+        let mode = parsed
+            .children
+            .iter()
+            .find(|c| c.text == "--mode")
+            .expect("--mode local override");
+        assert_eq!(mode.kind, EntryKind::Param);
+        assert_eq!(mode.desc, "Local override");
+        assert_eq!(
+            parsed
+                .children
+                .iter()
+                .filter(|c| c.text.eq_ignore_ascii_case("--mode"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            parsed
+                .children
+                .iter()
+                .filter(|c| c.text.eq_ignore_ascii_case("--keep"))
+                .count(),
+            1
+        );
+
+        // 5. Fig JSON suggestion length bounds & control/Bidi stripping + alias cap.
+        let long_sug = "a".repeat(300);
+        let many_aliases: Vec<String> = (0..100).map(|i| format!("--alias-{i}")).collect();
+        let fig_hostile = serde_json::json!({
+            "name": "figsec",
+            "description": "Safe\r\nDesc\u{202e}\u{061c}",
+            "subcommands": [
+                {"name": "-rf"},
+                {"name": "oksub", "description": "Valid"}
+            ],
+            "options": [
+                {
+                    "name": many_aliases,
+                    "description": "Option\x1b[31m",
+                    "args": {
+                        "suggestions": [
+                            long_sug,
+                            {"name": "good\u{202e}", "description": "Clean\u{0007}\nLine2"}
+                        ]
+                    }
+                }
+            ]
+        })
+        .to_string();
+        let fig_entry = parse_spec_str("figsec.json", &fig_hostile).expect("figsec");
+        assert_eq!(fig_entry.desc, "Safe\nDesc");
+        assert!(fig_entry.children.iter().any(|c| c.text == "oksub"));
+        assert!(!fig_entry.children.iter().any(|c| c.text == "-rf"));
+        let opt = fig_entry
+            .children
+            .iter()
+            .find(|c| c.text == "--alias-0")
+            .expect("--alias-0");
+        assert!(opt.aliases.len() < 64);
+        assert_eq!(opt.children.len(), 1);
+        assert_eq!(opt.children[0].text, "good");
+        assert_eq!(opt.children[0].desc, "Clean\nLine2");
     }
 }

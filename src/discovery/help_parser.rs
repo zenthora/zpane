@@ -36,38 +36,43 @@ fn is_unsafe_display_control(c: char) -> bool {
     (c.is_control() && c != '\n' && c != '\t')
         || matches!(
             c,
-            '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            '\u{061c}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{2028}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
         )
 }
 
 fn strip_ansi_escapes(text: &str) -> Cow<'_, str> {
     let bytes = text.as_bytes();
-    let needs_clean = if text.is_ascii() {
-        let mut dirty = false;
-        for (idx, &b) in bytes.iter().enumerate() {
-            if b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t' && b != b'\r') {
-                dirty = true;
-                break;
-            }
-            if b == b'\r' && bytes.get(idx + 1) != Some(&b'\n') {
-                dirty = true;
-                break;
-            }
+    let mut needs_clean = false;
+    let mut non_ascii_start = None;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b >= 0x80 {
+            non_ascii_start = Some(idx);
+            break;
         }
-        dirty
-    } else {
-        let mut dirty = false;
-        for (idx, ch) in text.char_indices() {
+        if b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t' && b != b'\r') {
+            needs_clean = true;
+            break;
+        }
+        if b == b'\r' && bytes.get(idx + 1) != Some(&b'\n') {
+            needs_clean = true;
+            break;
+        }
+    }
+    if let Some(start) = non_ascii_start {
+        for (rel_idx, ch) in text[start..].char_indices() {
+            let idx = start + rel_idx;
             if ch == '\x1b'
                 || (ch == '\r' && bytes.get(idx + 1) != Some(&b'\n'))
                 || (ch != '\r' && is_unsafe_display_control(ch))
             {
-                dirty = true;
+                needs_clean = true;
                 break;
             }
         }
-        dirty
-    };
+    }
     if !needs_clean {
         return Cow::Borrowed(text);
     }
@@ -98,7 +103,9 @@ fn strip_ansi_escapes(text: &str) -> Cow<'_, str> {
                         if next == '\n' || next == '\r' || count >= 256 {
                             break;
                         }
-                        let c = chars.next().unwrap();
+                        let Some(c) = chars.next() else {
+                            break;
+                        };
                         count += 1;
                         if c == '\x07' {
                             break;
@@ -126,12 +133,23 @@ fn strip_ansi_escapes(text: &str) -> Cow<'_, str> {
 }
 
 fn leading_ws_count(line: &str) -> usize {
-    if let Some(&first) = line.as_bytes().first() {
-        if first < 0x80 && !first.is_ascii_whitespace() {
-            return 0;
+    let bytes = line.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if b == b' ' || b == b'\t' {
+            idx += 1;
+        } else if b < 0x80 && b != b'\x0b' && b != b'\x0c' && b != b'\r' && b != b'\n' {
+            return idx;
+        } else {
+            return idx
+                + line[idx..]
+                    .chars()
+                    .take_while(|c| c.is_whitespace())
+                    .count();
         }
     }
-    line.chars().take_while(|c| c.is_whitespace()).count()
+    idx
 }
 
 fn classify_section_header(line: &str) -> Option<HelpSection> {
@@ -151,14 +169,26 @@ fn classify_section_header(line: &str) -> Option<HelpSection> {
         return Some(HelpSection::Ignore);
     }
 
-    let is_all_caps = trimmed.len() >= 3
-        && trimmed
-            .chars()
-            .all(|c| !c.is_alphabetic() || c.is_uppercase());
-    let ends_with_colon = trimmed.ends_with(':');
+    if has_column_gap {
+        return None;
+    }
 
-    if !has_column_gap
-        && (leading_spaces <= 1 || ends_with_colon || is_all_caps)
+    let ends_with_colon = trimmed.ends_with(':');
+    let is_all_caps = || {
+        trimmed.len() >= 3
+            && if trimmed.is_ascii() {
+                trimmed
+                    .bytes()
+                    .all(|b| !b.is_ascii_alphabetic() || b.is_ascii_uppercase())
+            } else {
+                trimmed
+                    .chars()
+                    .all(|c| !c.is_alphabetic() || c.is_uppercase())
+            }
+    };
+    let header_eligible = leading_spaces <= 1 || ends_with_colon || is_all_caps();
+
+    if header_eligible
         && (starts_with_ignore_ascii_case(trimmed, "examples")
             || starts_with_ignore_ascii_case(trimmed, "learn more")
             || starts_with_ignore_ascii_case(trimmed, "see '")
@@ -169,27 +199,40 @@ fn classify_section_header(line: &str) -> Option<HelpSection> {
         return Some(HelpSection::Ignore);
     }
 
-    if has_column_gap {
-        return None;
+    match trimmed.as_bytes().first().map(u8::to_ascii_lowercase) {
+        Some(b's') if starts_with_ignore_ascii_case(trimmed, "start a working area") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b'w') if starts_with_ignore_ascii_case(trimmed, "work on the current change") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b'e') if starts_with_ignore_ascii_case(trimmed, "examine the history") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b'g') if starts_with_ignore_ascii_case(trimmed, "grow, mark and tweak") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b'c') if starts_with_ignore_ascii_case(trimmed, "collaborate") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b'm') if starts_with_ignore_ascii_case(trimmed, "main porcelain commands") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b'a') if starts_with_ignore_ascii_case(trimmed, "ancillary commands") => {
+            return Some(HelpSection::Commands);
+        }
+        Some(b't') => {
+            if starts_with_ignore_ascii_case(trimmed, "the following commands are available") {
+                return Some(HelpSection::Commands);
+            }
+            if starts_with_ignore_ascii_case(trimmed, "the following options are available") {
+                return Some(HelpSection::Flags);
+            }
+        }
+        _ => {}
     }
 
-    if starts_with_ignore_ascii_case(trimmed, "start a working area")
-        || starts_with_ignore_ascii_case(trimmed, "work on the current change")
-        || starts_with_ignore_ascii_case(trimmed, "examine the history")
-        || starts_with_ignore_ascii_case(trimmed, "grow, mark and tweak")
-        || starts_with_ignore_ascii_case(trimmed, "collaborate")
-        || starts_with_ignore_ascii_case(trimmed, "main porcelain commands")
-        || starts_with_ignore_ascii_case(trimmed, "ancillary commands")
-        || starts_with_ignore_ascii_case(trimmed, "the following commands are available")
-    {
-        return Some(HelpSection::Commands);
-    }
-
-    if starts_with_ignore_ascii_case(trimmed, "the following options are available") {
-        return Some(HelpSection::Flags);
-    }
-
-    if ends_with_colon || is_all_caps {
+    if ends_with_colon || is_all_caps() {
         if contains_ignore_ascii_case(trimmed, "command")
             || contains_ignore_ascii_case(trimmed, "subcommand")
         {
@@ -209,15 +252,37 @@ fn classify_section_header(line: &str) -> Option<HelpSection> {
     None
 }
 
-fn build_flag_entry(short: &str, raw_flag: &str, arg_hint: &str, desc: &str) -> Entry {
-    let flag = raw_flag.replacen("--[no-]", "--", 1);
+fn cached_regex<'a>(slot: &'a OnceLock<Option<Regex>>, pattern: &str) -> Option<&'a Regex> {
+    slot.get_or_init(|| Regex::new(pattern).ok()).as_ref()
+}
+
+#[inline]
+fn has_two_adjacent_ws(s: &str) -> bool {
+    if !s.is_ascii() {
+        return true;
+    }
+    s.as_bytes()
+        .windows(2)
+        .any(|w| w[0].is_ascii_whitespace() && w[1].is_ascii_whitespace())
+}
+
+fn normalize_flag_token(raw_flag: &str) -> Cow<'_, str> {
+    if raw_flag.contains("--[no-]") {
+        Cow::Owned(raw_flag.replacen("--[no-]", "--", 1))
+    } else {
+        Cow::Borrowed(raw_flag)
+    }
+}
+
+fn build_flag_entry(short: &str, flag: Cow<'_, str>, arg_hint: &str, desc: &str) -> Entry {
     let kind = if arg_hint.is_empty() {
         EntryKind::Flag
     } else {
         EntryKind::Param
     };
 
-    let label = if !short.is_empty() && short != flag {
+    let has_distinct_short = !short.is_empty() && short != flag.as_ref();
+    let label = if has_distinct_short {
         if !arg_hint.is_empty() {
             format!("{flag} {arg_hint} ({short})")
         } else {
@@ -226,62 +291,181 @@ fn build_flag_entry(short: &str, raw_flag: &str, arg_hint: &str, desc: &str) -> 
     } else if !arg_hint.is_empty() {
         format!("{flag} {arg_hint}")
     } else {
-        flag.clone()
+        flag.to_string()
     };
 
-    let mut entry = Entry::new(&flag, label, kind, desc);
-    if !short.is_empty() && short != flag {
+    let mut entry = Entry::new(flag.into_owned(), label, kind, desc);
+    if has_distinct_short {
         entry.aliases.push(short.to_string());
     }
     entry
 }
 
+fn try_push_flag_entry(
+    flags: &mut Vec<Entry>,
+    seen: &mut HashSet<String>,
+    short: &str,
+    raw_flag: &str,
+    arg_hint: &str,
+    desc: &str,
+) -> Option<usize> {
+    let flag = normalize_flag_token(raw_flag);
+    if seen.contains(flag.as_ref()) {
+        return None;
+    }
+    let entry = build_flag_entry(
+        short,
+        flag,
+        arg_hint,
+        truncate_utf8_prefix(desc, MAX_DESC_BYTES),
+    );
+    seen.insert(entry.text.clone());
+    flags.push(entry);
+    Some(flags.len() - 1)
+}
+
+fn try_push_subcmd_entry(
+    subcmds: &mut Vec<Entry>,
+    seen: &mut HashSet<String>,
+    cmd: &str,
+    alias: &str,
+    desc: &str,
+) -> Option<usize> {
+    if cmd.is_empty() || seen.contains(cmd) {
+        return None;
+    }
+    seen.insert(cmd.to_string());
+    let label = if alias.is_empty() {
+        cmd.to_string()
+    } else {
+        format!("{cmd} ({alias})")
+    };
+    let mut entry = Entry::new(
+        cmd,
+        label,
+        EntryKind::Subcmd,
+        truncate_utf8_prefix(desc, MAX_DESC_BYTES),
+    );
+    if !alias.is_empty() {
+        entry.aliases.push(alias.to_string());
+    }
+    subcmds.push(entry);
+    Some(subcmds.len() - 1)
+}
+
+fn extract_possible_values_slice(desc: &str) -> Option<&str> {
+    const POSSIBLE_PREFIX: &str = "[possible values:";
+    const ALLOWED_PREFIX: &str = "Allowed values:";
+
+    let mut offset = 0usize;
+    let mut check_possible = true;
+    let mut check_allowed = true;
+
+    while offset < desc.len() && (check_possible || check_allowed) {
+        let tail = &desc[offset..];
+        let possible_idx = if check_possible {
+            let found = tail.find(POSSIBLE_PREFIX);
+            if found.is_none() {
+                check_possible = false;
+            }
+            found
+        } else {
+            None
+        };
+        let allowed_idx = if check_allowed {
+            let found = tail.find(ALLOWED_PREFIX);
+            if found.is_none() {
+                check_allowed = false;
+            }
+            found
+        } else {
+            None
+        };
+
+        match (possible_idx, allowed_idx) {
+            (Some(p), Some(a)) if p <= a => {
+                let after = &tail[p + POSSIBLE_PREFIX.len()..];
+                let Some(close) = after.find(']') else {
+                    check_possible = false;
+                    continue;
+                };
+                if close > 0 {
+                    return Some(after[..close].trim());
+                }
+                offset += p + POSSIBLE_PREFIX.len() + 1;
+            }
+            (_, Some(a)) => {
+                let after_start = a + ALLOWED_PREFIX.len();
+                let after = &tail[after_start..];
+                let trimmed = after.trim_start();
+                let end = trimmed.find(['.', '\n']).unwrap_or(trimmed.len());
+                if end > 0 {
+                    return Some(trimmed[..end].trim());
+                }
+                let raw_end = after.find(['.', '\n']).unwrap_or(after.len());
+                if raw_end > 0 {
+                    return Some("");
+                }
+                offset += after_start;
+            }
+            (Some(p), None) => {
+                let after = &tail[p + POSSIBLE_PREFIX.len()..];
+                let close = after.find(']')?;
+                if close > 0 {
+                    return Some(after[..close].trim());
+                }
+                offset += p + POSSIBLE_PREFIX.len() + 1;
+            }
+            (None, None) => break,
+        }
+    }
+    None
+}
+
+fn extract_default_value_slice(desc: &str) -> Option<&str> {
+    const DEFAULT_PREFIX: &str = "[default:";
+
+    let mut rest = desc;
+    while let Some(pos) = rest.find(DEFAULT_PREFIX) {
+        let after = &rest[pos + DEFAULT_PREFIX.len()..];
+        let close = after.find(']')?;
+        if close > 0 {
+            return Some(after[..close].trim());
+        }
+        rest = &after[1..];
+    }
+    None
+}
+
 fn populate_flag_metadata(entry: &mut Entry) {
-    let has_possible_hint =
-        entry.desc.contains("[possible values:") || entry.desc.contains("Allowed values:");
-    let has_default_hint = entry.desc.contains("[default:");
-    if !has_possible_hint && !has_default_hint {
+    let has_bracket = entry.desc.contains('[');
+    if !has_bracket && !entry.desc.contains("Allowed values:") {
         return;
     }
 
-    static RE_POSSIBLE_VALS: OnceLock<Regex> = OnceLock::new();
-    static RE_DEFAULT_VAL: OnceLock<Regex> = OnceLock::new();
-
-    if has_possible_hint {
-        let re_vals = RE_POSSIBLE_VALS.get_or_init(|| {
-            Regex::new(r"(?:\[possible values:\s*([^\]]+)\]|Allowed values:\s*([^.\n]+))").unwrap()
-        });
-        if let Some(v_caps) = re_vals.captures(&entry.desc) {
-            let raw_vals = v_caps
-                .get(1)
-                .or_else(|| v_caps.get(2))
-                .map(|m| m.as_str())
-                .unwrap_or("");
-            for v in raw_vals
-                .split(',')
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty() && s.len() <= 128)
-                .take(MAX_ENUM_VALUES)
-            {
-                if !entry.children.iter().any(|c| c.text == v) {
-                    entry.children.push(Entry::new(
-                        v,
-                        v,
-                        EntryKind::Enum,
-                        format!("Allowed value for {}", entry.text),
-                    ));
-                }
+    if let Some(raw_vals) = extract_possible_values_slice(&entry.desc) {
+        for v in raw_vals
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .take(MAX_ENUM_VALUES)
+        {
+            if !entry.children.iter().any(|c| c.text == v) {
+                entry.children.push(Entry::new(
+                    v,
+                    v,
+                    EntryKind::Enum,
+                    format!("Allowed value for {}", entry.text),
+                ));
             }
-            if entry.children.iter().any(|c| c.kind == EntryKind::Enum) {
-                entry.kind = EntryKind::Param;
-            }
+        }
+        if entry.children.iter().any(|c| c.kind == EntryKind::Enum) {
+            entry.kind = EntryKind::Param;
         }
     }
 
-    if has_default_hint {
-        let re_def = RE_DEFAULT_VAL.get_or_init(|| Regex::new(r"\[default:\s*([^\]]+)\]").unwrap());
-        if let Some(d_caps) = re_def.captures(&entry.desc) {
-            let def_val = d_caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+    if has_bracket {
+        if let Some(def_val) = extract_default_value_slice(&entry.desc) {
             if !def_val.is_empty()
                 && def_val.len() <= 128
                 && !entry.children.iter().any(|c| c.text == def_val)
@@ -316,33 +500,31 @@ fn append_desc_line(entry: &mut Entry, trimmed_line: &str) {
 /// Parses `--help` / `-h` output from Cobra, Clap, winget, git, and generic CLIs
 /// into Pane 2/3 [`Entry`] values (subcommands, Parameters, Flags, enums, and defaults).
 pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
-    static RE_SECTION_SUBCMD: OnceLock<Regex> = OnceLock::new();
-    static RE_SECTION_SUBCMD_HEADER: OnceLock<Regex> = OnceLock::new();
-    static RE_SECTION_FLAG: OnceLock<Regex> = OnceLock::new();
-    static RE_SECTION_FLAG_HEADER: OnceLock<Regex> = OnceLock::new();
-    static RE_LONG_FLAG_FALLBACK: OnceLock<Regex> = OnceLock::new();
-    static RE_SHORT_FLAG_FALLBACK: OnceLock<Regex> = OnceLock::new();
-    static RE_SUBCMD_FALLBACK: OnceLock<Regex> = OnceLock::new();
+    static RE_SECTION_SUBCMD: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_SECTION_SUBCMD_HEADER: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_SECTION_FLAG: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_SECTION_FLAG_HEADER: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_LONG_FLAG_FALLBACK: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_SHORT_FLAG_FALLBACK: OnceLock<Option<Regex>> = OnceLock::new();
+    static RE_SUBCMD_FALLBACK: OnceLock<Option<Regex>> = OnceLock::new();
 
-    let re_sec_sub = RE_SECTION_SUBCMD.get_or_init(|| {
-        Regex::new(r"^\s{2,8}([a-zA-Z0-9][a-zA-Z0-9_-]*)(?::|,\s*([a-zA-Z0-9][a-zA-Z0-9_-]*))?(?:\s{2,}|\t|\s*:\s+)(.+)$")
-            .unwrap()
-    });
-    let re_sec_sub_header = RE_SECTION_SUBCMD_HEADER.get_or_init(|| {
-        Regex::new(
-            r"^\s{2,6}([a-zA-Z0-9][a-zA-Z0-9_-]{1,24})(?:,\s*([a-zA-Z0-9][a-zA-Z0-9_-]*))?:?\s*$",
-        )
-        .unwrap()
-    });
+    let re_sec_sub = cached_regex(
+        &RE_SECTION_SUBCMD,
+        r"^\s{2,8}([a-zA-Z0-9][a-zA-Z0-9_-]*)(?::|,\s*([a-zA-Z0-9][a-zA-Z0-9_-]*))?(?:\s{2,}|\t|\s*:\s+)(.+)$",
+    );
+    let re_sec_sub_header = cached_regex(
+        &RE_SECTION_SUBCMD_HEADER,
+        r"^\s{2,6}([a-zA-Z0-9][a-zA-Z0-9_-]{1,24})(?:,\s*([a-zA-Z0-9][a-zA-Z0-9_-]*))?:?\s*$",
+    );
 
-    let re_sec_flag = RE_SECTION_FLAG.get_or_init(|| {
-        Regex::new(r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?:[ =]([^\s].*?)|(\[[^\]]+\]))?(?:\s{2,}|\t)(.+)$")
-            .unwrap()
-    });
-    let re_sec_flag_header = RE_SECTION_FLAG_HEADER.get_or_init(|| {
-        Regex::new(r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?: (<[^>]+>|\[[^\]]+\]|[A-Z][A-Z0-9_.-]*)|=([^\s]+)|(\[[^\]]+\]))?\s*$")
-            .unwrap()
-    });
+    let re_sec_flag = cached_regex(
+        &RE_SECTION_FLAG,
+        r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?:[ =]([^\s].*?)|(\[[^\]]+\]))?(?:\s{2,}|\t)(.+)$",
+    );
+    let re_sec_flag_header = cached_regex(
+        &RE_SECTION_FLAG_HEADER,
+        r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?: (<[^>]+>|\[[^\]]+\]|[A-Z][A-Z0-9_.-]*)|=([^\s]+)|(\[[^\]]+\]))?\s*$",
+    );
 
     let bounded_help = truncate_utf8_prefix(help_text, MAX_HELP_BYTES);
     let clean_help = strip_ansi_escapes(bounded_help);
@@ -359,74 +541,75 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
 
     for raw_line in clean_help.lines().take(MAX_HELP_LINES) {
         let line = truncate_utf8_prefix(raw_line, MAX_HELP_LINE_BYTES);
-        if let Some(sec) = classify_section_header(line) {
-            current_sec = sec;
-            detected_sections = true;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if matches!(current_sec, HelpSection::Ignore | HelpSection::None) {
+                active_item = None;
+            }
+            continue;
+        }
+        if trimmed.len() <= 128 && !trimmed.starts_with('-') {
+            if let Some(sec) = classify_section_header(line) {
+                current_sec = sec;
+                detected_sections = true;
+                active_item = None;
+                section_cmd_indent = None;
+                continue;
+            }
+        }
+
+        if matches!(current_sec, HelpSection::Ignore | HelpSection::None) {
             active_item = None;
-            section_cmd_indent = None;
             continue;
         }
 
         let line_indent = leading_ws_count(line);
-        let trimmed = line.trim();
         let at_entry_cap = subcmds.len() + flags.len() >= MAX_HELP_ENTRIES;
 
         match current_sec {
             HelpSection::Commands => {
                 let within_cmd_col =
                     !at_entry_cap && section_cmd_indent.is_none_or(|ci| line_indent <= ci + 2);
-                if within_cmd_col {
-                    if let Some(caps) = re_sec_sub.captures(line) {
+                let first_is_alnum = trimmed
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric);
+                if within_cmd_col && first_is_alnum {
+                    let matched_sec_sub = if (2..=8).contains(&line_indent)
+                        && (trimmed.contains(':')
+                            || trimmed.contains('\t')
+                            || has_two_adjacent_ws(trimmed))
+                    {
+                        re_sec_sub.and_then(|re| re.captures(line))
+                    } else {
+                        None
+                    };
+                    if let Some(caps) = matched_sec_sub {
                         let cmd = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                         let alias = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
                         let desc = caps.get(3).map(|m| m.as_str().trim()).unwrap_or("");
-
-                        if !cmd.is_empty() && seen.insert(cmd.to_string()) {
+                        if let Some(idx) =
+                            try_push_subcmd_entry(&mut subcmds, &mut seen, cmd, alias, desc)
+                        {
                             section_cmd_indent.get_or_insert(line_indent);
-                            let label = if alias.is_empty() {
-                                cmd.to_string()
-                            } else {
-                                format!("{cmd} ({alias})")
-                            };
-                            let mut entry = Entry::new(
-                                cmd,
-                                label,
-                                EntryKind::Subcmd,
-                                truncate_utf8_prefix(desc, MAX_DESC_BYTES),
-                            );
-                            if !alias.is_empty() {
-                                entry.aliases.push(alias.to_string());
-                            }
-                            subcmds.push(entry);
-                            active_item =
-                                Some((HelpSection::Commands, subcmds.len() - 1, line_indent, 0));
+                            active_item = Some((HelpSection::Commands, idx, line_indent, 0));
                             continue;
                         }
                     } else if active_item
                         .as_ref()
                         .is_none_or(|(_, _, ai, _)| line_indent <= *ai)
+                        && (2..=6).contains(&line_indent)
+                        && trimmed.len() >= 2
+                        && (!trimmed.contains(' ') || trimmed.contains(','))
                     {
-                        if let Some(caps) = re_sec_sub_header.captures(line) {
+                        if let Some(caps) = re_sec_sub_header.and_then(|re| re.captures(line)) {
                             let cmd = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                             let alias = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                            if !cmd.is_empty() && seen.insert(cmd.to_string()) {
+                            if let Some(idx) =
+                                try_push_subcmd_entry(&mut subcmds, &mut seen, cmd, alias, "")
+                            {
                                 section_cmd_indent.get_or_insert(line_indent);
-                                let label = if alias.is_empty() {
-                                    cmd.to_string()
-                                } else {
-                                    format!("{cmd} ({alias})")
-                                };
-                                let mut entry = Entry::new(cmd, label, EntryKind::Subcmd, "");
-                                if !alias.is_empty() {
-                                    entry.aliases.push(alias.to_string());
-                                }
-                                subcmds.push(entry);
-                                active_item = Some((
-                                    HelpSection::Commands,
-                                    subcmds.len() - 1,
-                                    line_indent,
-                                    0,
-                                ));
+                                active_item = Some((HelpSection::Commands, idx, line_indent, 0));
                                 continue;
                             }
                         }
@@ -434,19 +617,32 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                 }
 
                 if let Some((HelpSection::Commands, idx, item_indent, ref mut cont)) = active_item {
-                    if !trimmed.is_empty() {
-                        if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
-                            append_desc_line(&mut subcmds[idx], trimmed);
-                            *cont += 1;
-                        } else {
-                            active_item = None;
-                        }
+                    if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
+                        append_desc_line(&mut subcmds[idx], trimmed);
+                        *cont += 1;
+                    } else {
+                        active_item = None;
                     }
                 }
             }
             HelpSection::Flags => {
-                if !at_entry_cap {
-                    if let Some(caps) = re_sec_flag.captures(line) {
+                let looks_like_flag_line = !at_entry_cap
+                    && (1..=10).contains(&line_indent)
+                    && trimmed.len() >= 2
+                    && trimmed.as_bytes().first() == Some(&b'-')
+                    && trimmed
+                        .as_bytes()
+                        .get(1)
+                        .is_some_and(|&b| b == b'-' || b == b'?' || b.is_ascii_alphanumeric());
+
+                if looks_like_flag_line {
+                    let matched_sec_flag = if trimmed.contains('\t') || has_two_adjacent_ws(trimmed)
+                    {
+                        re_sec_flag.and_then(|re| re.captures(line))
+                    } else {
+                        None
+                    };
+                    if let Some(caps) = matched_sec_flag {
                         let short = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                         let raw_flag = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
                         let arg_hint = caps
@@ -455,21 +651,12 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                             .map(|m| m.as_str().trim())
                             .unwrap_or("");
                         let desc = caps.get(5).map(|m| m.as_str().trim()).unwrap_or("");
-                        let entry = build_flag_entry(
-                            short,
-                            raw_flag,
-                            arg_hint,
-                            truncate_utf8_prefix(desc, MAX_DESC_BYTES),
-                        );
-                        if seen.insert(entry.text.clone()) {
-                            flags.push(entry);
-                            active_item =
-                                Some((HelpSection::Flags, flags.len() - 1, line_indent, 0));
-                        } else {
-                            active_item = None;
-                        }
+                        active_item = try_push_flag_entry(
+                            &mut flags, &mut seen, short, raw_flag, arg_hint, desc,
+                        )
+                        .map(|idx| (HelpSection::Flags, idx, line_indent, 0));
                         continue;
-                    } else if let Some(caps) = re_sec_flag_header.captures(line) {
+                    } else if let Some(caps) = re_sec_flag_header.and_then(|re| re.captures(line)) {
                         let short = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                         let raw_flag = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
                         let arg_hint = caps
@@ -478,25 +665,19 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                             .or_else(|| caps.get(5))
                             .map(|m| m.as_str().trim())
                             .unwrap_or("");
-                        let entry = build_flag_entry(short, raw_flag, arg_hint, "");
-                        if seen.insert(entry.text.clone()) {
-                            flags.push(entry);
-                            active_item =
-                                Some((HelpSection::Flags, flags.len() - 1, line_indent, 0));
-                        } else {
-                            active_item = None;
-                        }
+                        active_item = try_push_flag_entry(
+                            &mut flags, &mut seen, short, raw_flag, arg_hint, "",
+                        )
+                        .map(|idx| (HelpSection::Flags, idx, line_indent, 0));
                         continue;
                     }
                 }
                 if let Some((HelpSection::Flags, idx, item_indent, ref mut cont)) = active_item {
-                    if !trimmed.is_empty() {
-                        if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
-                            append_desc_line(&mut flags[idx], trimmed);
-                            *cont += 1;
-                        } else {
-                            active_item = None;
-                        }
+                    if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
+                        append_desc_line(&mut flags[idx], trimmed);
+                        *cont += 1;
+                    } else {
+                        active_item = None;
                     }
                 }
             }
@@ -507,27 +688,40 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
     }
 
     if !detected_sections || (subcmds.is_empty() && flags.is_empty()) {
-        let re_long = RE_LONG_FLAG_FALLBACK.get_or_init(|| {
-            Regex::new(r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_-]*)(?:[ =](<[^>]+>|\[[^\]]+\]|[A-Z][A-Z0-9_.-]*|[^\s\]]+\]?)|(\[[^\]]+\]))?(?:\s{2,}(.+))?$").unwrap()
-        });
-        let re_short = RE_SHORT_FLAG_FALLBACK.get_or_init(|| {
-            Regex::new(r"^\s{1,10}(-[a-zA-Z0-9\?])(?:\s+(<[^>]+>|\[[^\]]+\]))?\s{2,}(.+)$").unwrap()
-        });
-        let re_sub = RE_SUBCMD_FALLBACK.get_or_init(|| {
-            Regex::new(r"^\s{2,8}([a-z][a-z0-9_-]{1,24})(?:,\s*([a-z0-9_-]+))?\s{2,}([A-Za-z].+)$")
-                .unwrap()
-        });
+        let re_long = cached_regex(
+            &RE_LONG_FLAG_FALLBACK,
+            r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_-]*)(?:[ =](<[^>]+>|\[[^\]]+\]|[A-Z][A-Z0-9_.-]*|[^\s\]]+\]?)|(\[[^\]]+\]))?(?:\s{2,}(.+))?$",
+        );
+        let re_short = cached_regex(
+            &RE_SHORT_FLAG_FALLBACK,
+            r"^\s{1,10}(-[a-zA-Z0-9\?])(?:\s+(<[^>]+>|\[[^\]]+\]))?\s{2,}(.+)$",
+        );
+        let re_sub = cached_regex(
+            &RE_SUBCMD_FALLBACK,
+            r"^\s{2,8}([a-z][a-z0-9_-]{1,24})(?:,\s*([a-z0-9_-]+))?\s{2,}([A-Za-z].+)$",
+        );
 
         let mut active_fallback_flag: Option<(usize, usize, usize)> = None;
 
         for raw_line in clean_help.lines().take(MAX_HELP_LINES) {
             let line = truncate_utf8_prefix(raw_line, MAX_HELP_LINE_BYTES);
-            let line_indent = leading_ws_count(line);
             let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let line_indent = leading_ws_count(line);
             let at_entry_cap = subcmds.len() + flags.len() >= MAX_HELP_ENTRIES;
 
             if !at_entry_cap {
-                if let Some(caps) = re_long.captures(line) {
+                let first_byte = trimmed.as_bytes().first().copied();
+                let maybe_flag = (1..=10).contains(&line_indent) && first_byte == Some(b'-');
+                let matched_long = if maybe_flag && trimmed.contains("--") {
+                    re_long.and_then(|re| re.captures(line))
+                } else {
+                    None
+                };
+
+                if let Some(caps) = matched_long {
                     let short = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                     let raw_long = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
                     let arg_hint = caps
@@ -536,37 +730,45 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                         .map(|m| m.as_str().trim())
                         .unwrap_or("");
                     let desc = caps.get(5).map(|m| m.as_str().trim()).unwrap_or("");
-                    let entry = build_flag_entry(
-                        short,
-                        raw_long,
-                        arg_hint,
-                        truncate_utf8_prefix(desc, MAX_DESC_BYTES),
-                    );
-                    if seen.insert(entry.text.clone()) {
-                        flags.push(entry);
-                        active_fallback_flag = Some((flags.len() - 1, line_indent, 0));
-                    } else {
-                        active_fallback_flag = None;
-                    }
+                    active_fallback_flag =
+                        try_push_flag_entry(&mut flags, &mut seen, short, raw_long, arg_hint, desc)
+                            .map(|idx| (idx, line_indent, 0));
                     continue;
-                } else if let Some(caps) = re_short.captures(line) {
+                }
+
+                let matched_short = if maybe_flag
+                    && trimmed.len() >= 5
+                    && trimmed
+                        .as_bytes()
+                        .get(1)
+                        .is_some_and(|&b| b != b'-' && (b.is_ascii_alphanumeric() || b == b'?'))
+                    && has_two_adjacent_ws(trimmed)
+                {
+                    re_short.and_then(|re| re.captures(line))
+                } else {
+                    None
+                };
+
+                if let Some(caps) = matched_short {
                     let short = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                     let arg_hint = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
                     let desc = caps.get(3).map(|m| m.as_str().trim()).unwrap_or("");
-                    let entry = build_flag_entry(
-                        "",
-                        short,
-                        arg_hint,
-                        truncate_utf8_prefix(desc, MAX_DESC_BYTES),
-                    );
-                    if seen.insert(entry.text.clone()) {
-                        flags.push(entry);
-                        active_fallback_flag = Some((flags.len() - 1, line_indent, 0));
-                    } else {
-                        active_fallback_flag = None;
-                    }
+                    active_fallback_flag =
+                        try_push_flag_entry(&mut flags, &mut seen, "", short, arg_hint, desc)
+                            .map(|idx| (idx, line_indent, 0));
                     continue;
-                } else if let Some(caps) = re_sub.captures(line) {
+                }
+
+                let matched_sub = if (2..=8).contains(&line_indent)
+                    && first_byte.is_some_and(|b| b.is_ascii_lowercase())
+                    && has_two_adjacent_ws(trimmed)
+                {
+                    re_sub.and_then(|re| re.captures(line))
+                } else {
+                    None
+                };
+
+                if let Some(caps) = matched_sub {
                     active_fallback_flag = None;
                     let sub = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                     let alias = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
@@ -590,34 +792,18 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                             | "grow"
                             | "collaborate"
                     );
-                    if !is_ignored && seen.insert(sub.to_string()) {
-                        let label = if alias.is_empty() {
-                            sub.to_string()
-                        } else {
-                            format!("{sub} ({alias})")
-                        };
-                        let mut entry = Entry::new(
-                            sub,
-                            label,
-                            EntryKind::Subcmd,
-                            truncate_utf8_prefix(desc, MAX_DESC_BYTES),
-                        );
-                        if !alias.is_empty() {
-                            entry.aliases.push(alias.to_string());
-                        }
-                        subcmds.push(entry);
+                    if !is_ignored {
+                        try_push_subcmd_entry(&mut subcmds, &mut seen, sub, alias, desc);
                     }
                     continue;
                 }
             }
             if let Some((idx, item_indent, ref mut cont)) = active_fallback_flag {
-                if !trimmed.is_empty() {
-                    if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
-                        append_desc_line(&mut flags[idx], trimmed);
-                        *cont += 1;
-                    } else {
-                        active_fallback_flag = None;
-                    }
+                if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
+                    append_desc_line(&mut flags[idx], trimmed);
+                    *cont += 1;
+                } else {
+                    active_fallback_flag = None;
                 }
             }
         }
@@ -626,8 +812,9 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
     for entry in &mut flags {
         if entry.desc.is_empty() {
             entry.desc = format!("CLI Flag {}", entry.text);
+        } else {
+            populate_flag_metadata(entry);
         }
-        populate_flag_metadata(entry);
     }
 
     subcmds.extend(flags);
@@ -962,5 +1149,139 @@ work on the current change (see also: git help everyday)
         );
         assert_eq!(classify_section_header("  -h, --help    Help"), None);
         assert_eq!(classify_section_header(&"Options: ".repeat(30)), None);
+    }
+
+    #[test]
+    fn test_perf_parse_cli_help_throughput() {
+        use std::fmt::Write as _;
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+
+        let mut help = String::with_capacity(48 * 1024);
+        help.push_str("Usage: benchtool [OPTIONS] <COMMAND>\n\nCommands:\n");
+        for i in 0..120 {
+            let _ = writeln!(
+                help,
+                "  subcmd-{i:03}, s{i:03}   Execute operation {i} across workspace targets\n                         with extended wrapped continuation details for subcommand {i}"
+            );
+        }
+        help.push_str("\nGlobal Options:\n");
+        for i in 0..180 {
+            let _ = writeln!(
+                help,
+                "  -{}, --option-{i:03} <VAL>   Configure option {i}\n                               Multi-line option description line 1 for {i}\n                               Multi-line option description line 2 [default: auto] [possible values: auto, fast, strict]",
+                char::from(b'a' + (i % 26) as u8),
+            );
+        }
+        help.push_str("\nExamples:\n  benchtool subcmd-001 --option-001 fast\n");
+
+        let iterations = 150usize;
+        // Warm up regex OnceLock initialization before measuring steady-state throughput.
+        let warmup = parse_cli_help(black_box(&help));
+        assert_eq!(warmup.len(), 300);
+
+        let start = Instant::now();
+        let mut total_entries = 0usize;
+        for _ in 0..iterations {
+            let parsed = parse_cli_help(black_box(&help));
+            total_entries += parsed.len();
+        }
+        let elapsed = start.elapsed();
+        let total_bytes = help.len() * iterations;
+        let mb_per_sec = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+        let us_per_call = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
+
+        println!(
+            "parse_cli_help throughput: {iterations} iters x {} bytes = {:.2} MiB in {:?} ({us_per_call:.1} us/call, {mb_per_sec:.2} MiB/s)",
+            help.len(),
+            total_bytes as f64 / (1024.0 * 1024.0),
+            elapsed
+        );
+
+        assert_eq!(total_entries, 300 * iterations);
+        let max_budget = if cfg!(debug_assertions) {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_secs(2)
+        };
+        assert!(
+            elapsed < max_budget,
+            "parse_cli_help took {elapsed:?}, expected < {max_budget:?}"
+        );
+    }
+
+    #[test]
+    fn test_pentest_help_parser_adversarial_inputs_and_metadata_scanners() {
+        // 1. Oversized help and oversized single lines with multibyte UTF-8 straddling byte caps.
+        let mut huge = String::from("Usage: pentest\n\nCommands:\n  run   Run task\n\nOptions:\n");
+        let crab_line = format!("  --utf8   {}\n", "🦀".repeat(700)); // > MAX_HELP_LINE_BYTES
+        huge.push_str(&crab_line);
+        while huge.len() < MAX_HELP_BYTES + 4096 {
+            huge.push_str(&"🦀".repeat(128));
+            huge.push('\n');
+        }
+        let parsed_huge = parse_cli_help(&huge);
+        assert!(parsed_huge.iter().any(|e| e.text == "run"));
+        let utf8_opt = parsed_huge
+            .iter()
+            .find(|e| e.text == "--utf8")
+            .expect("--utf8 survived oversized line");
+        assert!(utf8_opt.desc.len() <= MAX_DESC_BYTES);
+
+        // 2. Hostile CSI/OSC/C1/Bidi/line-separator/CR/NUL payloads + malformed metadata hints.
+        let oversized_enum = "z".repeat(200);
+        let hostile = format!(
+            concat!(
+                "\x1b[2J\x1b]8;;https://evil.example\x1b\\Usage:\x1b]8;;\x07\n",
+                "Commands:\n",
+                "  \x1b[31mdeploy, d   Deploy\u{061c}\u{2028}\u{2029}\u{2066} app\rspoof\0\x07\n",
+                "  deploy   Duplicate ignored\n",
+                "Options:\n",
+                "  --[no-]color   Toggle color\n",
+                "  --color        Duplicate after normalization ignored\n",
+                "  --mode <M>     Broken [possible values: ignored_unclosed and Allowed values: fast, {}, safe.\n",
+                "  --tag <T>      Empty [possible values:] [possible values:   ] [default:] [default: alpha] [default: beta]\n",
+                "  --unclosed <U>   Unterminated [default: never_closed\n",
+            ),
+            oversized_enum
+        );
+        let entries = parse_cli_help(&hostile);
+
+        let deploy = entries.iter().find(|e| e.text == "deploy").expect("deploy");
+        assert_eq!(deploy.desc, "Deploy appspoof");
+        assert!(!deploy.desc.contains('\u{061c}'));
+        assert!(!deploy.desc.contains('\u{2028}'));
+        assert!(!deploy.desc.contains('\u{2029}'));
+        assert!(!deploy.desc.contains('\u{2066}'));
+        assert!(!deploy.desc.contains('\r'));
+        assert!(!deploy.desc.contains('\0'));
+
+        let color_count = entries.iter().filter(|e| e.text == "--color").count();
+        assert_eq!(color_count, 1);
+
+        let mode = entries.iter().find(|e| e.text == "--mode").expect("--mode");
+        let mode_enums: Vec<&str> = mode.children.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(mode_enums, vec!["fast", "safe"]);
+
+        let tag = entries.iter().find(|e| e.text == "--tag").expect("--tag");
+        assert_eq!(tag.children.len(), 1);
+        assert_eq!(tag.children[0].text, "alpha");
+        assert_eq!(tag.children[0].kind, EntryKind::Value);
+
+        let unclosed = entries
+            .iter()
+            .find(|e| e.text == "--unclosed")
+            .expect("--unclosed");
+        assert!(unclosed.children.is_empty());
+
+        // 3. Fallback path with adversarial unterminated escapes and duplicates.
+        let fallback_hostile =
+            "  -x, --exec <CMD>   Run\u{202e} \x1b[999999cmd\n  --exec   Duplicate fallback\n  build, b   Build\n  build   Duplicate sub\n";
+        let fb = parse_cli_help(fallback_hostile);
+        assert_eq!(fb.iter().filter(|e| e.text == "--exec").count(), 1);
+        assert_eq!(fb.iter().filter(|e| e.text == "build").count(), 1);
+        let exec = fb.iter().find(|e| e.text == "--exec").expect("--exec");
+        assert!(!exec.desc.contains('\u{202e}'));
+        assert!(!exec.desc.contains('\x1b'));
     }
 }
