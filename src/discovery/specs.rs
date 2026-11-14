@@ -1,8 +1,17 @@
-use super::catalog::cache_dir;
+use super::catalog::{
+    cache_dir, ends_with_ignore_ascii_case, is_safe_command_token, sanitize_multiline_desc,
+    sanitize_single_line, MAX_SPEC_BYTES,
+};
 use crate::model::{Entry, EntryKind};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
+
+const MAX_YAML_DEPTH: usize = 48;
+const MAX_YAML_LINES: usize = 16_384;
+const MAX_SPEC_TREE_DEPTH: usize = 24;
+const MAX_SPEC_CHILDREN: usize = 1_024;
 
 /// Returns the local directory searched for declarative JSON/YAML CLI specifications:
 /// `%LOCALAPPDATA%\zpane\specs` on Windows, `$XDG_CACHE_HOME/zpane/specs` or `~/.cache/zpane/specs` on Unix.
@@ -10,30 +19,74 @@ pub(super) fn specs_dir() -> PathBuf {
     cache_dir().join("specs")
 }
 
-/// Returns true if a filename has a supported declarative spec extension (`.json`, `.yaml`, `.yml`).
+/// Returns true if a filename is a safe basename with a supported declarative spec extension (`.json`, `.yaml`, `.yml`).
 pub(super) fn is_spec_filename(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.ends_with(".json") || lower.ends_with(".yaml") || lower.ends_with(".yml")
+    if name.is_empty()
+        || name.len() > 255
+        || name.starts_with('.')
+        || name.contains(['/', '\\', ':', '\0'])
+        || name.contains("..")
+        || name.chars().any(char::is_control)
+    {
+        return false;
+    }
+    ends_with_ignore_ascii_case(name, ".json")
+        || ends_with_ignore_ascii_case(name, ".yaml")
+        || ends_with_ignore_ascii_case(name, ".yml")
+}
+
+fn is_safe_spec_command_name(name: &str) -> bool {
+    is_safe_command_token(name) && !name.contains(['/', '\\', ':', '\0']) && !name.contains("..")
+}
+
+fn clean_spec_token(raw: &str) -> Option<String> {
+    let cleaned = sanitize_single_line(raw.trim());
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 256
+        || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn clean_spec_aliases(raw_aliases: &[String]) -> Vec<String> {
+    raw_aliases
+        .iter()
+        .take(32)
+        .filter_map(|a| clean_spec_token(a))
+        .filter(|a| is_safe_spec_command_name(a))
+        .collect()
 }
 
 /// Parses a declarative specification (Carapace YAML/JSON or simplified Fig JSON) into a root [`Entry`].
 pub(super) fn parse_spec_str(file_name: &str, content: &str) -> anyhow::Result<Entry> {
+    if !is_spec_filename(file_name) {
+        anyhow::bail!("Unsafe or unsupported spec file name: {file_name}");
+    }
+    if content.len() > MAX_SPEC_BYTES {
+        anyhow::bail!(
+            "Spec file exceeds maximum allowed size ({MAX_SPEC_BYTES} bytes): {file_name}"
+        );
+    }
+
     let trimmed = content.trim_start_matches('\u{feff}').trim();
     if trimmed.is_empty() {
         anyhow::bail!("Empty spec file: {file_name}");
     }
 
     let value: serde_json::Value =
-        if file_name.to_ascii_lowercase().ends_with(".json") || trimmed.starts_with('{') {
+        if ends_with_ignore_ascii_case(file_name, ".json") || trimmed.starts_with('{') {
             serde_json::from_str(trimmed)?
         } else {
             yaml_to_json(trimmed)?
         };
 
-    spec_value_to_entry(&value)
+    spec_value_to_entry(value)
 }
 
-fn spec_value_to_entry(value: &serde_json::Value) -> anyhow::Result<Entry> {
+fn spec_value_to_entry(value: serde_json::Value) -> anyhow::Result<Entry> {
     let Some(obj) = value.as_object() else {
         anyhow::bail!("Spec root must be an object or YAML mapping");
     };
@@ -43,30 +96,36 @@ fn spec_value_to_entry(value: &serde_json::Value) -> anyhow::Result<Entry> {
         || obj.contains_key("commands")
         || obj.contains_key("completion")
     {
-        let spec: CarapaceSpec = serde_json::from_value(value.clone())?;
-        if spec.name.trim().is_empty() {
-            anyhow::bail!("carapace-spec missing required 'name'");
+        let spec: CarapaceSpec = serde_json::from_value(value)?;
+        if !is_safe_spec_command_name(spec.name.trim()) {
+            anyhow::bail!("carapace-spec missing or unsafe 'name'");
         }
-        Ok(carapace_spec_to_entry(&spec, &BTreeMap::new(), true))
+        Ok(carapace_spec_to_entry(&spec, &BTreeMap::new(), true, 0))
     } else if obj.contains_key("subcommands")
         || obj.contains_key("options")
         || obj.contains_key("args")
     {
-        let spec: FigSpec = serde_json::from_value(value.clone())?;
-        if spec.name.trim().is_empty() {
-            anyhow::bail!("Fig spec missing required 'name'");
+        let spec: FigSpec = serde_json::from_value(value)?;
+        if !is_safe_spec_command_name(spec.name.trim()) {
+            anyhow::bail!("Fig spec missing or unsafe 'name'");
         }
-        Ok(fig_spec_to_entry(&spec, true))
+        Ok(fig_spec_to_entry(&spec, true, 0))
     } else if let Some(name) = obj.get("name").and_then(|v| v.as_str()) {
         let trimmed_name = name.trim();
-        if trimmed_name.is_empty() {
-            anyhow::bail!("Declarative command spec missing required 'name'");
+        if !is_safe_spec_command_name(trimmed_name) {
+            anyhow::bail!("Declarative command spec missing or unsafe 'name'");
         }
-        let desc = obj
+        let raw_desc = obj
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("Declarative command spec");
-        Ok(Entry::new(trimmed_name, trimmed_name, EntryKind::Cli, desc))
+        let desc = sanitize_multiline_desc(raw_desc.trim());
+        Ok(Entry::new(
+            trimmed_name,
+            trimmed_name,
+            EntryKind::Cli,
+            desc.as_ref(),
+        ))
     } else {
         anyhow::bail!("Unrecognized declarative spec format");
     }
@@ -117,6 +176,7 @@ fn carapace_spec_to_entry(
     spec: &CarapaceSpec,
     inherited_persistent: &BTreeMap<String, String>,
     is_root: bool,
+    depth: usize,
 ) -> Entry {
     let kind = if is_root {
         EntryKind::Cli
@@ -124,45 +184,66 @@ fn carapace_spec_to_entry(
         EntryKind::Subcmd
     };
 
-    let mut effective_persistent = inherited_persistent.clone();
-    for (k, v) in &spec.persistentflags {
-        effective_persistent.insert(k.clone(), v.clone());
-    }
+    let effective_persistent: Cow<'_, BTreeMap<String, String>> = if spec.persistentflags.is_empty()
+    {
+        Cow::Borrowed(inherited_persistent)
+    } else {
+        let mut merged = inherited_persistent.clone();
+        for (k, v) in &spec.persistentflags {
+            merged.insert(k.clone(), v.clone());
+        }
+        Cow::Owned(merged)
+    };
 
     let spec_name = spec.name.trim();
-    let label = if !is_root && !spec.aliases.is_empty() {
-        format!("{spec_name} ({})", spec.aliases.join(", "))
+    let aliases = clean_spec_aliases(&spec.aliases);
+    let label = if !is_root && !aliases.is_empty() {
+        format!("{spec_name} ({})", aliases.join(", "))
     } else {
         spec_name.to_string()
     };
 
-    let mut entry =
-        Entry::new(spec_name, label, kind, &spec.description).with_aliases(spec.aliases.clone());
+    let clean_desc = sanitize_multiline_desc(spec.description.trim());
+    let mut entry = Entry::new(spec_name, label, kind, clean_desc.as_ref()).with_aliases(aliases);
 
-    let mut children = Vec::new();
-    let mut seen_sub = HashSet::new();
+    let sub_cap = spec.commands.len().min(MAX_SPEC_CHILDREN);
+    let mut children = Vec::with_capacity(sub_cap);
+    let mut seen_sub = HashSet::with_capacity(sub_cap);
 
     // 1. Subcommands first (matches CLI Explorer Pane 2 ergonomics)
-    for sub in &spec.commands {
-        let sub_name = sub.name.trim();
-        if !sub_name.is_empty() && seen_sub.insert(sub_name.to_ascii_lowercase()) {
-            children.push(carapace_spec_to_entry(sub, &effective_persistent, false));
+    if depth < MAX_SPEC_TREE_DEPTH {
+        for sub in spec.commands.iter().take(MAX_SPEC_CHILDREN) {
+            let sub_name = sub.name.trim();
+            if is_safe_spec_command_name(sub_name) && seen_sub.insert(sub_name.to_ascii_lowercase())
+            {
+                children.push(carapace_spec_to_entry(
+                    sub,
+                    effective_persistent.as_ref(),
+                    false,
+                    depth + 1,
+                ));
+            }
         }
     }
 
     // 2. Positional completion hints (for subcommands or commands with positional args)
-    let mut pos_candidates = Vec::new();
-    if let Some(first_pos) = spec.completion.positional.first() {
-        pos_candidates.extend(first_pos.iter().cloned());
-    }
-    pos_candidates.extend(spec.completion.positionalany.iter().cloned());
+    let first_pos = spec
+        .completion
+        .positional
+        .first()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut seen_pos = HashSet::new();
-    for raw in pos_candidates {
-        if let Some(val_entry) = carapace_completion_item_to_entry(&raw, EntryKind::Arg) {
+    for raw in first_pos
+        .iter()
+        .chain(spec.completion.positionalany.iter())
+        .take(MAX_SPEC_CHILDREN)
+    {
+        if let Some(val_entry) = carapace_completion_item_to_entry(raw, EntryKind::Arg) {
             let dedup_key = if val_entry.is_placeholder() {
-                format!("ph:{}", val_entry.label.to_ascii_lowercase())
+                (true, val_entry.label.to_ascii_lowercase())
             } else {
-                format!("tok:{}", val_entry.text.to_ascii_lowercase())
+                (false, val_entry.text.to_ascii_lowercase())
             };
             if seen_pos.insert(dedup_key) {
                 children.push(val_entry);
@@ -172,8 +253,14 @@ fn carapace_spec_to_entry(
 
     // 3. Local flags first, then inherited/persistent flags so local overrides win even when
     //    suffix markers (=, ?, *) or short-flag prefixes differ.
-    let mut seen_flags = HashSet::new();
-    for (flag_spec, desc) in spec.flags.iter().chain(effective_persistent.iter()) {
+    let mut seen_flags =
+        HashSet::with_capacity(spec.flags.len().saturating_add(effective_persistent.len()));
+    for (flag_spec, desc) in spec
+        .flags
+        .iter()
+        .chain(effective_persistent.iter())
+        .take(MAX_SPEC_CHILDREN)
+    {
         if let Some(flag_entry) = parse_carapace_flag(flag_spec, desc, &spec.completion.flag) {
             if seen_flags.insert(flag_entry.text.to_ascii_lowercase()) {
                 children.push(flag_entry);
@@ -207,11 +294,7 @@ fn parse_carapace_flag(
         }
     }
 
-    let parts: Vec<&str> = trimmed
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
+    let parts: Vec<String> = trimmed.split(',').filter_map(clean_spec_token).collect();
     if parts.is_empty() {
         return None;
     }
@@ -219,30 +302,25 @@ fn parse_carapace_flag(
     // Prefer long option (--foo) as primary token; keep short/other variants as Parameter Aliases
     let primary = parts
         .iter()
-        .copied()
         .find(|p| p.starts_with("--"))
-        .unwrap_or(parts[0]);
-    let aliases: Vec<String> = parts
-        .iter()
-        .copied()
-        .filter(|p| *p != primary)
-        .map(str::to_string)
-        .collect();
+        .unwrap_or(&parts[0])
+        .clone();
+    let aliases: Vec<String> = parts.iter().filter(|p| **p != primary).cloned().collect();
 
     let mut children = Vec::new();
     let mut seen_vals = HashSet::new();
-    for candidate_key in parts.iter().copied() {
+    for candidate_key in &parts {
         let stripped = candidate_key.trim_start_matches('-');
         if let Some(vals) = flag_completions
             .get(stripped)
-            .or_else(|| flag_completions.get(candidate_key))
+            .or_else(|| flag_completions.get(candidate_key.as_str()))
         {
-            for raw in vals {
+            for raw in vals.iter().take(MAX_SPEC_CHILDREN) {
                 if let Some(child) = carapace_completion_item_to_entry(raw, EntryKind::Enum) {
                     let dedup_key = if child.is_placeholder() {
-                        format!("ph:{}", child.label.to_ascii_lowercase())
+                        (true, child.label.to_ascii_lowercase())
                     } else {
-                        format!("tok:{}", child.text.to_ascii_lowercase())
+                        (false, child.text.to_ascii_lowercase())
                     };
                     if seen_vals.insert(dedup_key) {
                         children.push(child);
@@ -259,12 +337,13 @@ fn parse_carapace_flag(
     };
 
     let label = if aliases.is_empty() {
-        primary.to_string()
+        primary.clone()
     } else {
         format!("{primary} ({})", aliases.join(", "))
     };
 
-    let mut entry = Entry::new(primary, label, kind, desc).with_aliases(aliases);
+    let clean_desc = sanitize_multiline_desc(desc.trim());
+    let mut entry = Entry::new(&primary, label, kind, clean_desc.as_ref()).with_aliases(aliases);
     entry.children = children;
     Some(entry)
 }
@@ -291,15 +370,18 @@ fn carapace_completion_item_to_entry(raw: &str, default_kind: EntryKind) -> Opti
         return None;
     }
 
-    let (val, item_desc) = match trimmed.split_once('\t') {
+    let (raw_val, raw_item_desc) = match trimmed.split_once('\t') {
         Some((v, d)) => (v.trim(), d.trim()),
         None => (trimmed, ""),
     };
-    if val.is_empty() {
+    let val_clean = sanitize_single_line(raw_val);
+    let val = val_clean.trim();
+    if val.is_empty() || val.len() > 256 {
         return None;
     }
+    let desc_clean = sanitize_multiline_desc(raw_item_desc);
 
-    Some(Entry::new(val, val, default_kind, item_desc))
+    Some(Entry::new(val, val, default_kind, desc_clean.as_ref()))
 }
 
 // ============================================================================
@@ -383,19 +465,27 @@ enum FigSuggestion {
     },
 }
 
-fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
+fn fig_spec_to_entry(spec: &FigSpec, is_root: bool, depth: usize) -> Entry {
     let kind = if is_root {
         EntryKind::Cli
     } else {
         EntryKind::Subcmd
     };
     let spec_name = spec.name.trim();
-    let mut entry = Entry::new(spec_name, spec_name, kind, &spec.description);
-    let mut children = Vec::new();
+    let clean_desc = sanitize_multiline_desc(spec.description.trim());
+    let mut entry = Entry::new(spec_name, spec_name, kind, clean_desc.as_ref());
+    let mut children = Vec::with_capacity(
+        spec.subcommands
+            .len()
+            .saturating_add(spec.options.len())
+            .min(MAX_SPEC_CHILDREN),
+    );
 
-    for sub in &spec.subcommands {
-        if !sub.name.trim().is_empty() {
-            children.push(fig_spec_to_entry(sub, false));
+    if depth < MAX_SPEC_TREE_DEPTH {
+        for sub in spec.subcommands.iter().take(MAX_SPEC_CHILDREN) {
+            if is_safe_spec_command_name(sub.name.trim()) {
+                children.push(fig_spec_to_entry(sub, false, depth + 1));
+            }
         }
     }
 
@@ -403,15 +493,14 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
         children.extend(fig_args_to_entries(args_field.as_slice()));
     }
 
-    for opt in &spec.options {
+    for opt in spec.options.iter().take(MAX_SPEC_CHILDREN) {
         let Some(ref names_raw) = opt.name else {
             continue;
         };
         let names: Vec<String> = names_raw
             .as_slice()
             .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+            .filter_map(|s| clean_spec_token(s))
             .collect();
         if names.is_empty() {
             continue;
@@ -440,8 +529,9 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
             format!("{primary} ({})", aliases.join(", "))
         };
 
+        let opt_desc = sanitize_multiline_desc(opt.description.trim());
         let mut opt_entry =
-            Entry::new(&primary, label, opt_kind, &opt.description).with_aliases(aliases);
+            Entry::new(&primary, label, opt_kind, opt_desc.as_ref()).with_aliases(aliases);
         opt_entry.children = arg_children;
         children.push(opt_entry);
     }
@@ -452,7 +542,7 @@ fn fig_spec_to_entry(spec: &FigSpec, is_root: bool) -> Entry {
 
 fn fig_args_to_entries(args: &[FigArg]) -> Vec<Entry> {
     let mut out = Vec::new();
-    for arg in args {
+    for arg in args.iter().take(MAX_SPEC_CHILDREN) {
         if let Some(ref tpl) = arg.template {
             for t in tpl.as_slice() {
                 if t == "folders" {
@@ -470,15 +560,22 @@ fn fig_args_to_entries(args: &[FigArg]) -> Vec<Entry> {
                 }
             }
         }
-        for sug in &arg.suggestions {
+        for sug in arg.suggestions.iter().take(MAX_SPEC_CHILDREN) {
             match sug {
                 FigSuggestion::Plain(val) if !val.trim().is_empty() => {
-                    let v = val.trim();
-                    out.push(Entry::new(v, v, EntryKind::Enum, ""));
+                    let clean_v = sanitize_single_line(val.trim());
+                    let v = clean_v.trim();
+                    if !v.is_empty() {
+                        out.push(Entry::new(v, v, EntryKind::Enum, ""));
+                    }
                 }
                 FigSuggestion::Detailed { name, description } if !name.trim().is_empty() => {
-                    let n = name.trim();
-                    out.push(Entry::new(n, n, EntryKind::Enum, description));
+                    let clean_n = sanitize_single_line(name.trim());
+                    let n = clean_n.trim();
+                    if !n.is_empty() {
+                        let clean_d = sanitize_multiline_desc(description.trim());
+                        out.push(Entry::new(n, n, EntryKind::Enum, clean_d.as_ref()));
+                    }
                 }
                 _ => {}
             }
@@ -491,10 +588,10 @@ fn fig_args_to_entries(args: &[FigArg]) -> Vec<Entry> {
 // Lightweight Zero-Dependency YAML-Subset -> JSON Value Parser
 // ============================================================================
 
-#[derive(Debug, Clone)]
-struct YamlLine {
+#[derive(Debug, Clone, Copy)]
+struct YamlLine<'a> {
     indent: usize,
-    text: String,
+    text: &'a str,
 }
 
 fn strip_yaml_comment(line: &str) -> &str {
@@ -524,10 +621,16 @@ fn strip_yaml_comment(line: &str) -> &str {
     line
 }
 
-fn tokenize_yaml(input: &str) -> anyhow::Result<Vec<YamlLine>> {
+fn tokenize_yaml(input: &str) -> anyhow::Result<Vec<YamlLine<'_>>> {
     let mut out = Vec::new();
     for raw in input.lines() {
+        if out.len() >= MAX_YAML_LINES {
+            anyhow::bail!("YAML spec exceeds maximum allowed lines ({MAX_YAML_LINES})");
+        }
         let indent = raw.bytes().take_while(|b| *b == b' ').count();
+        if indent > 256 {
+            anyhow::bail!("YAML indentation exceeds maximum allowed spaces (256)");
+        }
         let rest = &raw[indent..];
         if rest.starts_with('\t') {
             anyhow::bail!("Tab indentation is not supported in YAML specs");
@@ -538,7 +641,7 @@ fn tokenize_yaml(input: &str) -> anyhow::Result<Vec<YamlLine>> {
         }
         out.push(YamlLine {
             indent,
-            text: cleaned.to_string(),
+            text: cleaned,
         });
     }
     Ok(out)
@@ -549,7 +652,7 @@ fn yaml_to_json(input: &str) -> anyhow::Result<serde_json::Value> {
     if lines.is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
-    let (val, next_idx) = parse_yaml_block(&lines, 0, lines[0].indent)?;
+    let (val, next_idx) = parse_yaml_block(&lines, 0, lines[0].indent, 0)?;
     if next_idx < lines.len() {
         anyhow::bail!(
             "Unexpected YAML syntax or indentation near: {}",
@@ -572,17 +675,21 @@ fn is_block_scalar(val_part: &str) -> Option<bool> {
 }
 
 fn consume_yaml_value(
-    lines: &[YamlLine],
+    lines: &[YamlLine<'_>],
     idx: &mut usize,
     parent_indent: usize,
     val_part: &str,
+    depth: usize,
 ) -> anyhow::Result<serde_json::Value> {
+    if depth >= MAX_YAML_DEPTH {
+        anyhow::bail!("YAML nesting depth exceeds maximum allowed ({MAX_YAML_DEPTH})");
+    }
     if let Some(literal) = is_block_scalar(val_part) {
         if *idx < lines.len() && lines[*idx].indent > parent_indent {
             let block_indent = lines[*idx].indent;
             let mut parts = Vec::new();
             while *idx < lines.len() && lines[*idx].indent >= block_indent {
-                parts.push(lines[*idx].text.as_str());
+                parts.push(lines[*idx].text);
                 *idx += 1;
             }
             let sep = if literal { "\n" } else { " " };
@@ -594,21 +701,21 @@ fn consume_yaml_value(
     if val_part.is_empty() {
         if *idx < lines.len() && lines[*idx].indent > parent_indent {
             let child_indent = lines[*idx].indent;
-            let (nested, next_idx) = parse_yaml_block(lines, *idx, child_indent)?;
+            let (nested, next_idx) = parse_yaml_block(lines, *idx, child_indent, depth)?;
             *idx = next_idx;
             Ok(nested)
         } else if *idx < lines.len()
             && lines[*idx].indent == parent_indent
-            && is_seq_item(&lines[*idx].text)
+            && is_seq_item(lines[*idx].text)
         {
-            let (nested, next_idx) = parse_yaml_seq(lines, *idx, lines[*idx].indent)?;
+            let (nested, next_idx) = parse_yaml_seq(lines, *idx, lines[*idx].indent, depth)?;
             *idx = next_idx;
             Ok(nested)
         } else {
             Ok(serde_json::Value::Null)
         }
     } else {
-        parse_yaml_inline(val_part)
+        parse_yaml_inline(val_part, depth)
     }
 }
 
@@ -640,35 +747,43 @@ fn find_mapping_colon(text: &str) -> Option<usize> {
 }
 
 fn parse_yaml_block(
-    lines: &[YamlLine],
+    lines: &[YamlLine<'_>],
     start: usize,
     base_indent: usize,
+    depth: usize,
 ) -> anyhow::Result<(serde_json::Value, usize)> {
+    if depth >= MAX_YAML_DEPTH {
+        anyhow::bail!("YAML nesting depth exceeds maximum allowed ({MAX_YAML_DEPTH})");
+    }
     if start >= lines.len() {
         return Ok((serde_json::Value::Null, start));
     }
-    if is_seq_item(&lines[start].text) {
-        parse_yaml_seq(lines, start, base_indent)
+    if is_seq_item(lines[start].text) {
+        parse_yaml_seq(lines, start, base_indent, depth)
     } else {
-        parse_yaml_map(lines, start, base_indent)
+        parse_yaml_map(lines, start, base_indent, depth)
     }
 }
 
 fn parse_yaml_map(
-    lines: &[YamlLine],
+    lines: &[YamlLine<'_>],
     mut idx: usize,
     base_indent: usize,
+    depth: usize,
 ) -> anyhow::Result<(serde_json::Value, usize)> {
+    if depth >= MAX_YAML_DEPTH {
+        anyhow::bail!("YAML nesting depth exceeds maximum allowed ({MAX_YAML_DEPTH})");
+    }
     let mut map = serde_json::Map::new();
     while idx < lines.len() {
         let line = &lines[idx];
-        if line.indent < base_indent || is_seq_item(&line.text) {
+        if line.indent < base_indent || is_seq_item(line.text) {
             break;
         }
         if line.indent > base_indent {
             anyhow::bail!("Unexpected YAML indentation at: {}", line.text);
         }
-        let Some(colon) = find_mapping_colon(&line.text) else {
+        let Some(colon) = find_mapping_colon(line.text) else {
             anyhow::bail!(
                 "Expected YAML 'key: value' mapping entry, found: {}",
                 line.text
@@ -679,21 +794,25 @@ fn parse_yaml_map(
         let line_indent = line.indent;
         idx += 1;
 
-        let val = consume_yaml_value(lines, &mut idx, line_indent, val_part)?;
+        let val = consume_yaml_value(lines, &mut idx, line_indent, val_part, depth + 1)?;
         map.insert(key, val);
     }
     Ok((serde_json::Value::Object(map), idx))
 }
 
 fn parse_yaml_seq(
-    lines: &[YamlLine],
+    lines: &[YamlLine<'_>],
     mut idx: usize,
     base_indent: usize,
+    depth: usize,
 ) -> anyhow::Result<(serde_json::Value, usize)> {
+    if depth >= MAX_YAML_DEPTH {
+        anyhow::bail!("YAML nesting depth exceeds maximum allowed ({MAX_YAML_DEPTH})");
+    }
     let mut seq = Vec::new();
     while idx < lines.len() {
         let line = &lines[idx];
-        if line.indent != base_indent || !is_seq_item(&line.text) {
+        if line.indent != base_indent || !is_seq_item(line.text) {
             break;
         }
         let after_dash_raw = &line.text[1..];
@@ -705,7 +824,7 @@ fn parse_yaml_seq(
         if after_dash.is_empty() {
             if idx < lines.len() && lines[idx].indent > base_indent {
                 let child_indent = lines[idx].indent;
-                let (nested, next_idx) = parse_yaml_block(lines, idx, child_indent)?;
+                let (nested, next_idx) = parse_yaml_block(lines, idx, child_indent, depth + 1)?;
                 idx = next_idx;
                 seq.push(nested);
             } else {
@@ -714,15 +833,15 @@ fn parse_yaml_seq(
         } else if let Some(colon) = find_mapping_colon(after_dash) {
             let first_key = unquote_yaml_scalar(after_dash[..colon].trim());
             let first_val_part = after_dash[colon + 1..].trim();
-            let first_val = consume_yaml_value(lines, &mut idx, item_indent, first_val_part)?;
+            let first_val =
+                consume_yaml_value(lines, &mut idx, item_indent, first_val_part, depth + 1)?;
 
             let mut item_map = serde_json::Map::new();
             item_map.insert(first_key, first_val);
-            if idx < lines.len()
-                && lines[idx].indent > base_indent
-                && !is_seq_item(&lines[idx].text)
+            if idx < lines.len() && lines[idx].indent > base_indent && !is_seq_item(lines[idx].text)
             {
-                let (rest_val, next_idx) = parse_yaml_map(lines, idx, lines[idx].indent)?;
+                let (rest_val, next_idx) =
+                    parse_yaml_map(lines, idx, lines[idx].indent, depth + 1)?;
                 idx = next_idx;
                 if let serde_json::Value::Object(rest_map) = rest_val {
                     item_map.extend(rest_map);
@@ -730,21 +849,25 @@ fn parse_yaml_seq(
             }
             seq.push(serde_json::Value::Object(item_map));
         } else {
-            seq.push(parse_yaml_inline(after_dash)?);
+            seq.push(parse_yaml_inline(after_dash, depth + 1)?);
         }
     }
     Ok((serde_json::Value::Array(seq), idx))
 }
 
-fn parse_yaml_inline(raw: &str) -> anyhow::Result<serde_json::Value> {
+fn parse_yaml_inline(raw: &str, depth: usize) -> anyhow::Result<serde_json::Value> {
+    if depth >= MAX_YAML_DEPTH {
+        anyhow::bail!("YAML inline nesting depth exceeds maximum allowed ({MAX_YAML_DEPTH})");
+    }
     let trimmed = raw.trim();
     if trimmed.starts_with('[') && trimmed.ends_with(']') {
         let inner = &trimmed[1..trimmed.len() - 1];
-        let mut arr = Vec::new();
-        for item in split_flow_items(inner) {
+        let items = split_flow_items(inner);
+        let mut arr = Vec::with_capacity(items.len());
+        for item in items {
             let t = item.trim();
             if !t.is_empty() {
-                arr.push(parse_yaml_inline(t)?);
+                arr.push(parse_yaml_inline(t, depth + 1)?);
             }
         }
         return Ok(serde_json::Value::Array(arr));
@@ -752,15 +875,16 @@ fn parse_yaml_inline(raw: &str) -> anyhow::Result<serde_json::Value> {
 
     if trimmed.starts_with('{') && trimmed.ends_with('}') {
         let inner = &trimmed[1..trimmed.len() - 1];
+        let pairs = split_flow_items(inner);
         let mut map = serde_json::Map::new();
-        for pair in split_flow_items(inner) {
+        for pair in pairs {
             let t = pair.trim();
             if t.is_empty() {
                 continue;
             }
             if let Some(colon) = find_mapping_colon(t) {
                 let k = unquote_yaml_scalar(t[..colon].trim());
-                let v = parse_yaml_inline(t[colon + 1..].trim())?;
+                let v = parse_yaml_inline(t[colon + 1..].trim(), depth + 1)?;
                 map.insert(k, v);
             }
         }
@@ -779,49 +903,35 @@ fn parse_yaml_inline(raw: &str) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::Value::String(unquote_yaml_scalar(trimmed)))
 }
 
-fn split_flow_items(inner: &str) -> Vec<String> {
+fn split_flow_items(inner: &str) -> Vec<&str> {
     let mut items = Vec::new();
-    let mut cur = String::new();
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
     let mut depth = 0usize;
+    let mut start = 0usize;
 
-    for ch in inner.chars() {
+    for (idx, ch) in inner.char_indices() {
         if escaped {
-            cur.push(ch);
             escaped = false;
             continue;
         }
         match ch {
-            '\\' if in_double => {
-                cur.push(ch);
-                escaped = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                cur.push(ch);
-            }
-            '\'' if !in_double => {
-                in_single = !in_single;
-                cur.push(ch);
-            }
-            '[' | '{' if !in_single && !in_double => {
-                depth += 1;
-                cur.push(ch);
-            }
-            ']' | '}' if !in_single && !in_double => {
-                depth = depth.saturating_sub(1);
-                cur.push(ch);
-            }
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '[' | '{' if !in_single && !in_double => depth += 1,
+            ']' | '}' if !in_single && !in_double => depth = depth.saturating_sub(1),
             ',' if !in_single && !in_double && depth == 0 => {
-                items.push(std::mem::take(&mut cur));
+                items.push(&inner[start..idx]);
+                start = idx + 1;
             }
-            _ => cur.push(ch),
+            _ => {}
         }
     }
-    if !cur.trim().is_empty() {
-        items.push(cur);
+    let tail = &inner[start..];
+    if !tail.trim().is_empty() {
+        items.push(tail);
     }
     items
 }
@@ -1118,5 +1228,92 @@ commands:
         let parsed = parse_spec_str("fig.json", fig_with_empty_opt).expect("fig with null/empty");
         let texts: Vec<&str> = parsed.children.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts, vec!["-v"]);
+    }
+
+    #[test]
+    fn test_parse_spec_blocks_path_traversal_unsafe_names_and_oversized_files() {
+        for bad_name in [
+            "../evil.yaml",
+            "..\\evil.yaml",
+            "sub/cmd.json",
+            "sub\\cmd.yml",
+            "C:cmd.json",
+            ".hidden.yaml",
+            ".json",
+            "bad\0.json",
+            "tool.txt",
+            "",
+        ] {
+            assert!(!is_spec_filename(bad_name), "should reject {bad_name:?}");
+            assert!(parse_spec_str(bad_name, r#"{"name":"ok"}"#).is_err());
+        }
+        assert!(is_spec_filename("git.json"));
+        assert!(is_spec_filename("MYTOOL.YAML"));
+        assert!(is_spec_filename("docker.yml"));
+
+        for hostile_root in ["-rf", "../evil", "sub/cmd", "bad name", "cmd\nid", "C:evil"] {
+            let yaml = format!("name: \"{hostile_root}\"\nflags:\n  -v: verbose\n");
+            assert!(
+                parse_spec_str("hostile.yaml", &yaml).is_err(),
+                "should reject hostile root {hostile_root:?}"
+            );
+            let fig = format!(r#"{{"name":"{hostile_root}","options":[{{"name":"-v"}}]}}"#);
+            assert!(
+                parse_spec_str("hostile.json", &fig).is_err(),
+                "should reject hostile Fig root {hostile_root:?}"
+            );
+        }
+
+        let oversized = format!(
+            "{{\"name\":\"ok\",\"description\":\"{}\"}}",
+            "x".repeat(MAX_SPEC_BYTES)
+        );
+        assert!(parse_spec_str("big.json", &oversized).is_err());
+
+        // Valid root should filter unsafe subcommands and strip Bidi/CR while keeping \n in desc
+        let mixed_yaml = "name: safetool\ndescription: \"Line1\\r\\nLine2\u{202e}\"\ncommands:\n  - name: -rf\n  - name: ../escape\n  - name: build\n    description: Valid sub\n";
+        let entry = parse_spec_str("safetool.yaml", mixed_yaml).expect("valid root survives");
+        let sub_names: Vec<&str> = entry.children.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(sub_names, vec!["build"]);
+        assert_eq!(entry.desc, "Line1\nLine2");
+    }
+
+    #[test]
+    fn test_parse_spec_bounds_yaml_depth_flow_depth_and_command_tree_recursion() {
+        let mut deep_yaml = String::from("name: deep\n");
+        for lvl in 0..60 {
+            let indent = "  ".repeat(lvl + 1);
+            deep_yaml.push_str(&format!("{indent}k{lvl}:\n"));
+        }
+        deep_yaml.push_str(&format!("{}leaf: 1\n", "  ".repeat(61)));
+        assert!(parse_spec_str("deep.yaml", &deep_yaml).is_err());
+
+        let deep_flow = format!(
+            "name: flow\nflags:\n  -f: {}1{}\n",
+            "[".repeat(60),
+            "]".repeat(60)
+        );
+        assert!(parse_spec_str("flow.yaml", &deep_flow).is_err());
+
+        // Deep Carapace command tree (> MAX_SPEC_TREE_DEPTH) should parse safely with capped depth
+        let mut deep_json = String::from(r#"{"name":"root","flags":{"-h":"help"},"commands":["#);
+        for lvl in 0..30 {
+            deep_json.push_str(&format!(r#"{{"name":"sub{lvl}","commands":["#));
+        }
+        deep_json.push_str(r#"{"name":"leaf","flags":{}}"#);
+        for _ in 0..30 {
+            deep_json.push_str("]}");
+        }
+        deep_json.push_str("]}");
+
+        let parsed = parse_spec_str("tree.json", &deep_json).expect("deep JSON bounded safely");
+        let mut depth_seen = 0usize;
+        let mut cur = &parsed;
+        while let Some(next) = cur.children.iter().find(|c| c.kind == EntryKind::Subcmd) {
+            depth_seen += 1;
+            cur = next;
+        }
+        assert!(depth_seen <= MAX_SPEC_TREE_DEPTH + 1);
+        assert!(depth_seen >= MAX_SPEC_TREE_DEPTH);
     }
 }

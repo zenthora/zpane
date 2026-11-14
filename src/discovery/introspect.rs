@@ -1,6 +1,8 @@
 use super::catalog::{
-    cache_dir, ensure_parent_dir, hide_window, load_catalog, ps_metadata_path,
-    sync_powershell_metadata, ShellDialect, PRIORITY_CLI_TOOLS,
+    cache_dir, collect_path_dirs_with_prefix, contains_ignore_ascii_case, hide_window,
+    load_catalog, ps_metadata_path, read_bounded_bytes, sanitize_multiline_desc,
+    sanitize_single_line, sync_powershell_metadata, write_secure_file, ShellDialect,
+    PRIORITY_CLI_TOOLS,
 };
 use super::help_parser::parse_cli_help;
 use crate::model::{Entry, EntryKind, RuntimeContext};
@@ -9,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
@@ -55,6 +57,10 @@ pub trait Introspect {
 }
 
 const CLI_CACHE_SCHEMA_VERSION: u32 = 3;
+const MAX_CLI_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CMD_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_CARAPACE_ENTRIES: usize = 1_024;
+const MAX_CHAIN_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedChainRecord {
@@ -67,6 +73,14 @@ struct CachedChainRecord {
     entries: Vec<Entry>,
 }
 
+#[derive(Serialize)]
+struct CachedChainRecordRef<'a> {
+    schema_version: u32,
+    dialect: &'a str,
+    exe_fingerprint: Option<(u64, u64)>,
+    entries: &'a [Entry],
+}
+
 fn dialect_cache_tag(dialect: ShellDialect) -> &'static str {
     match dialect {
         ShellDialect::PowerShell => "pwsh",
@@ -75,35 +89,186 @@ fn dialect_cache_tag(dialect: ShellDialect) -> &'static str {
     }
 }
 
-fn find_executable_in_path(exe: &str) -> Option<PathBuf> {
+fn has_shell_metachar_or_control(s: &str) -> bool {
+    s.chars().any(|c| {
+        c.is_control()
+            || matches!(
+                c,
+                '\0' | '\u{200b}'..='\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '&'
+                    | '|'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '$'
+                    | '`'
+                    | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '{'
+                    | '}'
+                    | '*'
+                    | '?'
+                    | '!'
+                    | '%'
+                    | '^'
+            )
+    })
+}
+
+fn is_safe_exe_token(exe: &str) -> bool {
     let trimmed = exe.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.len() > 260 || trimmed.starts_with('-') {
+        return false;
+    }
+    if has_shell_metachar_or_control(trimmed) {
+        return false;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return !path.components().any(|c| matches!(c, Component::ParentDir));
+    }
+    if trimmed.starts_with('.')
+        || trimmed
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, ':' | '/' | '\\'))
+    {
+        return false;
+    }
+    let mut comps = path.components();
+    matches!(comps.next(), Some(Component::Normal(_))) && comps.next().is_none()
+}
+
+fn is_safe_sub_arg(arg: &str) -> bool {
+    let trimmed = arg.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed.starts_with(['-', '/', '\\', '.'])
+        || trimmed.contains("..")
+        || trimmed.chars().any(|c| c.is_whitespace() || c == '=')
+        || has_shell_metachar_or_control(trimmed)
+    {
+        return false;
+    }
+    true
+}
+
+fn normalize_and_validate_chain<'a>(
+    chain: &[&'a str],
+    out: &mut [&'a str; MAX_CHAIN_DEPTH],
+) -> Option<usize> {
+    let mut len = 0usize;
+    for raw in chain {
+        let s = raw.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if len >= MAX_CHAIN_DEPTH {
+            return None;
+        }
+        let valid = if len == 0 {
+            is_safe_exe_token(s)
+        } else {
+            is_safe_sub_arg(s)
+        };
+        if !valid {
+            return None;
+        }
+        out[len] = s;
+        len += 1;
+    }
+    if len == 0 {
+        None
+    } else {
+        Some(len)
+    }
+}
+
+fn validate_cache_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > 512 {
+        return false;
+    }
+    let mut parts = key.split("::");
+    let Some(root) = parts.next() else {
+        return false;
+    };
+    if !is_safe_exe_token(root) {
+        return false;
+    }
+    for (count, part) in (1usize..).zip(parts) {
+        if count >= MAX_CHAIN_DEPTH || !is_safe_sub_arg(part) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        (meta.permissions().mode() & 0o111) != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_executable_in_dirs(trimmed: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    if !is_safe_exe_token(trimmed) {
         return None;
     }
     let direct_path = Path::new(trimmed);
-    if direct_path.components().count() > 1 {
-        if direct_path.is_file() {
+    let has_ext = direct_path.extension().is_some();
+    if direct_path.is_absolute() {
+        if is_executable_file(direct_path) {
             return Some(direct_path.to_path_buf());
+        }
+        if cfg!(windows) && !has_ext {
+            for ext in ["exe", "cmd", "bat"] {
+                let candidate = PathBuf::from(format!("{trimmed}.{ext}"));
+                if is_executable_file(&candidate) {
+                    return Some(candidate);
+                }
+            }
         }
         return None;
     }
-    let path_val = std::env::var_os("PATH")?;
-    let has_ext = direct_path.extension().is_some();
-    for dir in std::env::split_paths(&path_val) {
+
+    for dir in dirs {
         let direct = dir.join(trimmed);
-        if direct.is_file() {
+        if is_executable_file(&direct) {
             return Some(direct);
         }
         if cfg!(windows) && !has_ext {
             for ext in ["exe", "cmd", "bat"] {
                 let candidate = dir.join(format!("{trimmed}.{ext}"));
-                if candidate.is_file() {
+                if is_executable_file(&candidate) {
                     return Some(candidate);
                 }
             }
         }
     }
     None
+}
+
+pub(super) fn find_executable_in_path(exe: &str) -> Option<PathBuf> {
+    let trimmed = exe.trim();
+    let dirs = collect_path_dirs_with_prefix(
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("PREFIX").as_deref(),
+    );
+    resolve_executable_in_dirs(trimmed, &dirs)
 }
 
 fn executable_fingerprint(exe: &str) -> Option<(u64, u64)> {
@@ -152,7 +317,7 @@ fn load_cli_disk_cache_with_fingerprint<F>(
 where
     F: Fn(&str) -> Option<(u64, u64)>,
 {
-    let Ok(bytes) = fs::read(path) else {
+    let Some(bytes) = read_bounded_bytes(path, MAX_CLI_CACHE_BYTES) else {
         return HashMap::new();
     };
     let Ok(records) = serde_json::from_slice::<HashMap<String, CachedChainRecord>>(&bytes) else {
@@ -160,9 +325,10 @@ where
     };
 
     let expected_tag = expected_dialect.map(dialect_cache_tag);
-    let mut out = HashMap::new();
+    let mut out = HashMap::with_capacity(records.len());
+    let mut fp_cache: HashMap<String, Option<(u64, u64)>> = HashMap::new();
     for (key, rec) in records {
-        if rec.schema_version != CLI_CACHE_SCHEMA_VERSION {
+        if rec.schema_version != CLI_CACHE_SCHEMA_VERSION || !validate_cache_key(&key) {
             continue;
         }
         if let (Some(expected), Some(saved_dialect)) = (expected_tag, rec.dialect.as_deref()) {
@@ -172,7 +338,14 @@ where
         }
         if let Some(saved_fp) = rec.exe_fingerprint {
             if let Some(root_exe) = key.split("::").next() {
-                if fp_fn(root_exe) != Some(saved_fp) {
+                let current_fp = if let Some(&cached_fp) = fp_cache.get(root_exe) {
+                    cached_fp
+                } else {
+                    let computed = fp_fn(root_exe);
+                    fp_cache.insert(root_exe.to_string(), computed);
+                    computed
+                };
+                if current_fp != Some(saved_fp) {
                     continue;
                 }
             }
@@ -187,32 +360,41 @@ fn load_cli_disk_cache_from(path: &Path, dialect: ShellDialect) -> HashMap<Strin
 }
 
 fn save_cli_disk_cache_to(path: &Path, dialect: ShellDialect, cache: &HashMap<String, Vec<Entry>>) {
-    let mut records: HashMap<String, CachedChainRecord> = HashMap::with_capacity(cache.len());
-    let mut fp_cache: HashMap<String, Option<(u64, u64)>> = HashMap::new();
-    let tag = dialect_cache_tag(dialect).to_string();
+    let mut records: HashMap<&str, CachedChainRecordRef<'_>> = HashMap::with_capacity(cache.len());
+    let mut fp_cache: HashMap<&str, Option<(u64, u64)>> = HashMap::new();
+    let tag = dialect_cache_tag(dialect);
     for (key, entries) in cache {
         let root_exe = key.split("::").next().unwrap_or(key.as_str());
         let fp = *fp_cache
-            .entry(root_exe.to_string())
+            .entry(root_exe)
             .or_insert_with(|| executable_fingerprint(root_exe));
         records.insert(
-            key.clone(),
-            CachedChainRecord {
+            key.as_str(),
+            CachedChainRecordRef {
                 schema_version: CLI_CACHE_SCHEMA_VERSION,
-                dialect: Some(tag.clone()),
+                dialect: tag,
                 exe_fingerprint: fp,
-                entries: entries.clone(),
+                entries: entries.as_slice(),
             },
         );
     }
     if let Ok(json) = serde_json::to_vec(&records) {
-        ensure_parent_dir(path);
-        let _ = fs::write(path, json);
+        let _ = write_secure_file(path, &json);
     }
 }
 
-fn run_command_with_timeout(exe: &str, args: &[&str], timeout_ms: u64) -> String {
-    let mut cmd = Command::new(exe);
+fn read_pipe_bounded<R: Read>(mut reader: R, max_bytes: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(max_bytes.min(8192));
+    let mut limited = reader.by_ref().take((max_bytes + 1) as u64);
+    let _ = limited.read_to_end(&mut buf);
+    if buf.len() > max_bytes {
+        buf.truncate(max_bytes);
+    }
+    buf
+}
+
+fn run_command_with_timeout(exe_path: &Path, args: &[&str], timeout_ms: u64) -> String {
+    let mut cmd = Command::new(exe_path);
     cmd.args(args)
         .env_remove("FORCE_COLOR")
         .env_remove("CLICOLOR_FORCE")
@@ -231,41 +413,50 @@ fn run_command_with_timeout(exe: &str, args: &[&str], timeout_ms: u64) -> String
     let mut stderr_pipe = child.stderr.take();
 
     let out_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stdout_pipe.take() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
+        stdout_pipe
+            .take()
+            .map(|p| read_pipe_bounded(p, MAX_CMD_OUTPUT_BYTES))
+            .unwrap_or_default()
     });
 
     let err_handle = thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut p) = stderr_pipe.take() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
+        stderr_pipe
+            .take()
+            .map(|p| read_pipe_bounded(p, MAX_CMD_OUTPUT_BYTES))
+            .unwrap_or_default()
     });
 
     let start = Instant::now();
     let limit = Duration::from_millis(timeout_ms);
+    let mut poll_ms = 1u64;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
-                if start.elapsed() >= limit {
+                let elapsed = start.elapsed();
+                if elapsed >= limit {
                     let _ = child.kill();
                     let _ = child.wait();
                     break;
                 }
-                thread::sleep(Duration::from_millis(8));
+                let remaining = limit - elapsed;
+                thread::sleep(Duration::from_millis(poll_ms).min(remaining));
+                poll_ms = (poll_ms * 2).min(8);
             }
             Err(_) => break,
         }
     }
 
-    let out_str = out_handle.join().unwrap_or_default();
-    let err_str = err_handle.join().unwrap_or_default();
-    format!("{out_str}\n{err_str}")
+    let out_bytes = out_handle.join().unwrap_or_default();
+    let err_bytes = err_handle.join().unwrap_or_default();
+    let mut combined = String::from_utf8_lossy(&out_bytes).into_owned();
+    if !err_bytes.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str(&String::from_utf8_lossy(&err_bytes));
+    }
+    combined
 }
 
 /// Adapter signature for running a CLI command (`exe`, `args`) and returning combined help text.
@@ -273,7 +464,11 @@ type CommandRunner = dyn Fn(&str, &[&str]) -> Option<String> + Send + Sync;
 
 fn default_command_runner() -> Arc<CommandRunner> {
     Arc::new(|exe: &str, args: &[&str]| {
-        let out = run_command_with_timeout(exe, args, 450);
+        if !is_safe_exe_token(exe) {
+            return None;
+        }
+        let resolved = find_executable_in_path(exe)?;
+        let out = run_command_with_timeout(&resolved, args, 450);
         if out.trim().is_empty() {
             None
         } else {
@@ -300,19 +495,14 @@ struct CarapaceValue {
 }
 
 fn is_carapace_installed() -> bool {
-    let Some(path_val) = std::env::var_os("PATH") else {
-        return false;
-    };
-    let candidates: &[&str] = if cfg!(windows) {
-        &["carapace.exe", "carapace.cmd", "carapace.bat"]
-    } else {
-        &["carapace"]
-    };
-    std::env::split_paths(&path_val).any(|dir| candidates.iter().any(|bin| dir.join(bin).is_file()))
+    find_executable_in_path("carapace").is_some()
 }
 
 fn parse_carapace_export(json_str: &str) -> Vec<Entry> {
     let trimmed = json_str.trim();
+    if trimmed.len() > MAX_CMD_OUTPUT_BYTES {
+        return Vec::new();
+    }
     let Some(start) = trimmed.find('{') else {
         return Vec::new();
     };
@@ -320,33 +510,39 @@ fn parse_carapace_export(json_str: &str) -> Vec<Entry> {
         return Vec::new();
     };
 
-    let mut entries = Vec::with_capacity(export.values.len());
-    let mut seen = HashSet::new();
-    for item in export.values {
-        let text = item.value.trim().to_string();
-        if text.is_empty() || !seen.insert(text.to_ascii_lowercase()) {
+    let cap = export.values.len().min(MAX_CARAPACE_ENTRIES);
+    let mut entries = Vec::with_capacity(cap);
+    let mut seen = HashSet::with_capacity(cap);
+    for item in export.values.into_iter().take(MAX_CARAPACE_ENTRIES) {
+        let clean_text = sanitize_single_line(item.value.trim());
+        let text_trimmed = clean_text.trim();
+        if text_trimmed.is_empty() || !seen.insert(text_trimmed.to_ascii_lowercase()) {
             continue;
         }
-        let label = if item.display.trim().is_empty() {
+        let text = text_trimmed.to_string();
+        let clean_display = sanitize_single_line(item.display.trim());
+        let label = if clean_display.trim().is_empty() {
             text.clone()
         } else {
-            item.display.trim().to_string()
+            clean_display.trim().to_string()
         };
-        let tag_lower = item.tag.to_ascii_lowercase();
-        let kind = if text.starts_with('-') || tag_lower.contains("flag") {
+        let tag = item.tag.as_str();
+        let kind = if text.starts_with('-') || contains_ignore_ascii_case(tag, "flag") {
             if text.ends_with('=') {
                 EntryKind::Param
             } else {
                 EntryKind::Flag
             }
-        } else if tag_lower.contains("command") || tag_lower.contains("subcommand") {
+        } else if contains_ignore_ascii_case(tag, "command")
+            || contains_ignore_ascii_case(tag, "subcommand")
+        {
             EntryKind::Subcmd
-        } else if tag_lower.contains("directory")
-            || tag_lower.contains("dir")
-            || tag_lower.contains("file")
+        } else if contains_ignore_ascii_case(tag, "directory")
+            || contains_ignore_ascii_case(tag, "dir")
+            || contains_ignore_ascii_case(tag, "file")
         {
             EntryKind::Path
-        } else if tag_lower.is_empty()
+        } else if tag.trim().is_empty()
             && text
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -356,7 +552,8 @@ fn parse_carapace_export(json_str: &str) -> Vec<Entry> {
             EntryKind::Arg
         };
 
-        entries.push(Entry::new(text, label, kind, item.description.trim()));
+        let clean_desc = sanitize_multiline_desc(item.description.trim());
+        entries.push(Entry::new(text, label, kind, clean_desc.as_ref()));
     }
     entries
 }
@@ -377,16 +574,13 @@ fn introspect_cli_chain_with<F>(
 where
     F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
 {
-    let clean_chain: Vec<&str> = chain
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if clean_chain.is_empty() {
+    let mut stack_chain = [""; MAX_CHAIN_DEPTH];
+    let Some(chain_len) = normalize_and_validate_chain(chain, &mut stack_chain) else {
         return Vec::new();
-    }
+    };
+    let clean_chain = &stack_chain[..chain_len];
     let exe = clean_chain[0];
-    let sub_args: Vec<&str> = clean_chain[1..].to_vec();
+    let sub_args = &clean_chain[1..];
 
     // Note: For git, always prefer `-h` so git never spawns a web browser on Windows!
     let primary_flag = if exe_stem_eq(exe, "git") {
@@ -395,15 +589,17 @@ where
         "--help"
     };
 
-    let mut args1 = sub_args.clone();
-    args1.push(primary_flag);
-    let text = run_cmd(exe, &args1).unwrap_or_default();
+    let mut cmd_args = [""; MAX_CHAIN_DEPTH + 1];
+    cmd_args[..sub_args.len()].copy_from_slice(sub_args);
+    cmd_args[sub_args.len()] = primary_flag;
+    let arg_len = sub_args.len() + 1;
+
+    let text = run_cmd(exe, &cmd_args[..arg_len]).unwrap_or_default();
     let mut entries = parse_cli_help(&text);
 
     if primary_flag != "-h" && (text.trim().len() < 25 || entries.is_empty()) {
-        let mut args2 = sub_args;
-        args2.push("-h");
-        if let Some(fallback_text) = run_cmd(exe, &args2) {
+        cmd_args[sub_args.len()] = "-h";
+        if let Some(fallback_text) = run_cmd(exe, &cmd_args[..arg_len]) {
             let fallback_entries = parse_cli_help(&fallback_text);
             if !fallback_entries.is_empty() || entries.is_empty() {
                 entries = fallback_entries;
@@ -429,18 +625,19 @@ where
                     )
                 })));
     if needs_carapace {
-        let mut c_args = Vec::with_capacity(clean_chain.len() + 3);
-        c_args.push(exe);
-        c_args.push("export");
-        c_args.extend_from_slice(&clean_chain);
-        c_args.push("");
-        if let Some(carapace_out) = run_cmd("carapace", &c_args) {
+        let mut c_args = [""; MAX_CHAIN_DEPTH + 3];
+        c_args[0] = exe;
+        c_args[1] = "export";
+        c_args[2..2 + clean_chain.len()].copy_from_slice(clean_chain);
+        let c_len = 2 + clean_chain.len() + 1; // trailing empty arg ""
+        if let Some(carapace_out) = run_cmd("carapace", &c_args[..c_len]) {
             let carapace_entries = parse_carapace_export(&carapace_out);
             if entries.is_empty() {
                 entries = carapace_entries;
             } else if !carapace_entries.is_empty() {
                 let mut merged = Vec::with_capacity(entries.len() + carapace_entries.len());
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: HashSet<String> =
+                    HashSet::with_capacity(entries.len() + carapace_entries.len());
                 let mut extra_flags = Vec::new();
                 for item in carapace_entries {
                     let key = item.text.to_ascii_lowercase();
@@ -454,10 +651,10 @@ where
                     seen.insert(item.text.to_ascii_lowercase());
                     for alias in &item.aliases {
                         let lower = alias.to_ascii_lowercase();
-                        seen.insert(lower.clone());
                         if !lower.starts_with('-') {
                             seen.insert(format!("-{lower}"));
                         }
+                        seen.insert(lower);
                     }
                     merged.push(item);
                 }
@@ -471,13 +668,13 @@ where
         }
     }
 
-    let vars = dialect.common_var_entries();
-
     // If this is a subcommand or leaf level, also append helpful shell variables
     if clean_chain.len() >= 2 {
-        let mut existing: HashSet<String> = entries.iter().map(|i| i.text.clone()).collect();
+        let vars = dialect.common_var_entries();
+        let orig_len = entries.len();
+        entries.reserve(vars.len());
         for cv in vars {
-            if existing.insert(cv.text.clone()) {
+            if !entries[..orig_len].iter().any(|e| e.text == cv.text) {
                 entries.push(cv);
             }
         }
@@ -491,7 +688,7 @@ where
             )
             .with_aliases(vec!["h".to_string()]),
         );
-        entries.extend(vars);
+        entries.extend(dialect.common_var_entries());
     }
 
     entries
@@ -645,12 +842,34 @@ impl CliIntrospector {
 
     /// Canonical cache key for a command chain (`&["git"]` -> `"git"`, `&["git", "commit"]` -> `"git::commit"`).
     fn chain_key(chain: &[&str]) -> String {
-        chain
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("::")
+        let mut total_len = 0usize;
+        let mut count = 0usize;
+        for raw in chain {
+            let s = raw.trim();
+            if !s.is_empty() {
+                total_len += s.len();
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return String::new();
+        }
+        let mut out = String::with_capacity(total_len + 2 * (count - 1));
+        let mut first = true;
+        for raw in chain {
+            let s = raw.trim();
+            if s.is_empty() {
+                continue;
+            }
+            if !first {
+                out.push_str("::");
+            }
+            first = false;
+            let start = out.len();
+            out.push_str(s);
+            out[start..].make_ascii_lowercase();
+        }
+        out
     }
 
     fn root_exe(key: &str) -> &str {
@@ -667,15 +886,19 @@ impl CliIntrospector {
     /// Queries the cache for `chain`. On cache hit, returns the cached entries.
     /// On cache miss, enqueues a deduplicated background introspection job and returns a loading placeholder entry.
     pub fn query(&mut self, chain: &[&str]) -> Vec<Entry> {
-        let clean_chain: Vec<&str> = chain
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if clean_chain.is_empty() {
+        let mut stack_chain = [""; MAX_CHAIN_DEPTH];
+        let Some(chain_len) = normalize_and_validate_chain(chain, &mut stack_chain) else {
             return Vec::new();
+        };
+        let clean_chain = &stack_chain[..chain_len];
+
+        if clean_chain.len() == 1 && !clean_chain[0].bytes().any(|b| b.is_ascii_uppercase()) {
+            if let Some(cached) = self.cache.get(clean_chain[0]) {
+                return cached.clone();
+            }
         }
-        let key = Self::chain_key(&clean_chain);
+
+        let key = Self::chain_key(clean_chain);
         if let Some(cached) = self.cache.get(&key) {
             return cached.clone();
         }
@@ -691,7 +914,7 @@ impl CliIntrospector {
             }
         }
 
-        vec![Self::loading_entry(&clean_chain)]
+        vec![Self::loading_entry(clean_chain)]
     }
 
     /// Drains completed background introspection responses and catalog refreshes.
@@ -774,17 +997,20 @@ impl CliIntrospector {
 
     /// Invalidates all cached introspection chains rooted at `exe` so subsequent queries re-run `--help`.
     pub fn invalidate_command(&mut self, exe: &str) {
-        let root = exe.trim().to_ascii_lowercase();
-        if root.is_empty() {
+        let root_trimmed = exe.trim();
+        if root_trimmed.is_empty() {
             return;
         }
+        let root = root_trimmed.to_ascii_lowercase();
         *self.invalidated_gen.entry(root.clone()).or_insert(0) += 1;
-        let prefix = format!("{root}::");
         let before = self.cache.len();
-        self.cache
-            .retain(|k, _| k != &root && !k.starts_with(&prefix));
-        self.pending_keys
-            .retain(|k| k != &root && !k.starts_with(&prefix));
+        let matches_root = |k: &str| {
+            k == root
+                || (k.starts_with(&root)
+                    && k.as_bytes().get(root.len()..root.len() + 2) == Some(b"::"))
+        };
+        self.cache.retain(|k, _| !matches_root(k));
+        self.pending_keys.retain(|k| !matches_root(k));
         if self.cache.len() != before {
             self.dirty = true;
         }
@@ -793,16 +1019,32 @@ impl CliIntrospector {
     /// Pre-warms the CLI cache in parallel for all installed tools in `PRIORITY_CLI_TOOLS`
     /// using the canonical cache key format. Returns the number of installed priority tools warmed.
     fn warm_priority_tools(&mut self, col1_entries: &[Entry]) -> usize {
-        let installed: HashSet<String> = col1_entries
-            .iter()
-            .filter(|it| it.kind == EntryKind::Cli)
-            .map(|it| it.text.to_ascii_lowercase())
-            .collect();
+        let mut present = [false; PRIORITY_CLI_TOOLS.len()];
+        let mut remaining = PRIORITY_CLI_TOOLS.len();
+        for it in col1_entries {
+            if it.kind != EntryKind::Cli {
+                continue;
+            }
+            for (idx, &tool) in PRIORITY_CLI_TOOLS.iter().enumerate() {
+                if !present[idx]
+                    && it.text.len() == tool.len()
+                    && it.text.eq_ignore_ascii_case(tool)
+                {
+                    present[idx] = true;
+                    remaining -= 1;
+                    break;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+        }
 
         let available: Vec<&str> = PRIORITY_CLI_TOOLS
             .iter()
             .copied()
-            .filter(|t| installed.contains(&t.to_ascii_lowercase()))
+            .enumerate()
+            .filter_map(|(idx, tool)| present[idx].then_some(tool))
             .collect();
 
         let dialect = self.dialect;
@@ -1575,5 +1817,149 @@ Options:
         assert!(!recorded
             .iter()
             .any(|(exe, args)| exe == "git.exe" && args == &["--help"]));
+    }
+
+    #[test]
+    fn test_argument_option_and_path_traversal_injection_never_spawns_runner() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let calls_ref = Arc::clone(&calls);
+
+        let mut introspector = CliIntrospector::with_runner_and_carapace(
+            ShellDialect::Posix,
+            None,
+            true,
+            move |exe, args| {
+                calls_ref.lock().unwrap().push((
+                    exe.to_string(),
+                    args.iter().map(|s| (*s).to_string()).collect(),
+                ));
+                Some("Options:\n  --ok    Ok\n".to_string())
+            },
+        );
+
+        let hostile_chains: &[&[&str]] = &[
+            &["-rf"],
+            &["--upload-pack=calc"],
+            &["git", "--exec-path=/tmp/evil"],
+            &["git", "-c"],
+            &["cmd", "/c"],
+            &["git", "--upload-pack=id"],
+            &["./evil"],
+            &["../evil"],
+            &["sub/evil"],
+            &["C:evil.exe"],
+            &["git;id"],
+            &["git$(whoami)"],
+            &["git\n--help"],
+            &["git\0evil"],
+            &["tool", "../sub"],
+            &["a", "b", "c", "d", "e", "f", "g", "h", "i"],
+        ];
+
+        for chain in hostile_chains {
+            assert!(
+                introspector.query(chain).is_empty(),
+                "query should reject hostile chain {chain:?}"
+            );
+            assert!(
+                introspect_cli_chain_with(chain, ShellDialect::Posix, true, &|exe, _| {
+                    panic!("direct runner invoked for hostile exe: {exe}");
+                })
+                .is_empty(),
+                "introspect_cli_chain_with should reject {chain:?}"
+            );
+        }
+
+        assert!(!introspector.poll_blocking());
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_resolve_executable_blocks_relative_paths_and_reads_bounded_output_and_cache() {
+        use std::io::Cursor;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "zpane_test_introspect_sec_{}_{nonce}",
+            std::process::id()
+        ));
+        let bin_dir = root.join("zpane");
+        fs::create_dir_all(&bin_dir).unwrap();
+
+        #[cfg(windows)]
+        let fake_exe_name = "mybin.exe";
+        #[cfg(not(windows))]
+        let fake_exe_name = "mybin";
+
+        let fake_exe = bin_dir.join(fake_exe_name);
+        fs::write(&fake_exe, b"echo ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_exe, fs::Permissions::from_mode(0o755)).unwrap();
+            let non_exec = bin_dir.join("readme");
+            fs::write(&non_exec, b"not exec").unwrap();
+            fs::set_permissions(&non_exec, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(resolve_executable_in_dirs("readme", std::slice::from_ref(&bin_dir)).is_none());
+        }
+
+        assert!(resolve_executable_in_dirs("mybin", std::slice::from_ref(&bin_dir)).is_some());
+        assert!(resolve_executable_in_dirs("./mybin", std::slice::from_ref(&bin_dir)).is_none());
+        assert!(resolve_executable_in_dirs("-mybin", std::slice::from_ref(&bin_dir)).is_none());
+
+        let huge_stream = vec![b'a'; 1_000_000];
+        let bounded = read_pipe_bounded(Cursor::new(huge_stream), MAX_CMD_OUTPUT_BYTES);
+        assert_eq!(bounded.len(), MAX_CMD_OUTPUT_BYTES);
+
+        // Cache key sanitization + fp_cache single evaluation per root exe + 0600 save permissions
+        let cache_path = bin_dir.join("cli_cache_posix.json");
+        let valid_rec = CachedChainRecord {
+            schema_version: CLI_CACHE_SCHEMA_VERSION,
+            dialect: Some("posix".to_string()),
+            exe_fingerprint: Some((10, 20)),
+            entries: vec![Entry::new("--help", "--help", EntryKind::Flag, "Help")],
+        };
+        let poisoned = HashMap::from([
+            ("cargo", valid_rec.clone()),
+            ("cargo::build", valid_rec.clone()),
+            ("-rf", valid_rec.clone()),
+            ("../evil", valid_rec.clone()),
+            ("git::--exec-path=sh", valid_rec),
+        ]);
+        fs::write(&cache_path, serde_json::to_vec(&poisoned).unwrap()).unwrap();
+
+        let fp_calls = Arc::new(AtomicUsize::new(0));
+        let fp_calls_ref = Arc::clone(&fp_calls);
+        let loaded = load_cli_disk_cache_with_fingerprint(
+            &cache_path,
+            Some(ShellDialect::Posix),
+            move |exe| {
+                assert_eq!(exe, "cargo");
+                fp_calls_ref.fetch_add(1, Ordering::SeqCst);
+                Some((10, 20))
+            },
+        );
+        assert_eq!(fp_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(loaded.len(), 2);
+        assert!(loaded.contains_key("cargo"));
+        assert!(loaded.contains_key("cargo::build"));
+
+        save_cli_disk_cache_to(&cache_path, ShellDialect::Posix, &loaded);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = fs::metadata(&bin_dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = fs::metadata(&cache_path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

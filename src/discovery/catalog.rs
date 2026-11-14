@@ -1,12 +1,31 @@
+use super::introspect::find_executable_in_path;
 use super::specs::{is_spec_filename, parse_spec_str, specs_dir};
 use crate::model::{CwdEntry, Entry, EntryKind, RuntimeContext};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+pub(super) const MAX_CONFIG_BYTES: u64 = 256 * 1024;
+pub(super) const MAX_SPEC_BYTES: usize = 2 * 1024 * 1024;
+pub(super) const MAX_SPEC_FILES: usize = 256;
+pub(super) const MAX_PS_METADATA_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const MAX_GIT_SMALL_BYTES: u64 = 64 * 1024;
+pub(super) const MAX_GIT_PACKED_REFS_BYTES: u64 = 4 * 1024 * 1024;
+pub(super) const MAX_GIT_REFS_DEPTH: usize = 32;
+pub(super) const MAX_GIT_REFS_COUNT: usize = 10_000;
+const MAX_CWD_SCAN_READS: usize = 10_000;
+const MAX_HISTORY_ITEMS: usize = 10_000;
+const MAX_CONFIG_ARRAY_ITEMS: usize = 1_024;
 
 /// Canonical priority CLI tools list shared by Pane 1 catalog ordering and `--warm` batch warming.
 pub(super) const PRIORITY_CLI_TOOLS: &[&str] = &[
@@ -118,13 +137,22 @@ impl ShellDialect {
         is_windows: bool,
     ) -> Self {
         if let Some(zs) = zpane_shell.map(str::trim).filter(|s| !s.is_empty()) {
-            match zs.to_ascii_lowercase().as_str() {
-                "pwsh" | "powershell" => return ShellDialect::PowerShell,
-                "fish" => return ShellDialect::Fish,
-                "posix" | "bash" | "zsh" | "sh" | "dash" | "ash" | "ksh" | "mksh" => {
-                    return ShellDialect::Posix;
-                }
-                _ => {}
+            if zs.eq_ignore_ascii_case("pwsh") || zs.eq_ignore_ascii_case("powershell") {
+                return ShellDialect::PowerShell;
+            }
+            if zs.eq_ignore_ascii_case("fish") {
+                return ShellDialect::Fish;
+            }
+            if zs.eq_ignore_ascii_case("posix")
+                || zs.eq_ignore_ascii_case("bash")
+                || zs.eq_ignore_ascii_case("zsh")
+                || zs.eq_ignore_ascii_case("sh")
+                || zs.eq_ignore_ascii_case("dash")
+                || zs.eq_ignore_ascii_case("ash")
+                || zs.eq_ignore_ascii_case("ksh")
+                || zs.eq_ignore_ascii_case("mksh")
+            {
+                return ShellDialect::Posix;
             }
         }
         if is_windows || has_ps_module_path {
@@ -148,11 +176,14 @@ impl ShellDialect {
 
     /// Formats an environment variable reference in this dialect's syntax.
     fn env_token(self, name: &str) -> String {
+        let mut out = String::with_capacity(name.len() + 5);
         if self.is_powershell() {
-            format!("$env:{name}")
+            out.push_str("$env:");
         } else {
-            format!("${name}")
+            out.push('$');
         }
+        out.push_str(name);
+        out
     }
 
     /// Returns the path-list separator for this dialect.
@@ -169,23 +200,31 @@ impl ShellDialect {
         if self.is_powershell() {
             value.contains(';')
         } else {
-            let upper = name.to_ascii_uppercase();
-            value.contains(':') && (upper.contains("PATH") || upper.ends_with("DIRS"))
+            value.contains(':')
+                && (contains_ignore_ascii_case(name, "PATH")
+                    || ends_with_ignore_ascii_case(name, "DIRS"))
         }
     }
 
     /// Returns common built-in and special variable entries for this shell dialect.
     pub fn common_var_entries(self) -> Vec<Entry> {
-        let pwd = env::current_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
+        let pwd = sanitize_single_line(
+            &env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+        .into_owned();
 
         match self {
             ShellDialect::PowerShell => {
-                let home = env::var("USERPROFILE")
-                    .or_else(|_| env::var("HOME"))
-                    .unwrap_or_default();
-                let temp = env::temp_dir().display().to_string();
+                let home = sanitize_single_line(
+                    &env::var("USERPROFILE")
+                        .or_else(|_| env::var("HOME"))
+                        .unwrap_or_default(),
+                )
+                .into_owned();
+                let temp =
+                    sanitize_single_line(&env::temp_dir().display().to_string()).into_owned();
                 let profile = if cfg!(windows) {
                     format!("{home}\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1")
                 } else {
@@ -212,9 +251,23 @@ impl ShellDialect {
                 ]
             }
             ShellDialect::Posix | ShellDialect::Fish => {
-                let var = |k: &str| env::var(k).unwrap_or_default();
-                let tmp = env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-                let mut vars = vec![
+                let var =
+                    |k: &str| sanitize_single_line(&env::var(k).unwrap_or_default()).into_owned();
+                let tmp = sanitize_single_line(
+                    &env::var("TMPDIR")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| {
+                            if let Some(prefix) = non_empty_abs_env_path("PREFIX") {
+                                prefix.join("tmp").display().to_string()
+                            } else {
+                                "/tmp".to_string()
+                            }
+                        }),
+                )
+                .into_owned();
+                let mut vars = Vec::with_capacity(8);
+                vars.extend([
                     Entry::new("$PWD", "$PWD (Current Dir)", EntryKind::Var, pwd)
                         .with_literal(true),
                     Entry::new("$HOME", "$HOME (User Home)", EntryKind::Var, var("HOME"))
@@ -230,7 +283,7 @@ impl ShellDialect {
                         var("SHELL"),
                     )
                     .with_literal(true),
-                ];
+                ]);
                 if self == ShellDialect::Posix {
                     vars.extend([
                         Entry::new(
@@ -281,6 +334,152 @@ impl ShellDialect {
     }
 }
 
+#[inline]
+pub(super) fn cmp_ascii_case_insensitive(a: &str, b: &str) -> Ordering {
+    a.bytes()
+        .map(|x| x.to_ascii_lowercase())
+        .cmp(b.bytes().map(|y| y.to_ascii_lowercase()))
+}
+
+#[inline]
+pub(super) fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+#[inline]
+pub(super) fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    haystack
+        .len()
+        .checked_sub(suffix.len())
+        .and_then(|start| haystack.get(start..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+#[inline]
+pub(super) fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let hb = haystack.as_bytes();
+    let nb = needle.as_bytes();
+    if nb.is_empty() {
+        return true;
+    }
+    if nb.len() > hb.len() {
+        return false;
+    }
+    hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb))
+}
+
+#[inline]
+const fn is_bidi_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+/// Strips C0/DEL/C1 control characters and Unicode Bidi format controls so tokens and
+/// single-line descriptions cannot inject newlines, NULs, terminal escapes, or spoofed text.
+pub(super) fn sanitize_single_line(raw: &str) -> Cow<'_, str> {
+    if !raw
+        .chars()
+        .any(|c| c.is_control() || is_bidi_format_char(c))
+    {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if !c.is_control() && !is_bidi_format_char(c) {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Sanitizes multi-line descriptions by normalizing `\r\n` to `\n` and stripping `\0`, `\r`,
+/// C0/DEL/C1 controls (except `\n`), and Unicode Bidi format controls.
+pub(super) fn sanitize_multiline_desc(raw: &str) -> Cow<'_, str> {
+    if !raw
+        .chars()
+        .any(|c| (c.is_control() && c != '\n') || is_bidi_format_char(c))
+    {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c == '\n' || (!c.is_control() && !is_bidi_format_char(c)) {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
+pub(super) fn is_safe_command_token(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && !name.starts_with('-')
+        && name != "."
+        && name != ".."
+        && !name
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || is_bidi_format_char(c))
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name.bytes().enumerate().all(|(idx, b)| {
+            if idx == 0 {
+                b.is_ascii_alphabetic() || b == b'_'
+            } else {
+                b.is_ascii_alphanumeric() || b == b'_'
+            }
+        })
+}
+
+/// Quotes a literal string safely for `dialect` using single-quoting rules after stripping
+/// NUL/CR/LF and control characters so command substitution (`$(...)`, backticks) and quote
+/// breakouts are neutralized.
+fn quote_shell_literal(dialect: ShellDialect, raw: &str) -> Option<String> {
+    let clean = sanitize_single_line(raw);
+    if clean.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(clean.len() + 4);
+    out.push('\'');
+    match dialect {
+        ShellDialect::PowerShell => {
+            for ch in clean.chars() {
+                if ch == '\'' {
+                    out.push_str("''");
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+        ShellDialect::Posix => {
+            for ch in clean.chars() {
+                if ch == '\'' {
+                    out.push_str("'\\''");
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+        ShellDialect::Fish => {
+            for ch in clean.chars() {
+                match ch {
+                    '\\' => out.push_str("\\\\"),
+                    '\'' => out.push_str("\\'"),
+                    _ => out.push(ch),
+                }
+            }
+        }
+    }
+    out.push('\'');
+    Some(out)
+}
+
 /// Prevents a console window from flashing up for child processes on Windows; no-op elsewhere.
 pub(super) fn hide_window(cmd: &mut Command) -> &mut Command {
     #[cfg(windows)]
@@ -292,24 +491,148 @@ pub(super) fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+fn non_empty_abs_env_path(var: &str) -> Option<PathBuf> {
+    let val = env::var_os(var)?;
+    if val.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(val);
+    path.is_absolute().then_some(path)
+}
+
 /// Per-user cache directory: `%LOCALAPPDATA%\zpane` on Windows,
 /// `$XDG_CACHE_HOME/zpane` or `~/.cache/zpane` on Linux / Termux.
 pub(super) fn cache_dir() -> PathBuf {
     let base = if cfg!(windows) {
-        env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        non_empty_abs_env_path("LOCALAPPDATA").or_else(|| {
+            non_empty_abs_env_path("USERPROFILE").map(|p| p.join("AppData").join("Local"))
+        })
     } else {
-        env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        non_empty_abs_env_path("XDG_CACHE_HOME")
+            .or_else(|| non_empty_abs_env_path("HOME").map(|h| h.join(".cache")))
     }
-    .unwrap_or_else(|| PathBuf::from("."));
+    .unwrap_or_else(env::temp_dir);
     base.join("zpane")
 }
 
-pub(super) fn ensure_parent_dir(path: &Path) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+#[cfg(unix)]
+fn is_zpane_owned_dir(dir: &Path) -> bool {
+    dir.file_name().and_then(|n| n.to_str()) == Some("zpane")
+        || dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("zpane")
+}
+
+pub(super) fn ensure_secure_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir)?;
+    #[cfg(unix)]
+    {
+        if is_zpane_owned_dir(dir) {
+            if let Ok(meta) = fs::symlink_metadata(dir) {
+                if meta.is_dir() && !meta.file_type().is_symlink() {
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+                }
+            }
+        }
     }
+    Ok(())
+}
+
+/// Atomically writes `data` to `path` with `0600` file permissions and `0700` zpane cache directory
+/// permissions on Unix, avoiding symlink-following and world-readable race windows.
+pub(super) fn write_secure_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent directory")
+    })?;
+    ensure_secure_dir(parent)?;
+
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let pid = std::process::id();
+    let seq = TEMP_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+    let stem = path.file_name().and_then(|n| n.to_str()).unwrap_or("cache");
+
+    let mut tmp_path = None;
+    let mut file = None;
+    for attempt in 0..8u64 {
+        let candidate = parent.join(format!(".{stem}.{pid}.{seq}.{attempt}.tmp"));
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        opts.mode(0o600);
+        match opts.open(&candidate) {
+            Ok(f) => {
+                tmp_path = Some(candidate);
+                file = Some(f);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+
+    let (Some(tmp_path), Some(mut file)) = (tmp_path, file) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not allocate unique temp file",
+        ));
+    };
+
+    let res = (|| -> std::io::Result<()> {
+        file.write_all(data)?;
+        file.flush()?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        Ok(())
+    })();
+
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    res
+}
+
+/// Reads a regular file up to `max_bytes`, returning `None` for FIFOs, device nodes,
+/// missing files, or files larger than `max_bytes`.
+pub(super) fn read_bounded_bytes(path: &Path, max_bytes: u64) -> Option<Vec<u8>> {
+    // Check `metadata` before `open` so Unix FIFOs cannot block on open().
+    let pre = fs::metadata(path).ok()?;
+    if !pre.file_type().is_file() || pre.len() > max_bytes {
+        return None;
+    }
+    let file = fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(meta.len().min(65_536) as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .ok()?;
+    if (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    Some(buf)
+}
+
+pub(super) fn read_bounded_string(path: &Path, max_bytes: u64) -> Option<String> {
+    let bytes = read_bounded_bytes(path, max_bytes)?;
+    String::from_utf8(bytes).ok()
+}
+
+fn read_bounded_string_lossy(path: &Path, max_bytes: u64) -> Option<String> {
+    let bytes = read_bounded_bytes(path, max_bytes)?;
+    Some(match String::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+    })
 }
 
 pub(super) fn ps_metadata_path() -> PathBuf {
@@ -329,19 +652,21 @@ pub struct UserConfig {
 pub fn config_path() -> PathBuf {
     if let Ok(explicit) = env::var("ZPANE_CONFIG") {
         let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
+        if !trimmed.is_empty() && !trimmed.contains('\0') {
             return PathBuf::from(trimmed);
         }
     }
     if cfg!(windows) {
-        env::var_os("LOCALAPPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        non_empty_abs_env_path("LOCALAPPDATA")
+            .or_else(|| {
+                non_empty_abs_env_path("USERPROFILE").map(|p| p.join("AppData").join("Local"))
+            })
+            .unwrap_or_else(env::temp_dir)
             .join("zpane")
             .join("config.toml")
-    } else if let Some(xdg) = env::var_os("XDG_CONFIG_HOME").map(PathBuf::from) {
+    } else if let Some(xdg) = non_empty_abs_env_path("XDG_CONFIG_HOME") {
         xdg.join("zpane").join("config.toml")
-    } else if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
+    } else if let Some(home) = non_empty_abs_env_path("HOME") {
         home.join(".config").join("zpane").join("config.toml")
     } else {
         cache_dir().join("config.toml")
@@ -375,7 +700,7 @@ fn parse_toml_string_array(raw: &str) -> Vec<String> {
         .and_then(|s| s.strip_suffix(']'))
         .unwrap_or(trimmed);
     let mut out = Vec::new();
-    let mut chars = inner.chars().peekable();
+    let mut chars = inner.chars();
     while let Some(ch) = chars.next() {
         if ch == '"' || ch == '\'' {
             let quote = ch;
@@ -393,9 +718,12 @@ fn parse_toml_string_array(raw: &str) -> Vec<String> {
                     val.push(c);
                 }
             }
-            let cleaned = val.trim().to_string();
-            if !cleaned.is_empty() {
-                out.push(cleaned);
+            let sanitized = sanitize_single_line(val.trim());
+            if !sanitized.is_empty() {
+                out.push(sanitized.into_owned());
+                if out.len() >= MAX_CONFIG_ARRAY_ITEMS {
+                    break;
+                }
             }
         }
     }
@@ -405,79 +733,102 @@ fn parse_toml_string_array(raw: &str) -> Vec<String> {
 /// Parses `config.toml` supporting `priority_tools`, `disabled_tools`, and `history_limit`.
 pub fn parse_user_config_toml(raw: &str) -> UserConfig {
     let mut cfg = UserConfig::default();
+    if raw.len() as u64 > MAX_CONFIG_BYTES {
+        return cfg;
+    }
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let cleaned_lines: Vec<&str> = raw
+    let mut lines = raw
         .lines()
         .map(strip_toml_comment)
         .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+        .filter(|l| !l.is_empty());
 
-    let mut i = 0;
-    while i < cleaned_lines.len() {
-        let line = cleaned_lines[i];
+    let mut array_buf = String::new();
+    while let Some(line) = lines.next() {
         if line.starts_with('[') {
-            i += 1;
             continue;
         }
         let Some((key_raw, val_raw)) = line.split_once('=') else {
-            i += 1;
             continue;
         };
         let key = key_raw.trim();
-        let mut val = val_raw.trim().to_string();
-        if val.starts_with('[') && !val.ends_with(']') {
-            while i + 1 < cleaned_lines.len() {
-                i += 1;
-                val.push(' ');
-                val.push_str(cleaned_lines[i]);
-                if cleaned_lines[i].ends_with(']') {
+        let val_start = val_raw.trim();
+        let is_known = matches!(key, "priority_tools" | "disabled_tools" | "history_limit");
+        if val_start.starts_with('[') && !val_start.ends_with(']') {
+            if is_known {
+                array_buf.clear();
+                array_buf.push_str(val_start);
+            }
+            for next_line in lines.by_ref() {
+                if is_known {
+                    array_buf.push(' ');
+                    array_buf.push_str(next_line);
+                }
+                if next_line.ends_with(']') {
                     break;
                 }
             }
+            if !is_known {
+                continue;
+            }
+        } else if !is_known {
+            continue;
+        } else {
+            array_buf.clear();
+            array_buf.push_str(val_start);
         }
+
         match key {
-            "priority_tools" => cfg.priority_tools = parse_toml_string_array(&val),
-            "disabled_tools" => cfg.disabled_tools = parse_toml_string_array(&val),
+            "priority_tools" => cfg.priority_tools = parse_toml_string_array(&array_buf),
+            "disabled_tools" => cfg.disabled_tools = parse_toml_string_array(&array_buf),
             "history_limit" => {
-                let raw_num = val.trim();
-                let normalized = if !raw_num.starts_with('_')
+                let raw_num = array_buf.trim();
+                let limit_opt = if !raw_num.starts_with('_')
                     && !raw_num.ends_with('_')
                     && !raw_num.contains("__")
                 {
-                    raw_num.replace('_', "")
+                    if raw_num.contains('_') {
+                        raw_num.replace('_', "").parse::<usize>().ok()
+                    } else {
+                        raw_num.parse::<usize>().ok()
+                    }
                 } else {
-                    raw_num.to_string()
+                    raw_num.parse::<usize>().ok()
                 };
-                if let Ok(limit) = normalized.parse::<usize>() {
-                    cfg.history_limit = Some(limit);
+                if let Some(limit) = limit_opt {
+                    cfg.history_limit = Some(limit.min(MAX_HISTORY_ITEMS));
                 }
             }
             _ => {}
         }
-        i += 1;
     }
 
     cfg
 }
 
 fn home_dir() -> Option<PathBuf> {
-    env::var_os("HOME")
-        .or_else(|| env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
+    non_empty_abs_env_path("HOME").or_else(|| non_empty_abs_env_path("USERPROFILE"))
 }
 
 fn read_tail_string(path: &Path, max_bytes: u64) -> Option<String> {
+    let pre = fs::metadata(path).ok()?;
+    if !pre.file_type().is_file() {
+        return None;
+    }
     let mut file = fs::File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let len = meta.len();
     let drop_first_line = if len > max_bytes {
         file.seek(SeekFrom::Start(len - max_bytes)).ok()?;
         true
     } else {
         false
     };
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
+    let mut buf = Vec::with_capacity(len.min(max_bytes).min(65_536) as usize);
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf);
     if drop_first_line {
         if let Some((_, rest)) = text.split_once('\n') {
@@ -485,6 +836,80 @@ fn read_tail_string(path: &Path, max_bytes: u64) -> Option<String> {
         }
     }
     Some(text.into_owned())
+}
+
+pub(super) fn collect_path_dirs_with_prefix(
+    path_os: Option<&OsStr>,
+    prefix_os: Option<&OsStr>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen_canon = HashSet::new();
+
+    let mut push_if_unique_dir = |candidate: PathBuf| {
+        if candidate.as_os_str().is_empty() || !candidate.is_absolute() {
+            return;
+        }
+        let Ok(canon) = fs::canonicalize(&candidate) else {
+            return;
+        };
+        if canon.is_dir() && seen_canon.insert(canon) {
+            dirs.push(candidate);
+        }
+    };
+
+    if let Some(os) = path_os {
+        for p in env::split_paths(os) {
+            push_if_unique_dir(p);
+        }
+    }
+    if let Some(prefix) = prefix_os.filter(|p| !p.is_empty()) {
+        let prefix_path = Path::new(prefix);
+        if prefix_path.is_absolute() {
+            push_if_unique_dir(prefix_path.join("bin"));
+            push_if_unique_dir(prefix_path.join("bin").join("applets"));
+        }
+    }
+    dirs
+}
+
+pub(super) fn load_specs_from_dir(dir: &Path) -> Vec<(String, String)> {
+    let Ok(canon_dir) = fs::canonicalize(dir) else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(&canon_dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            if !is_spec_filename(&name) {
+                return None;
+            }
+            if let Ok(sym_meta) = fs::symlink_metadata(&path) {
+                if sym_meta.file_type().is_symlink() {
+                    let canon_file = fs::canonicalize(&path).ok()?;
+                    if !canon_file.starts_with(&canon_dir) {
+                        return None;
+                    }
+                }
+            }
+            if !path.is_file() {
+                return None;
+            }
+            Some((name, path))
+        })
+        .collect();
+    files.sort_by(|a, b| a.0.cmp(&b.0));
+    files.truncate(MAX_SPEC_FILES);
+
+    files
+        .into_iter()
+        .filter_map(|(name, path)| {
+            read_bounded_string(&path, MAX_SPEC_BYTES as u64).map(|body| (name, body))
+        })
+        .collect()
 }
 
 /// Injectable environment/filesystem source for building the Pane 1 Command Catalog.
@@ -510,56 +935,39 @@ impl EnvSource for OsEnv {
     }
 
     fn path_dirs(&self) -> Vec<PathBuf> {
-        env::var_os("PATH")
-            .map(|os| env::split_paths(&os).collect())
-            .unwrap_or_default()
+        collect_path_dirs_with_prefix(
+            env::var_os("PATH").as_deref(),
+            env::var_os("PREFIX").as_deref(),
+        )
     }
 
     fn dir_executables(&self, dir: &Path) -> Vec<(String, PathBuf)> {
         let Ok(entries) = fs::read_dir(dir) else {
             return Vec::new();
         };
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(128);
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = executable_name(&entry, &path) {
-                let name = name.to_string();
-                out.push((name, path));
+                if is_safe_command_token(name) {
+                    let name = name.to_string();
+                    out.push((name, path));
+                }
             }
         }
         out
     }
 
     fn read_ps_metadata(&self) -> Option<Vec<u8>> {
-        fs::read(ps_metadata_path()).ok()
+        read_bounded_bytes(&ps_metadata_path(), MAX_PS_METADATA_BYTES)
     }
 
     fn spec_files(&self) -> Vec<(String, String)> {
-        let dir = specs_dir();
-        let Ok(entries) = fs::read_dir(dir) else {
-            return Vec::new();
-        };
-        let mut files: Vec<(String, PathBuf)> = entries
-            .flatten()
-            .filter_map(|e| {
-                let path = e.path();
-                if !path.is_file() {
-                    return None;
-                }
-                let name = path.file_name()?.to_str()?.to_string();
-                is_spec_filename(&name).then_some((name, path))
-            })
-            .collect();
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-
-        files
-            .into_iter()
-            .filter_map(|(name, path)| fs::read_to_string(path).ok().map(|body| (name, body)))
-            .collect()
+        load_specs_from_dir(&specs_dir())
     }
 
     fn user_config(&self) -> UserConfig {
-        fs::read_to_string(config_path())
+        read_bounded_string(&config_path(), MAX_CONFIG_BYTES)
             .map(|raw| parse_user_config_toml(&raw))
             .unwrap_or_default()
     }
@@ -584,10 +992,7 @@ impl EnvSource for OsEnv {
                         out.push((name.to_string(), body));
                     }
                 }
-                if let Some(zdotdir) = std::env::var_os("ZDOTDIR")
-                    .map(PathBuf::from)
-                    .filter(|p| !p.as_os_str().is_empty() && p != &home)
-                {
+                if let Some(zdotdir) = non_empty_abs_env_path("ZDOTDIR").filter(|p| p != &home) {
                     for name in [".zshrc", ".zsh_aliases"] {
                         let path = zdotdir.join(name);
                         if let Some(body) = read_tail_string(&path, MAX_RC_BYTES) {
@@ -597,8 +1002,7 @@ impl EnvSource for OsEnv {
                 }
             }
             ShellDialect::Fish => {
-                let config_base = env::var_os("XDG_CONFIG_HOME")
-                    .map(PathBuf::from)
+                let config_base = non_empty_abs_env_path("XDG_CONFIG_HOME")
                     .unwrap_or_else(|| home.join(".config"));
                 let fish_dir = config_base.join("fish");
                 let main_cfg = fish_dir.join("config.fish");
@@ -634,7 +1038,9 @@ impl EnvSource for OsEnv {
 fn executable_name<'a>(entry: &fs::DirEntry, path: &'a Path) -> Option<&'a str> {
     #[cfg(windows)]
     {
-        let _ = entry;
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            return None;
+        }
         let ext = path.extension()?.to_str()?;
         if ext.eq_ignore_ascii_case("exe")
             || ext.eq_ignore_ascii_case("cmd")
@@ -646,9 +1052,11 @@ fn executable_name<'a>(entry: &fs::DirEntry, path: &'a Path) -> Option<&'a str> 
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        if entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+            return None;
+        }
         // `metadata()` follows symlinks (most of /usr/bin on Termux & Debian are links).
-        let meta = fs::metadata(entry.path()).ok()?;
+        let meta = fs::metadata(path).ok()?;
         if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
             return path.file_name()?.to_str();
         }
@@ -661,38 +1069,42 @@ where
     I: IntoIterator<Item = (String, String)>,
 {
     let mut vars: Vec<(String, String)> = vars_iter.into_iter().collect();
-    vars.sort_by_key(|a| a.0.to_ascii_lowercase());
+    vars.sort_by(|a, b| cmp_ascii_case_insensitive(&a.0, &b.0));
     let list_sep = dialect.path_sep();
 
     let mut children = Vec::with_capacity(vars.len());
     for (k, v) in vars {
-        // Windows exposes hidden per-drive CWD entries like `=C:` and `=ExitCode` in env blocks.
-        if k.is_empty() || k.starts_with('=') {
+        // Windows exposes hidden per-drive CWD entries like `=C:` and `=ExitCode` in env blocks;
+        // also skip hostile env names that cannot be safely emitted as shell variable tokens.
+        if k.starts_with('=') || !is_valid_env_var_name(&k) {
             continue;
         }
+        let clean_v = sanitize_single_line(&v);
         let token = dialect.env_token(&k);
-        let mut entry = Entry::new(&token, &k, EntryKind::Env, &v);
+        let mut entry = Entry::new(&token, &k, EntryKind::Env, clean_v.as_ref());
 
-        if dialect.is_path_list(&k, &v) {
-            for part in v.split(list_sep).filter(|s| !s.is_empty()) {
-                entry.children.push(Entry::new(
-                    format!("\"{part}\""),
-                    part,
-                    EntryKind::Value,
-                    format!("Path entry in {token}"),
-                ));
+        if dialect.is_path_list(&k, clean_v.as_ref()) {
+            for part in clean_v.split(list_sep).filter(|s| !s.is_empty()) {
+                if let Some(quoted) = quote_shell_literal(dialect, part) {
+                    entry.children.push(Entry::new(
+                        quoted,
+                        part,
+                        EntryKind::Value,
+                        format!("Path entry in {token}"),
+                    ));
+                }
             }
         } else {
             entry.children.push(Entry::new(
                 &token,
                 format!("Insert {token}"),
                 EntryKind::Var,
-                format!("Current value: {v}"),
+                format!("Current value: {clean_v}"),
             ));
-            if !v.is_empty() {
+            if let Some(quoted) = quote_shell_literal(dialect, clean_v.as_ref()) {
                 entry.children.push(Entry::new(
-                    format!("\"{v}\""),
-                    format!("Literal: {v}"),
+                    quoted,
+                    format!("Literal: {clean_v}"),
                     EntryKind::Value,
                     format!("Insert literal value of {token}"),
                 ));
@@ -734,7 +1146,8 @@ fn build_var_scope_entry(dialect: ShellDialect, ctx: &RuntimeContext) -> Entry {
     let mut root = Entry::scope_root("$", label, EntryKind::Var, desc);
     root.children = dialect.common_var_entries();
     if let Some(ref branch) = ctx.git_branch {
-        let trimmed = branch.trim();
+        let sanitized = sanitize_single_line(branch.trim());
+        let trimmed = sanitized.trim();
         if !trimmed.is_empty() {
             root.children.push(
                 Entry::new(
@@ -749,20 +1162,22 @@ fn build_var_scope_entry(dialect: ShellDialect, ctx: &RuntimeContext) -> Entry {
     }
     for child in &mut root.children {
         let tok = child.text.clone();
-        let val = child.desc.clone();
+        let val = sanitize_single_line(&child.desc).into_owned();
         child.children.push(Entry::new(
             &tok,
             format!("Insert {tok}"),
             EntryKind::Var,
             format!("Value: {val}"),
         ));
-        if child.has_literal && !val.is_empty() {
-            child.children.push(Entry::new(
-                format!("\"{val}\""),
-                format!("Literal: {val}"),
-                EntryKind::Value,
-                format!("Insert literal path/value of {tok}"),
-            ));
+        if child.has_literal {
+            if let Some(quoted) = quote_shell_literal(dialect, &val) {
+                child.children.push(Entry::new(
+                    quoted,
+                    format!("Literal: {val}"),
+                    EntryKind::Value,
+                    format!("Insert literal path/value of {tok}"),
+                ));
+            }
         }
     }
     root
@@ -790,36 +1205,67 @@ fn convert_ps_export_to_entry(exp: PsCommandExport) -> Entry {
         _ => EntryKind::Cmdlet,
     };
 
-    let mut cmd_entry = Entry::new(&exp.name, &exp.name, kind, &exp.desc);
-    let mut primary = Vec::new();
+    let cmd_name = exp.name.trim();
+    let cmd_desc = sanitize_single_line(&exp.desc);
+    let mut cmd_entry = Entry::new(cmd_name, cmd_name, kind, cmd_desc.as_ref());
+    let mut primary = Vec::with_capacity(exp.params.len());
     let mut common = Vec::new();
 
     for p in exp.params {
-        let p_flag = format!("-{}", p.name);
-        let label = if p.aliases.is_empty() {
+        let p_name = sanitize_single_line(p.name.trim());
+        if p_name.is_empty() || p_name.chars().any(char::is_whitespace) {
+            continue;
+        }
+        let p_flag = format!("-{p_name}");
+        let clean_aliases: Vec<String> = p
+            .aliases
+            .into_iter()
+            .filter_map(|a| {
+                let s = sanitize_single_line(a.trim());
+                (!s.is_empty() && !s.chars().any(char::is_whitespace)).then(|| s.into_owned())
+            })
+            .collect();
+        let label = if clean_aliases.is_empty() {
             p_flag.clone()
         } else {
-            let al: Vec<String> = p.aliases.iter().map(|a| format!("-{a}")).collect();
-            format!("{p_flag} ({})", al.join(", "))
+            let mut buf = String::with_capacity(p_flag.len() + clean_aliases.len() * 6 + 4);
+            buf.push_str(&p_flag);
+            buf.push_str(" (");
+            for (idx, a) in clean_aliases.iter().enumerate() {
+                if idx > 0 {
+                    buf.push_str(", ");
+                }
+                buf.push('-');
+                buf.push_str(a);
+            }
+            buf.push(')');
+            buf
         };
         let p_kind = if p.is_switch {
             EntryKind::Flag
         } else {
             EntryKind::Param
         };
-        let desc = format!("[{}] Parameter {}", p.type_name, label);
+        let p_type = sanitize_single_line(&p.type_name);
+        let desc = format!("[{p_type}] Parameter {label}");
 
         let mut param_entry = Entry::new(&p_flag, label, p_kind, desc)
             .with_parameter_sets(p.parameter_sets)
-            .with_aliases(p.aliases);
+            .with_aliases(clean_aliases);
 
+        param_entry
+            .children
+            .reserve(p.valid_values.len() + if p.is_switch { 3 } else { 0 });
         for val in p.valid_values {
-            param_entry.children.push(Entry::new(
-                &val,
-                &val,
-                EntryKind::Enum,
-                format!("Allowed [{}] value for {p_flag}", p.type_name),
-            ));
+            let clean_val = sanitize_single_line(val.trim());
+            if !clean_val.is_empty() {
+                param_entry.children.push(Entry::new(
+                    clean_val.as_ref(),
+                    clean_val.as_ref(),
+                    EntryKind::Enum,
+                    format!("Allowed [{p_type}] value for {p_flag}"),
+                ));
+            }
         }
         if p.is_switch {
             param_entry.children.push(Entry::placeholder(
@@ -883,6 +1329,7 @@ fn strip_matching_quotes(raw: &str) -> &str {
 
 fn is_valid_command_ident(name: &str) -> bool {
     !name.is_empty()
+        && name.len() <= 128
         && !name.starts_with('_')
         && !name.starts_with('-')
         && name
@@ -962,9 +1409,9 @@ fn extract_fish_function_desc(rest: &str) -> Option<String> {
         cursor = next;
         if tok == "--description" || tok == "-d" {
             if let Some((val, _)) = next_shell_token(cursor) {
-                let cleaned = strip_matching_quotes(val);
+                let cleaned = sanitize_single_line(strip_matching_quotes(val));
                 if !cleaned.is_empty() {
-                    return Some(cleaned.to_string());
+                    return Some(cleaned.into_owned());
                 }
             }
             return None;
@@ -973,9 +1420,9 @@ fn extract_fish_function_desc(rest: &str) -> Option<String> {
             .strip_prefix("--description=")
             .or_else(|| tok.strip_prefix("-d="))
         {
-            let cleaned = strip_matching_quotes(val);
+            let cleaned = sanitize_single_line(strip_matching_quotes(val));
             if !cleaned.is_empty() {
-                return Some(cleaned.to_string());
+                return Some(cleaned.into_owned());
             }
             return None;
         }
@@ -993,6 +1440,7 @@ pub fn parse_posix_fish_definitions(
     let mut seen = HashSet::new();
 
     for (source, content) in files {
+        let source_clean = sanitize_single_line(source);
         let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         for raw_line in content.lines() {
             let trimmed = raw_line.trim();
@@ -1023,9 +1471,9 @@ pub fn parse_posix_fish_definitions(
                             if is_valid_command_ident(name)
                                 && seen.insert(name.to_ascii_lowercase())
                             {
-                                let target = strip_matching_quotes(
+                                let target = sanitize_single_line(strip_matching_quotes(
                                     val_raw.trim().trim_end_matches(';').trim(),
-                                );
+                                ));
                                 entries.push(Entry::new(
                                     name,
                                     name,
@@ -1046,7 +1494,7 @@ pub fn parse_posix_fish_definitions(
                                 name,
                                 name,
                                 EntryKind::Func,
-                                format!("Shell function ({source})"),
+                                format!("Shell function ({source_clean})"),
                             ));
                         }
                         continue;
@@ -1067,7 +1515,7 @@ pub fn parse_posix_fish_definitions(
                                 name,
                                 name,
                                 EntryKind::Func,
-                                format!("Shell function ({source})"),
+                                format!("Shell function ({source_clean})"),
                             ));
                         }
                     }
@@ -1097,7 +1545,8 @@ pub fn parse_posix_fish_definitions(
                                 && !target_raw.is_empty()
                                 && seen.insert(name.to_ascii_lowercase())
                             {
-                                let target = strip_matching_quotes(target_raw);
+                                let target =
+                                    sanitize_single_line(strip_matching_quotes(target_raw));
                                 entries.push(Entry::new(
                                     name,
                                     name,
@@ -1155,7 +1604,8 @@ pub fn parse_posix_fish_definitions(
                                     && !target_raw.is_empty()
                                     && seen.insert(name.to_ascii_lowercase())
                                 {
-                                    let target = strip_matching_quotes(target_raw);
+                                    let target =
+                                        sanitize_single_line(strip_matching_quotes(target_raw));
                                     entries.push(Entry::new(
                                         name,
                                         name,
@@ -1174,7 +1624,7 @@ pub fn parse_posix_fish_definitions(
                                 && seen.insert(name.to_ascii_lowercase())
                             {
                                 let desc = extract_fish_function_desc(rest)
-                                    .unwrap_or_else(|| format!("Fish function ({source})"));
+                                    .unwrap_or_else(|| format!("Fish function ({source_clean})"));
                                 entries.push(Entry::new(name, name, EntryKind::Func, desc));
                             }
                         }
@@ -1187,7 +1637,10 @@ pub fn parse_posix_fish_definitions(
     entries
 }
 
-fn unescape_fish_history_cmd(raw: &str) -> String {
+fn unescape_fish_history_cmd(raw: &str) -> Cow<'_, str> {
+    if !raw.contains('\\') {
+        return Cow::Borrowed(raw);
+    }
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
     while let Some(c) = chars.next() {
@@ -1205,7 +1658,7 @@ fn unescape_fish_history_cmd(raw: &str) -> String {
             out.push(c);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn strip_zsh_extended_timestamp(line: &str) -> &str {
@@ -1245,9 +1698,23 @@ pub fn parse_shell_history_from_str(
     if max_items == 0 {
         return Vec::new();
     }
+    let max_items = max_items.min(MAX_HISTORY_ITEMS);
+    const MAX_RAW_TAIL: usize = 2 * 1024 * 1024;
+    let raw = if raw.len() > MAX_RAW_TAIL {
+        let mut start = raw.len() - MAX_RAW_TAIL;
+        while !raw.is_char_boundary(start) {
+            start += 1;
+        }
+        match raw[start..].split_once('\n') {
+            Some((_, rest)) => rest,
+            None => &raw[start..],
+        }
+    } else {
+        raw
+    };
 
     let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
-    let mut extracted = Vec::new();
+    let mut extracted: Vec<(Cow<'_, str>, bool)> = Vec::new();
     let mut pending: Option<String> = None;
 
     for raw_line in raw.lines() {
@@ -1259,15 +1726,15 @@ pub fn parse_shell_history_from_str(
                     continue;
                 }
                 if let Some(cmd) = trimmed.strip_prefix("- cmd:") {
-                    let cleaned = unescape_fish_history_cmd(cmd.trim());
-                    if !cleaned.is_empty() {
-                        extracted.push(cleaned);
+                    let t = cmd.trim();
+                    if !t.is_empty() {
+                        extracted.push((Cow::Borrowed(t), true));
                     }
                 } else if !trimmed.starts_with("when:")
                     && !trimmed.starts_with("paths:")
                     && !trimmed.starts_with('-')
                 {
-                    extracted.push(trimmed.to_string());
+                    extracted.push((Cow::Borrowed(trimmed), false));
                 }
             }
             ShellDialect::Posix | ShellDialect::PowerShell => {
@@ -1280,7 +1747,7 @@ pub fn parse_shell_history_from_str(
                     if has_odd_trailing_escape(trimmed, escape_char) {
                         let part = &trimmed[..trimmed.len() - escape_char.len_utf8()];
                         let part = part.trim_end();
-                        if !part.is_empty() {
+                        if !part.is_empty() && buf.len() < 4096 {
                             if !buf.is_empty() {
                                 buf.push(' ');
                             }
@@ -1288,14 +1755,14 @@ pub fn parse_shell_history_from_str(
                         }
                         pending = Some(buf);
                     } else {
-                        if !trimmed.is_empty() {
+                        if !trimmed.is_empty() && buf.len() < 4096 {
                             if !buf.is_empty() {
                                 buf.push(' ');
                             }
                             buf.push_str(trimmed);
                         }
                         if !buf.is_empty() {
-                            extracted.push(buf);
+                            extracted.push((Cow::Owned(buf), false));
                         }
                     }
                     continue;
@@ -1316,21 +1783,32 @@ pub fn parse_shell_history_from_str(
                     let prefix = cmd[..cmd.len() - escape_char.len_utf8()].trim_end();
                     pending = Some(prefix.to_string());
                 } else {
-                    extracted.push(cmd.to_string());
+                    extracted.push((Cow::Borrowed(cmd), false));
                 }
             }
         }
     }
 
     if let Some(leftover) = pending.filter(|s| !s.is_empty()) {
-        extracted.push(leftover);
+        extracted.push((Cow::Owned(leftover), false));
     }
 
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for cmd in extracted.into_iter().rev() {
-        if seen.insert(cmd.to_ascii_lowercase()) {
-            out.push(cmd);
+    let cap = max_items.min(256);
+    let mut seen = HashSet::with_capacity(cap);
+    let mut out = Vec::with_capacity(cap);
+    for (raw_cmd, needs_fish_unescape) in extracted.into_iter().rev() {
+        let unescaped = if needs_fish_unescape {
+            unescape_fish_history_cmd(&raw_cmd)
+        } else {
+            raw_cmd
+        };
+        let cleaned = sanitize_single_line(unescaped.trim());
+        if cleaned.is_empty() || cleaned.len() > 4096 {
+            continue;
+        }
+        let lower = cleaned.to_ascii_lowercase();
+        if seen.insert(lower) {
+            out.push(cleaned.into_owned());
             if out.len() >= max_items {
                 break;
             }
@@ -1348,7 +1826,7 @@ fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
     let mut candidates = Vec::new();
     if let Ok(histfile) = env::var("HISTFILE") {
         let trimmed = histfile.trim();
-        if !trimmed.is_empty() {
+        if !trimmed.is_empty() && !trimmed.contains('\0') {
             candidates.push(PathBuf::from(trimmed));
         }
     }
@@ -1356,7 +1834,7 @@ fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
     match dialect {
         ShellDialect::PowerShell => {
             if cfg!(windows) {
-                if let Some(appdata) = env::var_os("APPDATA").map(PathBuf::from) {
+                if let Some(appdata) = non_empty_abs_env_path("APPDATA") {
                     candidates.push(
                         appdata
                             .join("Microsoft")
@@ -1377,7 +1855,7 @@ fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
             }
         }
         ShellDialect::Fish => {
-            if let Some(xdg) = env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+            if let Some(xdg) = non_empty_abs_env_path("XDG_DATA_HOME") {
                 candidates.push(xdg.join("fish").join("fish_history"));
             }
             if let Some(home) = home_dir() {
@@ -1392,7 +1870,10 @@ fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
         ShellDialect::Posix => {
             if let Some(home) = home_dir() {
                 let prefers_zsh = env::var("SHELL")
-                    .map(|s| s.ends_with("/zsh") || s == "zsh")
+                    .map(|s| {
+                        let t = s.trim();
+                        t.ends_with("/zsh") || t == "zsh"
+                    })
                     .unwrap_or(false);
                 if prefers_zsh {
                     candidates.push(home.join(".zsh_history"));
@@ -1406,12 +1887,10 @@ fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
     }
 
     for path in candidates {
-        if path.is_file() {
-            if let Some(raw) = read_tail_string(&path, MAX_HIST_BYTES) {
-                let parsed = parse_shell_history_from_str(dialect, &raw, limit);
-                if !parsed.is_empty() {
-                    return parsed;
-                }
+        if let Some(raw) = read_tail_string(&path, MAX_HIST_BYTES) {
+            let parsed = parse_shell_history_from_str(dialect, &raw, limit);
+            if !parsed.is_empty() {
+                return parsed;
             }
         }
     }
@@ -1463,14 +1942,17 @@ fn resolve_git_dir(start_dir: &Path) -> Option<PathBuf> {
             return Some(candidate);
         }
         if candidate.is_file() {
-            if let Ok(content) = fs::read_to_string(&candidate) {
+            if let Some(content) = read_bounded_string_lossy(&candidate, MAX_GIT_SMALL_BYTES) {
                 if let Some(rest) = content.trim().strip_prefix("gitdir:") {
-                    let git_path = PathBuf::from(rest.trim());
-                    return Some(if git_path.is_absolute() {
-                        git_path
-                    } else {
-                        dir.join(git_path)
-                    });
+                    let trimmed = rest.trim();
+                    if !trimmed.is_empty() && !trimmed.contains('\0') {
+                        let git_path = PathBuf::from(trimmed);
+                        return Some(if git_path.is_absolute() {
+                            git_path
+                        } else {
+                            dir.join(git_path)
+                        });
+                    }
                 }
             }
         }
@@ -1479,15 +1961,28 @@ fn resolve_git_dir(start_dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn collect_git_refs(base: &Path, dir: &Path, out: &mut Vec<String>) {
+fn collect_git_refs(base: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    if depth >= MAX_GIT_REFS_DEPTH || out.len() >= MAX_GIT_REFS_COUNT {
+        return;
+    }
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
+        if out.len() >= MAX_GIT_REFS_COUNT {
+            break;
+        }
+        // Use `entry.file_type()` so symlinks are never followed into directory loops.
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
-            collect_git_refs(base, &path, out);
-        } else if path.is_file() {
+        if ft.is_dir() {
+            collect_git_refs(base, &path, depth + 1, out);
+        } else if ft.is_file() {
             if path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1496,9 +1991,10 @@ fn collect_git_refs(base: &Path, dir: &Path, out: &mut Vec<String>) {
                 continue;
             }
             if let Ok(rel) = path.strip_prefix(base) {
-                let branch = rel.to_string_lossy().replace('\\', "/");
-                if !branch.is_empty() {
-                    out.push(branch);
+                let raw_branch = rel.to_string_lossy().replace('\\', "/");
+                let clean = sanitize_single_line(&raw_branch);
+                if !clean.is_empty() {
+                    out.push(clean.into_owned());
                 }
             }
         }
@@ -1506,11 +2002,12 @@ fn collect_git_refs(base: &Path, dir: &Path, out: &mut Vec<String>) {
 }
 
 fn resolve_git_common_dir(git_dir: &Path) -> PathBuf {
-    let Ok(raw) = fs::read_to_string(git_dir.join("commondir")) else {
+    let Some(raw) = read_bounded_string_lossy(&git_dir.join("commondir"), MAX_GIT_SMALL_BYTES)
+    else {
         return git_dir.to_path_buf();
     };
     let rel = raw.trim();
-    if rel.is_empty() {
+    if rel.is_empty() || rel.contains('\0') {
         return git_dir.to_path_buf();
     }
     let candidate = Path::new(rel);
@@ -1527,11 +2024,10 @@ fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
     };
     let common_dir = resolve_git_common_dir(&git_dir);
 
-    let current = fs::read_to_string(git_dir.join("HEAD"))
-        .ok()
-        .and_then(|head| {
+    let current =
+        read_bounded_string_lossy(&git_dir.join("HEAD"), MAX_GIT_SMALL_BYTES).and_then(|head| {
             let trimmed = head.trim();
-            if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
+            let raw = if let Some(branch) = trimmed.strip_prefix("ref: refs/heads/") {
                 Some(branch.to_string())
             } else if let Some(other_ref) = trimmed.strip_prefix("ref: ") {
                 Some(other_ref.to_string())
@@ -1539,18 +2035,20 @@ fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
                 Some(trimmed.chars().take(8).collect())
             } else {
                 None
-            }
+            }?;
+            let clean = sanitize_single_line(&raw);
+            (!clean.is_empty()).then(|| clean.into_owned())
         });
 
     let mut branches = Vec::new();
     let heads_dir = common_dir.join("refs").join("heads");
     if heads_dir.is_dir() {
-        collect_git_refs(&heads_dir, &heads_dir, &mut branches);
+        collect_git_refs(&heads_dir, &heads_dir, 0, &mut branches);
     }
     if common_dir != git_dir {
         let local_heads = git_dir.join("refs").join("heads");
         if local_heads.is_dir() {
-            collect_git_refs(&local_heads, &local_heads, &mut branches);
+            collect_git_refs(&local_heads, &local_heads, 0, &mut branches);
         }
     }
     let mut packed_seen = HashSet::new();
@@ -1559,16 +2057,20 @@ fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
         if !packed_seen.insert(packed_path.clone()) {
             continue;
         }
-        if let Ok(packed) = fs::read_to_string(&packed_path) {
+        if let Some(packed) = read_bounded_string_lossy(&packed_path, MAX_GIT_PACKED_REFS_BYTES) {
             for line in packed.lines() {
+                if branches.len() >= MAX_GIT_REFS_COUNT {
+                    break;
+                }
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
                     continue;
                 }
                 if let Some((_, ref_name)) = line.split_once(char::is_whitespace) {
                     if let Some(branch) = ref_name.trim().strip_prefix("refs/heads/") {
-                        if !branch.is_empty() && !branches.iter().any(|b| b == branch) {
-                            branches.push(branch.to_string());
+                        let clean = sanitize_single_line(branch);
+                        if !clean.is_empty() {
+                            branches.push(clean.into_owned());
                         }
                     }
                 }
@@ -1592,10 +2094,15 @@ fn scan_cwd_entries(dir: &Path) -> Vec<CwdEntry> {
         return Vec::new();
     };
     let mut items: Vec<CwdEntry> = rd
+        .take(MAX_CWD_SCAN_READS)
         .flatten()
         .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.is_empty() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.is_empty()
+                || name
+                    .chars()
+                    .any(|c| c.is_control() || is_bidi_format_char(c))
+            {
                 return None;
             }
             let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
@@ -1603,11 +2110,9 @@ fn scan_cwd_entries(dir: &Path) -> Vec<CwdEntry> {
         })
         .collect();
     items.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir).then_with(|| {
-            a.name
-                .to_ascii_lowercase()
-                .cmp(&b.name.to_ascii_lowercase())
-        })
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| cmp_ascii_case_insensitive(&a.name, &b.name))
     });
     items.truncate(MAX_CWD_ENTRIES);
     items
@@ -1653,18 +2158,19 @@ pub(super) fn load_catalog_with_context(
     ctx: &RuntimeContext,
 ) -> Vec<Entry> {
     let mut list = Vec::with_capacity(5000);
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::with_capacity(2048);
 
     // 0. Active shell session history at the top of Pane 1
-    let mut hist_seen = HashSet::new();
+    let mut hist_seen = HashSet::with_capacity(ctx.history.len());
     for cmd in &ctx.history {
-        let trimmed = cmd.trim();
+        let clean = sanitize_single_line(cmd.trim());
+        let trimmed = clean.trim();
         if trimmed.is_empty() || !hist_seen.insert(trimmed.to_ascii_lowercase()) {
             continue;
         }
         list.push(Entry::new(
-            trimmed.to_string(),
-            trimmed.to_string(),
+            trimmed,
+            trimmed,
             EntryKind::History,
             "Recent shell history",
         ));
@@ -1692,13 +2198,19 @@ pub(super) fn load_catalog_with_context(
         .map(|s| s.to_ascii_lowercase())
         .collect();
 
-    let mut ps_map: HashMap<String, Entry> = HashMap::new();
-    let mut ps_order: Vec<String> = Vec::new();
+    let mut ps_map: HashMap<String, Entry> =
+        HashMap::with_capacity(if dialect.is_powershell() { 1024 } else { 64 });
+    let mut ps_order: Vec<String> =
+        Vec::with_capacity(if dialect.is_powershell() { 1024 } else { 64 });
     if dialect.is_powershell() {
         if let Some(bytes) = env_src.read_ps_metadata() {
             if let Ok(exports) = serde_json::from_slice::<Vec<PsCommandExport>>(&bytes) {
                 for exp in exports {
-                    let key = exp.name.to_ascii_lowercase();
+                    let trimmed_name = exp.name.trim();
+                    if !is_safe_command_token(trimmed_name) {
+                        continue;
+                    }
+                    let key = trimmed_name.to_ascii_lowercase();
                     if disabled.contains(&key) {
                         continue;
                     }
@@ -1725,8 +2237,8 @@ pub(super) fn load_catalog_with_context(
 
     // 3. Scan PATH directories for CLI executables
     //    (Windows: .exe / .cmd / .bat; Unix: any file with an execute bit)
-    let mut cli_map: HashMap<String, Entry> = HashMap::new();
-    let mut cli_order: Vec<String> = Vec::new();
+    let mut cli_map: HashMap<String, Entry> = HashMap::with_capacity(2048);
+    let mut cli_order: Vec<String> = Vec::with_capacity(2048);
     let mut seen_path_dirs = HashSet::new();
     for dir in env_src.path_dirs() {
         let dir_key = if cfg!(windows) {
@@ -1738,6 +2250,13 @@ pub(super) fn load_catalog_with_context(
             continue;
         }
         for (name, path) in env_src.dir_executables(&dir) {
+            if !is_safe_command_token(&name) {
+                continue;
+            }
+            let has_upper = name.bytes().any(|b| b.is_ascii_uppercase());
+            if !has_upper && (disabled.contains(&name) || cli_map.contains_key(&name)) {
+                continue;
+            }
             let key = name.to_ascii_lowercase();
             if disabled.contains(&key) {
                 continue;
@@ -1780,8 +2299,11 @@ pub(super) fn load_catalog_with_context(
         .map(str::trim)
         .filter(|b| !b.is_empty())
     {
-        if let Some(git_entry) = cli_map.get_mut("git") {
-            git_entry.desc = format!("[branch: {branch}] {}", git_entry.desc);
+        let clean_branch = sanitize_single_line(branch);
+        if !clean_branch.is_empty() {
+            if let Some(git_entry) = cli_map.get_mut("git") {
+                git_entry.desc = format!("[branch: {clean_branch}] {}", git_entry.desc);
+            }
         }
     }
 
@@ -1887,25 +2409,39 @@ foreach ($c in $cmds) {
 if ($out.Count -eq 0) { '[]' } else { ConvertTo-Json -InputObject @($out) -Depth 6 -Compress }
 "#;
 
-    let mut cmd = Command::new("pwsh");
+    let pwsh_path = find_executable_in_path("pwsh").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "pwsh executable not found on PATH",
+        )
+    })?;
+    let mut cmd = Command::new(pwsh_path);
     cmd.args(["-NoLogo", "-NoProfile", "-Command", ps_script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
-    let output = hide_window(&mut cmd).output()?;
-    if !output.status.success() {
+    let mut child = hide_window(&mut cmd).spawn()?;
+    let mut stdout_buf = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(MAX_PS_METADATA_BYTES.saturating_add(1))
+            .read_to_end(&mut stdout_buf)?;
+    }
+    let status = child.wait()?;
+    if (stdout_buf.len() as u64) > MAX_PS_METADATA_BYTES {
+        anyhow::bail!("pwsh metadata export exceeded {MAX_PS_METADATA_BYTES} byte limit");
+    }
+    if !status.success() {
         return Err(std::io::Error::other(format!(
-            "pwsh metadata export failed with status {}",
-            output.status
+            "pwsh metadata export failed with status {status}"
         ))
         .into());
     }
 
-    let exports: Vec<PsCommandExport> = serde_json::from_slice(&output.stdout)?;
+    let exports: Vec<PsCommandExport> = serde_json::from_slice(&stdout_buf)?;
     let count = exports.len();
     let dest = ps_metadata_path();
-    ensure_parent_dir(&dest);
-    fs::write(dest, &output.stdout)?;
+    write_secure_file(&dest, &stdout_buf)?;
     Ok(count)
 }
 
@@ -2729,5 +3265,131 @@ disabled_tools = ["blocked"] # hide unwanted binaries
         assert_eq!(git_entry.desc, "/fake/bin/git");
         let cli_count = catalog.iter().filter(|e| e.text == "mycli").count();
         assert_eq!(cli_count, 1);
+    }
+
+    #[test]
+    fn test_env_scope_filters_unsafe_names_and_quotes_literal_values_safely() {
+        let hostile_vars = vec![
+            ("FOO;id".to_string(), "1".to_string()),
+            ("$(whoami)".to_string(), "2".to_string()),
+            ("1BAD".to_string(), "3".to_string()),
+            ("GOOD\nBAD".to_string(), "4".to_string()),
+            (
+                "SAFE_TOKEN".to_string(),
+                "a'b\\c$(id)`id`\r\n\0\u{202e}".to_string(),
+            ),
+        ];
+
+        let ps_root =
+            build_env_scope_entry_from_vars(ShellDialect::PowerShell, hostile_vars.clone());
+        assert_eq!(ps_root.children.len(), 1);
+        assert_eq!(ps_root.children[0].label, "SAFE_TOKEN");
+        assert_eq!(ps_root.children[0].text, "$env:SAFE_TOKEN");
+        assert_eq!(ps_root.children[0].desc, "a'b\\c$(id)`id`");
+        assert_eq!(ps_root.children[0].children[1].text, "'a''b\\c$(id)`id`'");
+
+        let posix_root = build_env_scope_entry_from_vars(ShellDialect::Posix, hostile_vars.clone());
+        assert_eq!(posix_root.children.len(), 1);
+        assert_eq!(posix_root.children[0].text, "$SAFE_TOKEN");
+        assert_eq!(
+            posix_root.children[0].children[1].text,
+            "'a'\\''b\\c$(id)`id`'"
+        );
+
+        let fish_root = build_env_scope_entry_from_vars(ShellDialect::Fish, hostile_vars);
+        assert_eq!(fish_root.children.len(), 1);
+        assert_eq!(fish_root.children[0].text, "$SAFE_TOKEN");
+        assert_eq!(
+            fish_root.children[0].children[1].text,
+            "'a\\'b\\\\c$(id)`id`'"
+        );
+    }
+
+    #[test]
+    fn test_cross_distro_prefix_path_dedup_and_skips_relative_entries() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("zpane_test_path_{}_{nonce}", std::process::id()));
+        let prefix = root.join("termux_usr");
+        let prefix_bin = prefix.join("bin");
+        let prefix_applets = prefix_bin.join("applets");
+        let extra_bin = root.join("extra_bin");
+        fs::create_dir_all(&prefix_applets).unwrap();
+        fs::create_dir_all(&extra_bin).unwrap();
+
+        let joined_path =
+            env::join_paths([Path::new("."), Path::new("rel/bin"), &extra_bin, &extra_bin])
+                .unwrap();
+        let dirs = collect_path_dirs_with_prefix(Some(&joined_path), Some(prefix.as_os_str()));
+
+        assert_eq!(dirs, vec![extra_bin.clone(), prefix_bin, prefix_applets]);
+
+        #[cfg(unix)]
+        {
+            let usr_merge_link = root.join("bin_link");
+            std::os::unix::fs::symlink(&extra_bin, &usr_merge_link).unwrap();
+            let linked_path = env::join_paths([&extra_bin, &usr_merge_link]).unwrap();
+            let merged = collect_path_dirs_with_prefix(Some(&linked_path), None);
+            assert_eq!(merged, vec![extra_bin.clone()]);
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_bounded_reads_git_depth_and_secure_cache_permissions() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("zpane_test_sec_{}_{nonce}", std::process::id()));
+        let zpane_cache = root.join("zpane");
+        let cache_file = zpane_cache.join("ps_metadata.json");
+        let small_file = root.join("small.txt");
+        let oversized_file = root.join("huge.txt");
+
+        write_secure_file(&cache_file, b"{\"ok\":true}").unwrap();
+        assert_eq!(
+            read_bounded_bytes(&cache_file, 1024).unwrap(),
+            b"{\"ok\":true}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = fs::metadata(&zpane_cache).unwrap().permissions().mode() & 0o777;
+            let file_mode = fs::metadata(&cache_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+
+        fs::write(&small_file, b"hello").unwrap();
+        fs::write(&oversized_file, vec![b'x'; 64]).unwrap();
+        assert!(read_bounded_bytes(&small_file, 16).is_some());
+        assert!(read_bounded_bytes(&oversized_file, 16).is_none());
+        assert!(read_bounded_bytes(&root, 1024).is_none());
+
+        // Deep .git/refs/heads tree past MAX_GIT_REFS_DEPTH + shallow main branch
+        let git_dir = root.join("repo").join(".git");
+        let heads = git_dir.join("refs").join("heads");
+        fs::create_dir_all(&heads).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(heads.join("main"), "0123456789abcdef\n").unwrap();
+
+        let mut deep = heads.clone();
+        for i in 0..40 {
+            deep = deep.join(format!("d{i}"));
+        }
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("too_deep"), "0123456789abcdef\n").unwrap();
+
+        let (git_branch, git_branches) = detect_git_context_in(&root.join("repo"));
+        assert_eq!(git_branch.as_deref(), Some("main"));
+        assert!(git_branches.contains(&"main".to_string()));
+        assert!(!git_branches.iter().any(|b| b.contains("too_deep")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
