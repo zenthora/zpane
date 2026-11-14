@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-11-14
+
+### Bug Fixes
+
+- *(discovery)* Harden spec, help, introspection cache, and shell catalog parsing
+- *(session)* Harden tokenization, subcommand sliding, parameter matching, and seeding
+- *(ui)* Harden Unicode rendering, CLI parsing, fuzzy scrolling, and init wrappers
+
+### Miscellaneous Tasks
+
+- *(git)* Remove migrated .kilo skill
+
 ## [0.4.0] - 2026-11-14
 
 ### Features
@@ -16,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(skills)* Add project agent skills
 - *(release)* Bump version to 0.4.0 and update CHANGELOG.md
 - *(git)* Ignore and untrack .agents
+- *(release)* Update CHANGELOG.md for 0.4.0
 
 ## [0.3.0] - 2026-11-14
 
