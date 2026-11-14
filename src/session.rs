@@ -1072,17 +1072,30 @@ fn sanitize_scope_children(entries: &mut Vec<Entry>, dialect: ShellDialect, in_v
                 kept.push(entry);
             }
             EntryKind::Path if !entry.is_scope_root() => {
-                if !is_safe_unquoted_token(&entry.text, Some(dialect))
-                    && !is_valid_single_quoted(&entry.text, dialect)
-                    && !(entry.text.len() >= 2
+                if entry.text.starts_with('-') {
+                    let prefixed = format!("./{}", entry.text);
+                    entry.text = quote_literal_for_dialect(&prefixed, Some(dialect), true);
+                } else {
+                    let already_safe_double = entry.text.len() >= 2
                         && entry.text.starts_with('"')
                         && entry.text.ends_with('"')
-                        && is_benign_double_quotable(
-                            &entry.text[1..entry.text.len() - 1],
-                            Some(dialect),
-                        ))
-                {
-                    entry.text = quote_literal_for_dialect(&entry.text, Some(dialect), true);
+                        && {
+                            let inner = &entry.text[1..entry.text.len() - 1];
+                            !inner.is_empty()
+                                && !inner.starts_with('-')
+                                && !inner.contains('"')
+                                && !inner.contains('\\')
+                                && inner.chars().all(|ch| {
+                                    (ch.is_whitespace() && !is_disallowed_control(ch))
+                                        || is_safe_unquoted_char(ch, false)
+                                })
+                        };
+                    if !already_safe_double
+                        && !is_valid_single_quoted(&entry.text, dialect)
+                        && !is_safe_unquoted_token(&entry.text, Some(dialect))
+                    {
+                        entry.text = quote_literal_for_dialect(&entry.text, Some(dialect), true);
+                    }
                 }
                 kept.push(entry);
             }
@@ -3907,35 +3920,30 @@ mod tests {
                 assert_eq!(cmd, expected_cmd, "dialect={dialect:?}, payload={payload}");
             }
 
-            // Control, newline, NUL, and Bidi override chars injected via typing must be dropped.
+            // Control, newline, NUL, and BiDi override/mark chars injected via typing must be dropped.
             session.apply(UserAction::ClearFilter);
-            for ch in "safe\n;\rid\0\x1b\u{202e}".chars() {
+            for ch in "safe\n;\rid\0\x1b\u{061C}\u{200E}\u{200F}\u{202e}".chars() {
                 session.apply(UserAction::InsertChar(ch));
             }
             assert_eq!(session.command_line(), "echo --msg 'safe;id'");
             assert!(
-                !session
-                    .command_line()
-                    .chars()
-                    .any(|c| c.is_control() || c == '\u{202e}'),
-                "control characters leaked into command line: {:?}",
+                !session.command_line().chars().any(is_disallowed_control),
+                "control or BiDi characters leaked into command line: {:?}",
                 session.command_line()
             );
 
-            // Hostile `--initial` buffer with embedded CR/LF/NUL/ESC/Bidi must be sanitized.
+            // Hostile `--initial` buffer with embedded CR/LF/NUL/ESC/BiDi must be sanitized.
             let seeded = MillerSession::new(
                 vec![echo.clone()],
                 FakeIntrospector::empty(),
-                "echo --msg ok\n; id\r\n\0\x1b[31m\u{202e}",
+                "echo --msg ok\n; id\r\n\0\x1b[31m\u{061C}\u{200E}\u{200F}\u{202e}",
                 Viewport::new(120, 30),
                 dialect,
             );
             let seeded_cmd = seeded.command_line();
             assert!(
-                !seeded_cmd
-                    .chars()
-                    .any(|c| c.is_control() || c == '\u{202e}'),
-                "hostile initial buffer retained control characters: {seeded_cmd:?}"
+                !seeded_cmd.chars().any(is_disallowed_control),
+                "hostile initial buffer retained control/BiDi characters: {seeded_cmd:?}"
             );
         }
     }
@@ -4131,6 +4139,43 @@ mod tests {
             assert_eq!(
                 git_sess.apply(UserAction::Confirm),
                 SessionOutcome::Confirmed("git checkout '$(whoami)'".to_string())
+            );
+
+            // 5. Pre-populated `EntryKind::Path` children neutralize interior quotes/backslashes,
+            // leading `-` option injection, and BiDi marks.
+            let mut static_paths_root =
+                Entry::scope_root("./", "Pre-populated paths", EntryKind::Subcmd, "");
+            static_paths_root.children = vec![
+                Entry::new(r#""a" --evil=1""#, "breakout", EntryKind::Path, ""),
+                Entry::new("--upload-pack=evil", "opt", EntryKind::Path, ""),
+                Entry::new("bad\u{200E}mark.txt", "bidi", EntryKind::Path, ""),
+                Entry::new(r#""C:\temp\dir""#, "win", EntryKind::Path, ""),
+                Entry::new(r#""my file.txt""#, "benign", EntryKind::Path, ""),
+            ];
+            let mut static_sess = MillerSession::new(
+                vec![static_paths_root],
+                FakeIntrospector::empty(),
+                "",
+                Viewport::new(120, 30),
+                dialect,
+            );
+            static_sess.apply(UserAction::StepRight);
+            let static_texts: Vec<&str> = static_sess.view().panes[1]
+                .entries()
+                .iter()
+                .map(|e| e.text.as_str())
+                .collect();
+            assert_eq!(
+                static_texts,
+                vec![
+                    r#"'"a" --evil=1"'"#,
+                    "./--upload-pack=evil",
+                    match dialect {
+                        ShellDialect::Fish => r#"'"C:\\temp\\dir"'"#,
+                        _ => r#"'"C:\temp\dir"'"#,
+                    },
+                    r#""my file.txt""#,
+                ]
             );
         }
     }

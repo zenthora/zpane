@@ -109,7 +109,10 @@ pub(crate) fn is_disallowed_control(ch: char) -> bool {
     ch.is_control()
         || matches!(
             ch,
-            '\u{2028}'
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
                 | '\u{2029}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2066}'..='\u{2069}'
@@ -883,6 +886,10 @@ mod tests {
             },
             CwdEntry {
                 name: "\x1b]52;c;YQ==\x07".to_string(),
+                is_dir: false,
+            },
+            CwdEntry {
+                name: "rtl\u{061C}a\u{200E}b\u{200F}c.txt".to_string(),
                 is_dir: false,
             },
             CwdEntry {
