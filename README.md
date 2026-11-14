@@ -44,6 +44,10 @@ See [`docs/prior-art-and-alternatives.md`](docs/prior-art-and-alternatives.md) f
 - **Dual-Engine Hybrid Discovery**:
   - **PowerShell CLR Reflection (`ps_metadata.json`)**: Indexes Cmdlets, Functions, and Aliases along with parameter types, shorthand aliases, `[Switch]` flags, `[ValidateSet]` / `Enum` values, and `ParameterSet` memberships.
   - **Asynchronous JIT CLI Introspection (`cli_cache.json`)**: Scans `PATH` for native executables (`.exe`/`.cmd`/`.bat` on Windows; `+x` binaries and symlinks on Linux & Termux) and lazily introspects `--help` / `-h` in a LIFO-prioritized background worker. Includes section-aware grammar parsers for **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), extracting `[possible values: ...]` and `[default: ...]` automatically.
+- **Declarative Specs & Carapace Bridge**:
+  - Loads custom `carapace-spec` (`.yaml`/`.yml`/`.json`) and simplified Fig (`.json`) command specs from `%LOCALAPPDATA%\zpane\specs\` (Windows) or `$XDG_CACHE_HOME/zpane/specs` / `~/.cache/zpane/specs` (Unix), and falls back to `carapace <cmd> export` automatically when `--help`/`-h` parsing yields no entries.
+- **Dynamic Runtime Context**:
+  - Automatically detects current Git branches and working-directory entries, and accepts `--context`, `--context-file`, `--git-branch`, and `--history` flags to surface recent shell history and live context directly inside `zpane`.
 - **Automatic Shell Dialect Adaptation (`PowerShell`, `POSIX`, and `Fish`)**:
   - Emits `$env:VAR` and indexes PowerShell cmdlets when running on Windows or inside `pwsh` on Linux; automatically switches to `$VAR` tokens and `:`-separated `PATH` inspection in `bash`, `zsh`, `fish` (with Fish-native `$status`, `$last_pid`, `$fish_pid` variables), and Android Termux (override anytime with `ZPANE_SHELL=pwsh|posix|fish`).
 - **Dynamic `ParameterSet` Exclusivity Pruning**:
@@ -70,7 +74,7 @@ Install the prebuilt `.pkg.tar.zst` release package or build from [`packaging/ar
 
 ```bash
 # Install release package directly
-sudo pacman -U dist/zpane-0.2.0-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/zpane-0.3.0-1-x86_64.pkg.tar.zst
 
 # Or build from PKGBUILD
 cd packaging/arch && makepkg -si
@@ -79,7 +83,7 @@ cd packaging/arch && makepkg -si
 ### Debian / Ubuntu (`.deb`)
 
 ```bash
-sudo dpkg -i dist/zpane_0.2.0-1_amd64.deb
+sudo dpkg -i dist/zpane_0.3.0-1_amd64.deb
 ```
 
 ### Fedora / RHEL / openSUSE (`.rpm`)
@@ -87,9 +91,9 @@ sudo dpkg -i dist/zpane_0.2.0-1_amd64.deb
 Install the prebuilt `.rpm` package via `dnf` / `rpm` or build from [`packaging/fedora/zpane.spec`](packaging/fedora/zpane.spec):
 
 ```bash
-sudo dnf install ./dist/zpane-0.2.0-1.x86_64.rpm
+sudo dnf install ./dist/zpane-0.3.0-1.x86_64.rpm
 # or
-sudo rpm -Uvh dist/zpane-0.2.0-1.x86_64.rpm
+sudo rpm -Uvh dist/zpane-0.3.0-1.x86_64.rpm
 ```
 
 ### Android Termux (`aarch64`)
@@ -97,7 +101,7 @@ sudo rpm -Uvh dist/zpane-0.2.0-1.x86_64.rpm
 Install the Termux `.deb` package (built with the `/data/data/com.termux/files/usr` prefix) or see [`packaging/termux/build.sh`](packaging/termux/build.sh):
 
 ```bash
-dpkg -i zpane_0.2.0_aarch64.deb
+dpkg -i zpane_0.3.0_aarch64.deb
 zpane --warm
 ```
 
@@ -140,11 +144,6 @@ Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
     }
 }
 ```
-
-### Declarative Specs & Carapace Bridge
-
-- Drop custom `carapace-spec` (`.yaml`/`.yml`/`.json`) or simplified Fig (`.json`) specs into `%LOCALAPPDATA%\zpane\specs\` (Windows) or `$XDG_CACHE_HOME/zpane/specs` / `~/.cache/zpane/specs` (Unix).
-- If [`carapace`](https://carapace.sh/) is installed on `PATH`, `zpane` queries `carapace <cmd> export` automatically whenever `--help`/`-h` parsing yields no entries.
 
 ### Zsh (`~/.zshrc`)
 
@@ -197,6 +196,13 @@ bind \em _zpane_fish
 
 ---
 
+## Declarative Specs & Carapace Bridge
+
+- Drop custom `carapace-spec` (`.yaml`/`.yml`/`.json`) or simplified Fig (`.json`) specs into `%LOCALAPPDATA%\zpane\specs\` (Windows) or `$XDG_CACHE_HOME/zpane/specs` / `~/.cache/zpane/specs` (Unix).
+- If [`carapace`](https://carapace.sh/) is installed on `PATH`, `zpane` queries `carapace <cmd> export` automatically whenever `--help`/`-h` parsing yields no entries.
+
+---
+
 ## Keyboard Shortcuts
 
 | Key | Action |
@@ -209,7 +215,7 @@ bind \em _zpane_fish
 | `Type any char` | Fuzzy-filter the active column (or type a custom argument value in Column 3) |
 | <kbd>Backspace</kbd> | Delete the last filter character, or pop the last appended command token if the filter is empty |
 | <kbd>Ctrl+U</kbd> | Clear the active column's fuzzy filter |
-| <kbd>Ctrl+R</kbd> | Re-synchronize PowerShell cmdlet/function/alias metadata (`ps_metadata.json`) |
+| <kbd>Ctrl+R</kbd> | Re-synchronize PowerShell metadata (`Sync PS`) or reload the command catalog (`Reload` on POSIX/Fish) |
 | <kbd>Enter</kbd> | Accept the assembled command line and exit |
 | <kbd>Esc</kbd> / <kbd>Ctrl+C</kbd> | Cancel and exit without modifying the prompt |
 

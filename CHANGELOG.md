@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-14
+
+### Features
+
+- Add declarative specs, carapace bridge, and dynamic runtime context
+
+### Refactoring
+
+- *(core)* Split discovery module, align domain terms, and add agent guidelines
+
+### Miscellaneous Tasks
+
+- *(cargo)* Restore .cargo/config.toml tracking
+
 ## [0.2.0] - 2026-11-13
 
 ### Features
@@ -30,8 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Miscellaneous Tasks
 
+- *(git)* Ignore and untrack .scratch and .cargo
 - *(hooks)* Configure prek stages, conventional commits, and git-cliff SemVer
 - *(hooks)* Mark manual git-cliff-changelog hook as always_run
+- *(release)* Bump version to 0.2.0 and update CHANGELOG.md
 
 ## [0.1.0] - 2026-11-12
 
