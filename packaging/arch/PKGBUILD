@@ -9,31 +9,39 @@ license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo')
 optdepends=('powershell: PowerShell cmdlet and parameter-set reflection')
+options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Security: pin the source tarball SHA-256 digest when publishing a tagged release or AUR update.
 sha256sums=('SKIP')
 
 prepare() {
-    cd "$pkgname-$pkgver"
+    cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
-    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
 }
 
 build() {
-    cd "$pkgname-$pkgver"
+    cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
     cargo build --frozen --release --all-features
 }
 
 check() {
-    cd "$pkgname-$pkgver"
+    cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
     cargo test --frozen --all-features
 }
 
 package() {
-    cd "$pkgname-$pkgver"
-    install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
-    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
-    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    umask 022
+    cd "$srcdir/$pkgname-$pkgver"
+    install -d -m0755 \
+        "$pkgdir/usr/bin" \
+        "$pkgdir/usr/share/licenses/$pkgname" \
+        "$pkgdir/usr/share/doc/$pkgname"
+    install -Dm0755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+    install -Dm0644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 }

@@ -7,6 +7,8 @@ URL:            https://github.com/zenthora/zpane
 BuildArch:      x86_64
 %global __os_install_post %{nil}
 %global debug_package %{nil}
+%global use_source_date_epoch_as_buildtime 1
+%global clamp_mtime_to_source_date_epoch 1
 
 %description
 zpane brings the spatial orientation of 3-column Miller file managers
@@ -20,14 +22,22 @@ PowerShell, Bash, Zsh, Fish, and Termux.
 # Binary pre-built via cargo
 
 %install
+umask 022
+install -d -m0755 \
+    "%{buildroot}%{_bindir}" \
+    "%{buildroot}%{_datadir}/doc/zpane" \
+    "%{buildroot}%{_datadir}/licenses/zpane"
 install -Dm0755 "%{_sourcedir}/zpane" "%{buildroot}%{_bindir}/zpane"
 install -Dm0644 "%{_sourcedir}/README.md" "%{buildroot}%{_datadir}/doc/zpane/README.md"
 install -Dm0644 "%{_sourcedir}/LICENSE" "%{buildroot}%{_datadir}/licenses/zpane/LICENSE"
 
 %files
-%{_bindir}/zpane
-%doc %{_datadir}/doc/zpane/README.md
-%license %{_datadir}/licenses/zpane/LICENSE
+%defattr(-,root,root,-)
+%attr(0755,root,root) %{_bindir}/zpane
+%dir %attr(0755,root,root) %{_datadir}/doc/zpane
+%doc %attr(0644,root,root) %{_datadir}/doc/zpane/README.md
+%dir %attr(0755,root,root) %{_datadir}/licenses/zpane
+%license %attr(0644,root,root) %{_datadir}/licenses/zpane/LICENSE
 
 %changelog
 * Sat Nov 14 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.4.1-1
