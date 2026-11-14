@@ -269,7 +269,7 @@ impl Entry {
             && (self.children.is_empty() || self.children.iter().any(Entry::is_placeholder))
     }
 
-    /// Whether this parameter or flag Entry matches a raw command token (`-Id`, `--id`, `-Id:value`)
+    /// Whether this parameter or flag Entry matches a raw command token (`-Id`, `--id`, `-Id:value`, `--extension=rs`)
     /// by exact token name or structured Parameter Alias, case-insensitively.
     pub fn matches_parameter_token(&self, token: &str) -> bool {
         if !token.starts_with('-') {
@@ -277,7 +277,7 @@ impl Entry {
         }
         let clean = token
             .trim_start_matches('-')
-            .split(':')
+            .split([':', '='])
             .next()
             .unwrap_or("");
         if clean.is_empty() {
@@ -286,11 +286,14 @@ impl Entry {
 
         self.text
             .trim_start_matches('-')
+            .trim_end_matches('=')
             .eq_ignore_ascii_case(clean)
-            || self
-                .aliases
-                .iter()
-                .any(|alias| alias.trim_start_matches('-').eq_ignore_ascii_case(clean))
+            || self.aliases.iter().any(|alias| {
+                alias
+                    .trim_start_matches('-')
+                    .trim_end_matches('=')
+                    .eq_ignore_ascii_case(clean)
+            })
     }
 
     /// Computes the active PowerShell Parameter Sets implied by `tokens`, using exact
@@ -467,5 +470,21 @@ mod tests {
         let only_dirs = ctx.cwd_path_entries(true);
         assert_eq!(only_dirs.len(), 1);
         assert_eq!(only_dirs[0].text, "src/");
+    }
+
+    #[test]
+    fn test_matches_parameter_token_handles_equals_and_colon_attachments() {
+        let carapace_param = Entry::new("--extension=", "-e, --extension=", EntryKind::Param, "")
+            .with_aliases(vec!["e".to_string()]);
+        assert!(carapace_param.matches_parameter_token("--extension=rs"));
+        assert!(carapace_param.matches_parameter_token("--extension="));
+        assert!(carapace_param.matches_parameter_token("--extension"));
+        assert!(carapace_param.matches_parameter_token("-e"));
+        assert!(!carapace_param.matches_parameter_token("rs"));
+
+        let ps_param = Entry::new("-Id", "-Id (-PID)", EntryKind::Param, "")
+            .with_aliases(vec!["PID".to_string()]);
+        assert!(ps_param.matches_parameter_token("-Id:42"));
+        assert!(ps_param.matches_parameter_token("-PID:42"));
     }
 }

@@ -21,6 +21,7 @@ pub enum UserAction {
     InsertChar(char),
     ClearFilter,
     ReloadCatalog,
+    ToggleInspector,
     Resize(usize, usize),
     Confirm,
     Cancel,
@@ -38,16 +39,32 @@ impl UserAction {
                 Some(UserAction::Cancel)
             }
             (KeyCode::Enter, _) => Some(UserAction::Confirm),
+            (KeyCode::F(1), _) | (KeyCode::Char('i'), KeyModifiers::ALT) => {
+                Some(UserAction::ToggleInspector)
+            }
+            (KeyCode::Char('?'), mods) if mods.contains(KeyModifiers::ALT) => {
+                Some(UserAction::ToggleInspector)
+            }
             (KeyCode::Char('r'), KeyModifiers::CONTROL) => Some(UserAction::ReloadCatalog),
             (KeyCode::Char('u'), KeyModifiers::CONTROL) => Some(UserAction::ClearFilter),
-            (KeyCode::Up, _) => Some(UserAction::MoveUp),
-            (KeyCode::Down, _) => Some(UserAction::MoveDown),
+            (KeyCode::Up, _)
+            | (KeyCode::Char('p'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('k'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('k'), KeyModifiers::ALT) => Some(UserAction::MoveUp),
+            (KeyCode::Down, _)
+            | (KeyCode::Char('n'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('j'), KeyModifiers::CONTROL)
+            | (KeyCode::Char('j'), KeyModifiers::ALT) => Some(UserAction::MoveDown),
             (KeyCode::PageUp, _) => Some(UserAction::PageUp),
             (KeyCode::PageDown, _) => Some(UserAction::PageDown),
             (KeyCode::Home, _) => Some(UserAction::MoveHome),
             (KeyCode::End, _) => Some(UserAction::MoveEnd),
-            (KeyCode::Right, _) => Some(UserAction::StepRight),
-            (KeyCode::Left, _) => Some(UserAction::StepLeft),
+            (KeyCode::Right, _)
+            | (KeyCode::Char('l'), KeyModifiers::ALT)
+            | (KeyCode::Char('f'), KeyModifiers::CONTROL) => Some(UserAction::StepRight),
+            (KeyCode::Left, _)
+            | (KeyCode::Char('h'), KeyModifiers::ALT)
+            | (KeyCode::Char('b'), KeyModifiers::CONTROL) => Some(UserAction::StepLeft),
             (KeyCode::Tab, _) => Some(UserAction::AcceptToken),
             (KeyCode::Backspace, _) => Some(UserAction::Backspace),
             (KeyCode::Char(ch), mods)
@@ -72,6 +89,7 @@ pub enum SessionOutcome {
 struct Pane2CacheState {
     p1_entry_idx: Option<usize>,
     active_param_set: Option<String>,
+    subcmd_chain: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,15 +97,133 @@ struct Pane3CacheState {
     p1_entry_idx: Option<usize>,
     p2_entry_idx: Option<usize>,
     pane3_filter: String,
+    subcmd_chain: Vec<String>,
 }
 
 type CatalogLoader = Box<dyn FnMut(ShellDialect) -> Vec<Entry>>;
 
+/// Splits a seeded shell command buffer at the last top-level unquoted pipeline/chain
+/// separator (`||`, `&&`, `|`, `;`), returning `(pipeline_prefix, active_segment)`.
+pub fn split_pipeline_prefix(input: &str) -> (Option<String>, &str) {
+    let bytes = input.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut last_sep_end: Option<usize> = None;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let ch = input[i..].chars().next().unwrap();
+        let ch_len = ch.len_utf8();
+        if escaped {
+            escaped = false;
+            i += ch_len;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '|' if !in_single && !in_double => {
+                if bytes.get(i + 1) == Some(&b'|') {
+                    last_sep_end = Some(i + 2);
+                    i += 2;
+                    continue;
+                } else {
+                    last_sep_end = Some(i + 1);
+                }
+            }
+            '&' if !in_single && !in_double && bytes.get(i + 1) == Some(&b'&') => {
+                last_sep_end = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            ';' if !in_single && !in_double => {
+                last_sep_end = Some(i + 1);
+            }
+            _ => {}
+        }
+        i += ch_len;
+    }
+
+    if let Some(sep_end) = last_sep_end {
+        let prefix = input[..sep_end].trim();
+        let tail = input[sep_end..].trim();
+        if prefix.is_empty() {
+            (None, tail)
+        } else {
+            (Some(prefix.to_string()), tail)
+        }
+    } else {
+        (None, input.trim())
+    }
+}
+
+/// Tokenizes a single shell command segment on unquoted whitespace while keeping quoted
+/// multi-word arguments intact as single tokens.
+pub fn tokenize_shell_words(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in segment.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => {
+                current.push(ch);
+                escaped = true;
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            c if c.is_whitespace() && !in_single && !in_double => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn join_command_tokens(tokens: &[String]) -> String {
+    let mut out = String::new();
+    for tok in tokens {
+        if out.is_empty() {
+            out.push_str(tok);
+            continue;
+        }
+        let attach = (out.ends_with('=') && !tok.starts_with('-')) || tok.starts_with(":$");
+        if !attach {
+            out.push(' ');
+        }
+        out.push_str(tok);
+    }
+    out
+}
+
 /// Cohesive Command Line assembler owning committed tokens, multi-token initial seeding,
-/// and live-cursor preview suppression rules across all three Miller Panes.
+/// multi-level subcommand window chains, pipeline prefixes, and live-cursor preview suppression.
 #[derive(Debug, Default, Clone)]
 struct CommandLine {
+    pipeline_prefix: Option<String>,
     tokens: Vec<String>,
+    subcmd_chain: Vec<String>,
     pending_pane2_seed: Option<String>,
     pending_pane3_seeds: VecDeque<String>,
     suppress_pane2_preview: bool,
@@ -97,11 +233,8 @@ struct CommandLine {
 impl CommandLine {
     fn from_initial_buffer(initial_buffer: &str, pane1: &mut PaneList) -> (Self, Pane) {
         let mut active_pane = Pane::First;
-        let tokens: Vec<String> = initial_buffer
-            .split_whitespace()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .collect();
+        let (pipeline_prefix, active_segment) = split_pipeline_prefix(initial_buffer);
+        let tokens = tokenize_shell_words(active_segment);
 
         if let Some(first_tok) = tokens.first() {
             if pane1.select_first_matching(|it| it.text.eq_ignore_ascii_case(first_tok)) {
@@ -123,7 +256,9 @@ impl CommandLine {
 
         (
             Self {
+                pipeline_prefix,
                 tokens,
+                subcmd_chain: Vec::new(),
                 pending_pane2_seed,
                 pending_pane3_seeds,
                 suppress_pane2_preview: false,
@@ -160,6 +295,7 @@ impl CommandLine {
         } else if !self.tokens[0].eq_ignore_ascii_case(&p1.text) {
             self.tokens[0] = p1.text.clone();
             self.tokens.truncate(1);
+            self.subcmd_chain.clear();
         }
     }
 
@@ -220,7 +356,7 @@ impl CommandLine {
                     if !p1.is_scope_root()
                         && p2.is_emittable()
                         && !p2.is_loading()
-                        && out.len() <= 1
+                        && out.len() <= 1 + self.subcmd_chain.len()
                         && out.last().map(String::as_str) != Some(p2.text.as_str())
                     {
                         out.push(p2.text.clone());
@@ -236,7 +372,12 @@ impl CommandLine {
             }
         }
 
-        out.join(" ")
+        let cmd_body = join_command_tokens(&out);
+        match (&self.pipeline_prefix, cmd_body.is_empty()) {
+            (Some(prefix), true) => prefix.clone(),
+            (Some(prefix), false) => format!("{prefix} {cmd_body}"),
+            (None, _) => cmd_body,
+        }
     }
 }
 
@@ -325,9 +466,33 @@ fn is_git_branch_target(exe: &str, p2: &Entry) -> bool {
     ) || p2.text == "-B"
 }
 
+fn walk_entry_chain<'a>(root: &'a Entry, chain: &[String]) -> Option<&'a Entry> {
+    let mut cur = root;
+    for seg in chain {
+        cur = cur
+            .children
+            .iter()
+            .find(|c| c.text.eq_ignore_ascii_case(seg))?;
+    }
+    Some(cur)
+}
+
+fn format_custom_value_token(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let already_quoted = trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')));
+    if !already_quoted && trimmed.chars().any(char::is_whitespace) {
+        format!("\"{trimmed}\"")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn resolve_pane2_entries<I: Introspect>(
     pane1_entry: Option<&Entry>,
     tokens: &[String],
+    subcmd_chain: &[String],
     introspector: &mut I,
 ) -> (Vec<Entry>, Option<String>) {
     let Some(p1) = pane1_entry else {
@@ -336,6 +501,19 @@ fn resolve_pane2_entries<I: Introspect>(
 
     if p1.is_loading() {
         return (Vec::new(), None);
+    }
+
+    if !subcmd_chain.is_empty() {
+        if let Some(nested) = walk_entry_chain(p1, subcmd_chain) {
+            if !nested.children.is_empty() {
+                return (nested.children.clone(), None);
+            }
+        }
+        let p1_exe = primary_exe_for_entry(p1);
+        let mut chain: Vec<&str> = Vec::with_capacity(1 + subcmd_chain.len());
+        chain.push(p1_exe);
+        chain.extend(subcmd_chain.iter().map(String::as_str));
+        return (introspector.query(&chain), None);
     }
 
     if !p1.children.is_empty() {
@@ -356,6 +534,7 @@ fn resolve_pane2_entries<I: Introspect>(
 fn resolve_pane3_entries<I: Introspect>(
     pane1_entry: Option<&Entry>,
     pane2_entry: Option<&Entry>,
+    subcmd_chain: &[String],
     introspector: &mut I,
     pane3_filter: &str,
     dialect: ShellDialect,
@@ -375,7 +554,7 @@ fn resolve_pane3_entries<I: Introspect>(
 
     if !trimmed_input.is_empty() {
         entries.push(Entry::new(
-            trimmed_input,
+            format_custom_value_token(trimmed_input),
             format!("✏ Use \"{trimmed_input}\""),
             EntryKind::Value,
             format!("Insert custom value for {}", p2.label),
@@ -406,7 +585,11 @@ fn resolve_pane3_entries<I: Introspect>(
     }
 
     if p2.kind == EntryKind::Subcmd {
-        let sub_entries = introspector.query(&[p1_exe, p2.text.as_str()]);
+        let mut chain: Vec<&str> = Vec::with_capacity(2 + subcmd_chain.len());
+        chain.push(p1_exe);
+        chain.extend(subcmd_chain.iter().map(String::as_str));
+        chain.push(p2.text.as_str());
+        let sub_entries = introspector.query(&chain);
         if sub_entries.iter().any(Entry::is_loading) {
             entries.extend(sub_entries);
             return entries;
@@ -440,12 +623,12 @@ fn resolve_pane3_token(cur_p3: Option<&Entry>, pane3_filter: &str) -> Option<Str
         } else if p3.is_emittable() {
             Some(p3.text.clone())
         } else if !trimmed_filter.is_empty() {
-            Some(trimmed_filter.to_string())
+            Some(format_custom_value_token(trimmed_filter))
         } else {
             None
         }
     } else if !trimmed_filter.is_empty() {
-        Some(trimmed_filter.to_string())
+        Some(format_custom_value_token(trimmed_filter))
     } else {
         None
     }
@@ -466,6 +649,7 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     active_param_set_label: Option<String>,
     viewport: Viewport,
     dialect: ShellDialect,
+    inspector_expanded: bool,
     dirty: bool,
 }
 
@@ -492,6 +676,7 @@ impl<I: Introspect> MillerSession<I> {
             active_param_set_label: None,
             viewport,
             dialect,
+            inspector_expanded: false,
             dirty: true,
         };
         session.sync_panes();
@@ -594,8 +779,20 @@ impl<I: Introspect> MillerSession<I> {
         self.sync_panes();
 
         match action {
-            UserAction::Cancel => return SessionOutcome::Canceled,
+            UserAction::Cancel => {
+                if self.inspector_expanded {
+                    self.inspector_expanded = false;
+                    self.dirty = true;
+                    return SessionOutcome::Continue;
+                }
+                return SessionOutcome::Canceled;
+            }
             UserAction::Confirm => return SessionOutcome::Confirmed(self.command_line()),
+            UserAction::ToggleInspector => {
+                self.inspector_expanded = !self.inspector_expanded;
+                self.dirty = true;
+                return SessionOutcome::Continue;
+            }
             UserAction::Resize(w, h) => {
                 self.viewport = Viewport::new(w, h);
                 self.clamp_scroll();
@@ -603,6 +800,10 @@ impl<I: Introspect> MillerSession<I> {
                 return SessionOutcome::Continue;
             }
             UserAction::ReloadCatalog => {
+                if let Some(p1) = self.selected_entry(Pane::First) {
+                    let exe = primary_exe_for_entry(p1).to_string();
+                    self.introspector.invalidate_command(&exe);
+                }
                 if let Some(loader) = self.catalog_loader.as_mut() {
                     let entries = loader(self.dialect);
                     self.apply_catalog_update(entries);
@@ -662,6 +863,24 @@ impl<I: Introspect> MillerSession<I> {
         }
     }
 
+    fn slide_window_into_subcmd(
+        &mut self,
+        parent_sub: String,
+        next_sub: String,
+        suppress_pane3: bool,
+    ) {
+        self.cmd.subcmd_chain.push(parent_sub);
+        self.panes[1].clear_filter();
+        self.panes[2].clear_filter();
+        self.cmd.pending_pane2_seed = Some(next_sub);
+        self.cmd.suppress_pane2_preview = false;
+        self.cmd.suppress_pane3_preview = suppress_pane3;
+        self.active_pane = Pane::Second;
+        self.pane2_cache_state = None;
+        self.pane3_cache_state = None;
+        self.dirty = true;
+    }
+
     fn step_right(&mut self) {
         match self.active_pane {
             Pane::First => {
@@ -686,7 +905,24 @@ impl<I: Introspect> MillerSession<I> {
                     }
                 }
             }
-            Pane::Third => {}
+            Pane::Third => {
+                if let (Some(p1), Some(p2), Some(p3)) = (
+                    self.selected_entry(Pane::First).cloned(),
+                    self.selected_entry(Pane::Second).cloned(),
+                    self.selected_entry(Pane::Third).cloned(),
+                ) {
+                    if p2.kind == EntryKind::Subcmd
+                        && p3.kind == EntryKind::Subcmd
+                        && p3.is_emittable()
+                        && !p3.is_loading()
+                    {
+                        self.cmd.commit_pane2_entry(Some(&p1), &p2);
+                        self.cmd.push_token_dedup(p3.text.clone());
+                        self.cmd.pending_pane3_seeds.clear();
+                        self.slide_window_into_subcmd(p2.text, p3.text, false);
+                    }
+                }
+            }
         }
     }
 
@@ -699,8 +935,20 @@ impl<I: Introspect> MillerSession<I> {
                 self.dirty = true;
             }
             Pane::Second => {
-                self.active_pane = Pane::First;
-                self.cmd.resume_preview(Pane::Second);
+                if let Some(prev_sub) = self.cmd.subcmd_chain.pop() {
+                    self.cmd.pending_pane2_seed = None;
+                    self.cmd.suppress_pane2_preview = true;
+                    self.pane2_cache_state = None;
+                    self.pane3_cache_state = None;
+                    self.sync_panes();
+                    self.panes[1]
+                        .select_first_matching(|it| it.text.eq_ignore_ascii_case(&prev_sub));
+                    self.pane3_cache_state = None;
+                    self.sync_panes();
+                } else {
+                    self.active_pane = Pane::First;
+                    self.cmd.resume_preview(Pane::Second);
+                }
                 self.dirty = true;
             }
             Pane::First => {}
@@ -751,6 +999,20 @@ impl<I: Introspect> MillerSession<I> {
                 let p1_opt = self.selected_entry(Pane::First).cloned();
                 let p2_opt = self.selected_entry(Pane::Second).cloned();
                 let p3_opt = self.selected_entry(Pane::Third).cloned();
+                if let (Some(p2), Some(p3)) = (p2_opt.as_ref(), p3_opt.as_ref()) {
+                    if p2.kind == EntryKind::Subcmd
+                        && p3.kind == EntryKind::Subcmd
+                        && p3.is_emittable()
+                        && !p3.is_loading()
+                    {
+                        self.cmd.commit_pane2_entry(p1_opt.as_ref(), p2);
+                        self.cmd.push_token_dedup(p3.text.clone());
+                        self.cmd.pending_pane3_seeds.clear();
+                        self.slide_window_into_subcmd(p2.text.clone(), p3.text.clone(), false);
+                        return;
+                    }
+                }
+
                 let pane3_filter = self.panes[2].filter();
                 let val_to_add = resolve_pane3_token(p3_opt.as_ref(), pane3_filter);
                 let is_flag_placeholder = p3_opt
@@ -785,20 +1047,40 @@ impl<I: Introspect> MillerSession<I> {
         if self.active_pane_mut().pop_filter_char() {
             self.finish_filter_edit();
         } else if self.cmd.pop_token().is_some() {
-            if self.active_pane == Pane::Third && self.cmd.tokens().len() <= 1 {
+            let depth_popped = if self.cmd.tokens().len() <= self.cmd.subcmd_chain.len() {
+                self.cmd.subcmd_chain.pop()
+            } else {
+                None
+            };
+            if let Some(prev_sub) = depth_popped {
+                self.pane2_cache_state = None;
+                self.pane3_cache_state = None;
                 self.active_pane = Pane::Second;
-                self.cmd.resume_preview(Pane::Second);
-                self.cmd.resume_preview(Pane::Third);
-            } else if self.active_pane == Pane::Third {
-                self.cmd.suppress_pane3_preview = true;
-            } else if self.active_pane == Pane::Second {
-                if self.cmd.tokens().is_empty() {
-                    self.active_pane = Pane::First;
+                self.cmd.suppress_pane2_preview = true;
+                self.sync_panes();
+                self.panes[1].select_first_matching(|it| it.text.eq_ignore_ascii_case(&prev_sub));
+                self.pane3_cache_state = None;
+            } else {
+                let min_pane3_tokens = 1 + self.cmd.subcmd_chain.len();
+                if self.active_pane == Pane::Third && self.cmd.tokens().len() <= min_pane3_tokens {
+                    self.active_pane = Pane::Second;
                     self.cmd.resume_preview(Pane::Second);
-                } else {
-                    self.cmd.suppress_pane2_preview = true;
+                    self.cmd.resume_preview(Pane::Third);
+                } else if self.active_pane == Pane::Third {
+                    self.cmd.suppress_pane3_preview = true;
+                } else if self.active_pane == Pane::Second {
+                    if self.cmd.tokens().is_empty() {
+                        self.active_pane = Pane::First;
+                        self.cmd.resume_preview(Pane::Second);
+                    } else {
+                        self.cmd.suppress_pane2_preview = true;
+                    }
                 }
             }
+            self.dirty = true;
+        } else if self.cmd.pipeline_prefix.take().is_some() {
+            self.active_pane = Pane::First;
+            self.cmd.resume_preview(Pane::Second);
             self.dirty = true;
         } else if self.active_pane != Pane::First {
             self.active_pane = match self.active_pane {
@@ -831,6 +1113,7 @@ impl<I: Introspect> MillerSession<I> {
             command_line: self.command_line(),
             active_param_set: self.active_param_set_label.as_deref(),
             dialect: self.dialect,
+            inspector_expanded: self.inspector_expanded,
         }
     }
 
@@ -861,35 +1144,44 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn sync_panes(&mut self) {
-        let cur_p1_idx = self.panes[0].selected_source_idx();
-        let cur_p2_idx = self.sync_pane2(cur_p1_idx);
-        self.sync_pane3(cur_p1_idx, cur_p2_idx);
+        for _ in 0..16 {
+            let cur_p1_idx = self.panes[0].selected_source_idx();
+            let cur_p2_idx = self.sync_pane2(cur_p1_idx);
+            let slid = self.sync_pane3(cur_p1_idx, cur_p2_idx);
+            if !slid {
+                break;
+            }
+        }
         self.clamp_scroll();
     }
 
     fn sync_pane2(&mut self, cur_p1_idx: Option<usize>) -> Option<usize> {
         let cur_p1 = cur_p1_idx.map(|idx| &self.panes[0].entries()[idx]);
-        let (entries, active_param_set) =
-            resolve_pane2_entries(cur_p1, self.cmd.tokens(), &mut self.introspector);
+        let (entries, active_param_set) = resolve_pane2_entries(
+            cur_p1,
+            self.cmd.tokens(),
+            &self.cmd.subcmd_chain,
+            &mut self.introspector,
+        );
 
         let next_state = Pane2CacheState {
             p1_entry_idx: cur_p1_idx,
             active_param_set: active_param_set.clone(),
+            subcmd_chain: self.cmd.subcmd_chain.clone(),
         };
 
         if self.pane2_cache_state.as_ref() != Some(&next_state) {
-            let same_p1 = self
-                .pane2_cache_state
-                .as_ref()
-                .is_some_and(|prev| prev.p1_entry_idx == cur_p1_idx);
-            let prev_p2_text = if same_p1 {
+            let same_p1_depth = self.pane2_cache_state.as_ref().is_some_and(|prev| {
+                prev.p1_entry_idx == cur_p1_idx && prev.subcmd_chain == self.cmd.subcmd_chain
+            });
+            let prev_p2_text = if same_p1_depth {
                 self.selected_entry(Pane::Second).map(|it| it.text.clone())
             } else {
                 None
             };
 
             self.panes[1].set_entries(entries);
-            if same_p1 && !self.cmd.suppress_pane2_preview {
+            if same_p1_depth && !self.cmd.suppress_pane2_preview {
                 let matched = prev_p2_text.as_deref().is_some_and(|prev_txt| {
                     self.panes[1].select_first_matching(|it| it.text == prev_txt)
                 });
@@ -924,7 +1216,7 @@ impl<I: Introspect> MillerSession<I> {
         self.panes[1].selected_source_idx()
     }
 
-    fn sync_pane3(&mut self, cur_p1_idx: Option<usize>, cur_p2_idx: Option<usize>) {
+    fn sync_pane3(&mut self, cur_p1_idx: Option<usize>, cur_p2_idx: Option<usize>) -> bool {
         let cur_p1 = cur_p1_idx.map(|idx| &self.panes[0].entries()[idx]);
         let cur_p2 = cur_p2_idx.map(|idx| &self.panes[1].entries()[idx]);
 
@@ -932,12 +1224,14 @@ impl<I: Introspect> MillerSession<I> {
             p1_entry_idx: cur_p1_idx,
             p2_entry_idx: cur_p2_idx,
             pane3_filter: self.panes[2].filter().to_string(),
+            subcmd_chain: self.cmd.subcmd_chain.clone(),
         };
 
         if self.pane3_cache_state.as_ref() != Some(&next_state) {
             let entries = resolve_pane3_entries(
                 cur_p1,
                 cur_p2,
+                &self.cmd.subcmd_chain,
                 &mut self.introspector,
                 self.panes[2].filter(),
                 self.dialect,
@@ -953,15 +1247,31 @@ impl<I: Introspect> MillerSession<I> {
             if !pane3_entries.is_empty() && !pane3_entries[0].is_loading() {
                 let tok3 = self.cmd.pending_pane3_seeds.pop_front().unwrap();
                 let has_more = !self.cmd.pending_pane3_seeds.is_empty();
-                self.cmd.pending_pane3_seeds.clear();
                 let matched = self.panes[2].select_first_matching(|it| {
                     it.text.eq_ignore_ascii_case(&tok3) || it.matches_parameter_token(&tok3)
                 });
+                let matched_subcmd = matched
+                    && self.panes[2]
+                        .selected()
+                        .is_some_and(|e| e.kind == EntryKind::Subcmd);
+
+                if has_more && matched_subcmd {
+                    let parent_sub = cur_p2_idx
+                        .and_then(|idx| self.panes[1].entries().get(idx))
+                        .filter(|e| e.kind == EntryKind::Subcmd)
+                        .map(|e| e.text.clone());
+                    if let Some(parent_sub) = parent_sub {
+                        self.slide_window_into_subcmd(parent_sub, tok3, false);
+                        return true;
+                    }
+                }
+                self.cmd.pending_pane3_seeds.clear();
                 if !matched || has_more {
                     self.cmd.suppress_pane3_preview = true;
                 }
             }
         }
+        false
     }
 
     fn clamp_scroll(&mut self) {
@@ -1884,5 +2194,193 @@ mod tests {
             .entries()
             .iter()
             .any(|e| e.text == "--locked"));
+    }
+
+    #[test]
+    fn test_multi_level_subcommand_sliding_navigation_backspace_and_seeding() {
+        let mut remote = Entry::new("remote", "remote", EntryKind::Subcmd, "Manage remotes");
+        let mut add = Entry::new("add", "add", EntryKind::Subcmd, "Add a remote");
+        add.children = vec![
+            Entry::new("--tags", "--tags", EntryKind::Flag, "Import tags"),
+            Entry::new("-f", "-f", EntryKind::Flag, "Fetch immediately"),
+        ];
+        remote.children = vec![
+            add,
+            Entry::new("remove", "remove", EntryKind::Subcmd, "Remove a remote"),
+        ];
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git VCS");
+        git.children = vec![remote];
+
+        let mut session = MillerSession::new(
+            vec![git.clone()],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+
+        // Pane 1 (`git`) -> Pane 2 (`remote`) -> Pane 3 (`add`) -> Slide into (`git`, `remote`, `add`)
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::StepRight);
+        assert_eq!(session.view().active_pane, Pane::Third);
+        assert_eq!(
+            session.view().panes[2].selected().map(|e| e.text.as_str()),
+            Some("add")
+        );
+
+        session.apply(UserAction::StepRight);
+        assert_eq!(session.view().active_pane, Pane::Third);
+        assert_eq!(
+            session.view().panes[1].selected().map(|e| e.text.as_str()),
+            Some("add")
+        );
+        assert_eq!(
+            session.view().panes[2].selected().map(|e| e.text.as_str()),
+            Some("--tags")
+        );
+        assert_eq!(session.command_line(), "git remote add --tags");
+
+        // StepLeft into Pane 2 (`add`), then StepLeft again slides back to root `remote`
+        session.apply(UserAction::StepLeft);
+        assert_eq!(session.view().active_pane, Pane::Second);
+        session.apply(UserAction::StepLeft);
+        assert_eq!(session.view().active_pane, Pane::Second);
+        assert_eq!(
+            session.view().panes[1].selected().map(|e| e.text.as_str()),
+            Some("remote")
+        );
+        assert_eq!(session.command_line(), "git remote add");
+
+        // Initial buffer seeding across 3+ levels (`git remote add --tags`)
+        let seeded = MillerSession::new(
+            vec![git],
+            FakeIntrospector::empty(),
+            "git remote add --tags",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        assert_eq!(seeded.view().active_pane, Pane::Third);
+        assert_eq!(
+            seeded.view().panes[1].selected().map(|e| e.text.as_str()),
+            Some("add")
+        );
+        assert_eq!(
+            seeded.view().panes[2].selected().map(|e| e.text.as_str()),
+            Some("--tags")
+        );
+        assert_eq!(seeded.command_line(), "git remote add --tags");
+    }
+
+    #[test]
+    fn test_quote_aware_seeding_pipeline_prefix_and_equals_colon_attachment() {
+        assert_eq!(
+            split_pipeline_prefix(r#"Get-Process | Where-Object -Property "CPU""#),
+            (
+                Some("Get-Process |".to_string()),
+                r#"Where-Object -Property "CPU""#
+            )
+        );
+        assert_eq!(
+            tokenize_shell_words(r#"git commit -m "fix: bug" --date='2026-01-01'"#),
+            vec!["git", "commit", "-m", "\"fix: bug\"", "--date='2026-01-01'"]
+        );
+
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git");
+        let mut commit = Entry::new("commit", "commit", EntryKind::Subcmd, "Commit");
+        commit.children = vec![
+            Entry::new("-m", "-m", EntryKind::Param, "Message"),
+            Entry::new("--format=", "--format=", EntryKind::Param, "Format"),
+        ];
+        git.children = vec![commit];
+
+        let session = MillerSession::new(
+            vec![git],
+            FakeIntrospector::empty(),
+            r#"git status && git commit -m "fix: bug""#,
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        assert_eq!(
+            session.command_line(),
+            r#"git status && git commit -m "fix: bug""#
+        );
+
+        // Typing custom value with spaces wraps in quotes automatically
+        let mut fd = Entry::new("fd", "fd", EntryKind::Cli, "Find");
+        let ext = Entry::new("--extension=", "-e, --extension=", EntryKind::Param, "Ext");
+        fd.children = vec![
+            ext,
+            Entry::new("--glob", "--glob", EntryKind::Param, "Glob"),
+        ];
+        let mut fd_sess = MillerSession::new(
+            vec![fd],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        fd_sess.apply(UserAction::StepRight);
+        fd_sess.apply(UserAction::StepRight);
+        for ch in "rs".chars() {
+            fd_sess.apply(UserAction::InsertChar(ch));
+        }
+        assert_eq!(fd_sess.command_line(), "fd --extension=rs");
+
+        fd_sess.apply(UserAction::AcceptToken);
+        fd_sess.apply(UserAction::MoveDown);
+        fd_sess.apply(UserAction::StepRight);
+        for ch in "my file.rs".chars() {
+            fd_sess.apply(UserAction::InsertChar(ch));
+        }
+        assert_eq!(
+            fd_sess.command_line(),
+            "fd --extension=rs --glob \"my file.rs\""
+        );
+    }
+
+    #[test]
+    fn test_home_row_keys_and_inspector_toggle_overlay() {
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(UserAction::MoveDown)
+        );
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)),
+            Some(UserAction::MoveUp)
+        );
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::ALT)),
+            Some(UserAction::MoveDown)
+        );
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::ALT)),
+            Some(UserAction::MoveUp)
+        );
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)),
+            Some(UserAction::ToggleInspector)
+        );
+
+        let mut session = MillerSession::new(
+            vec![Entry::new("git", "git", EntryKind::Cli, "Git VCS")],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(100, 20),
+            ShellDialect::Posix,
+        );
+        assert!(!session.view().inspector_expanded);
+
+        assert_eq!(
+            session.apply(UserAction::ToggleInspector),
+            SessionOutcome::Continue
+        );
+        assert!(session.view().inspector_expanded);
+
+        // First Esc closes the expanded inspector instead of canceling the session.
+        assert_eq!(session.apply(UserAction::Cancel), SessionOutcome::Continue);
+        assert!(!session.view().inspector_expanded);
+
+        // Second Esc cancels normally.
+        assert_eq!(session.apply(UserAction::Cancel), SessionOutcome::Canceled);
     }
 }

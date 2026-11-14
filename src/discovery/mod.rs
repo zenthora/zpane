@@ -8,4 +8,4 @@ pub use catalog::{
 };
 #[cfg(test)]
 pub use introspect::PollResult;
-pub use introspect::{warm_cli_cache, CliIntrospector, Introspect};
+pub use introspect::{clear_disk_cache, warm_cli_cache, CliIntrospector, Introspect};

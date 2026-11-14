@@ -258,6 +258,7 @@ pub struct RenderState<'a> {
     pub command_line: String,
     pub active_param_set: Option<&'a str>,
     pub dialect: ShellDialect,
+    pub inspector_expanded: bool,
 }
 
 /// Resolves the currently inspected entry from the active pane, falling back to parent panes
@@ -286,6 +287,110 @@ fn inspector_header(st: &RenderState<'_>) -> (String, String) {
     (info_title, info_desc)
 }
 
+fn wrap_display_lines(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let mut cur = String::new();
+        let mut cur_w = 0usize;
+        for word in raw_line.split_whitespace() {
+            let word_w: usize = word
+                .chars()
+                .map(|c| UnicodeWidthChar::width(sanitize_char(c)).unwrap_or(0))
+                .sum();
+            let space_w = usize::from(!cur.is_empty());
+            if cur_w + space_w + word_w <= max_width {
+                if space_w == 1 {
+                    cur.push(' ');
+                    cur_w += 1;
+                }
+                cur.push_str(word);
+                cur_w += word_w;
+            } else {
+                if !cur.is_empty() {
+                    lines.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                if word_w <= max_width {
+                    cur.push_str(word);
+                    cur_w = word_w;
+                } else {
+                    for ch in word.chars().map(sanitize_char) {
+                        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+                        if cur_w + cw > max_width && !cur.is_empty() {
+                            lines.push(std::mem::take(&mut cur));
+                            cur_w = 0;
+                        }
+                        cur.push(ch);
+                        cur_w += cw;
+                    }
+                }
+            }
+        }
+        if !cur.is_empty() {
+            lines.push(cur);
+        } else if lines.is_empty() {
+            lines.push(String::new());
+        }
+    }
+    lines
+}
+
+fn build_expanded_inspector_rows(entry: Option<&Entry>, w3: usize) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    let Some(it) = entry else {
+        rows.push((C_HEADER_ACT, " ℹ No selection [F1 Close]".to_string()));
+        return rows;
+    };
+
+    rows.push((
+        C_HEADER_ACT,
+        format!(" ℹ {} {} [F1 Close]", it.label, it.kind.badge()),
+    ));
+    let mut token_line = if it.text.is_empty() {
+        " Token: (placeholder)".to_string()
+    } else {
+        format!(" Token: {}", it.text)
+    };
+    if !it.aliases.is_empty() {
+        token_line.push_str(&format!("  Aliases: {}", it.aliases.join(", ")));
+    }
+    rows.push((C_FILTER, token_line));
+
+    let sets_line = if !it.parameter_sets.is_empty() {
+        format!(" Sets : {}", it.parameter_sets.join(", "))
+    } else {
+        format!(" Kind : {}", it.kind.badge())
+    };
+    rows.push((C_DIM, sets_line));
+    rows.push((C_BORDER_DIM, "─".repeat(w3)));
+
+    let wrap_w = w3.saturating_sub(2).max(1);
+    for line in wrap_display_lines(&it.desc, wrap_w) {
+        rows.push((C_TEXT, format!(" {line}")));
+    }
+
+    if !it.children.is_empty() {
+        let preview: Vec<&str> = it
+            .children
+            .iter()
+            .filter(|c| !c.is_placeholder())
+            .take(8)
+            .map(|c| c.text.as_str())
+            .collect();
+        if !preview.is_empty() {
+            rows.push((C_BORDER_DIM, "─".repeat(w3)));
+            for line in wrap_display_lines(&format!("Children: {}", preview.join(", ")), wrap_w) {
+                rows.push((C_DIM, format!(" {line}")));
+            }
+        }
+    }
+
+    rows
+}
+
 /// Computes `(w1, w2, w3)` inside `inner_w` summing strictly to `inner_w`.
 fn split_pane_widths(inner_w: usize) -> (usize, usize, usize) {
     let w1 = (inner_w * 28 / 100).max(10).min(inner_w / 3);
@@ -300,6 +405,14 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     let win_w = st.viewport.width.max(Viewport::MIN_WIDTH);
     let list_rows = st.viewport.rows(Pane::First);
     let (info_title, info_desc) = inspector_header(st);
+    let expanded_rows = if st.inspector_expanded {
+        build_expanded_inspector_rows(
+            selected_info_entry(st),
+            split_pane_widths(win_w.saturating_sub(4)).2,
+        )
+    } else {
+        Vec::new()
+    };
 
     let inner_w = win_w.saturating_sub(4);
     let (w1, w2, w3) = split_pane_widths(inner_w);
@@ -316,7 +429,11 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     } else {
         format!(" 2. Subcommands / Params ({}) ", st.panes[1].visible_len())
     };
-    let h3_txt = format!(" 3. Flags / Values / Info ({}) ", st.panes[2].visible_len());
+    let h3_txt = if st.inspector_expanded {
+        " 3. Inspector [F1 Close] ".to_string()
+    } else {
+        format!(" 3. Flags / Values / Info ({}) ", st.panes[2].visible_len())
+    };
 
     let header_color = |pane: Pane| {
         if st.active_pane == pane {
@@ -351,32 +468,44 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         sb.push_str(C_BORDER_DIM);
         sb.push('│');
         sb.push_str(RST);
-        // Pane 3: Top 3 rows = Inspector Header, Rows 3.. = Interactive List
-        match r {
-            0 => {
-                sb.push_str(C_HEADER_ACT);
-                push_padded_text(&mut sb, &info_title, w3);
+        if st.inspector_expanded {
+            if let Some((color, text)) = expanded_rows.get(r) {
+                sb.push_str(color);
+                push_padded_text(&mut sb, text, w3);
                 sb.push_str(RST);
-            }
-            1 => {
-                sb.push_str(C_DIM);
-                push_padded_text(&mut sb, &info_desc, w3);
-                sb.push_str(RST);
-            }
-            2 => {
-                sb.push_str(C_BORDER_DIM);
+            } else {
                 for _ in 0..w3 {
-                    sb.push('─');
+                    sb.push(' ');
                 }
-                sb.push_str(RST);
             }
-            _ => push_pane_cell(
-                &mut sb,
-                st.panes[2],
-                r - PANE3_INSPECTOR_ROWS,
-                w3,
-                st.active_pane == Pane::Third,
-            ),
+        } else {
+            // Pane 3: Top 3 rows = Inspector Header, Rows 3.. = Interactive List
+            match r {
+                0 => {
+                    sb.push_str(C_HEADER_ACT);
+                    push_padded_text(&mut sb, &info_title, w3);
+                    sb.push_str(RST);
+                }
+                1 => {
+                    sb.push_str(C_DIM);
+                    push_padded_text(&mut sb, &info_desc, w3);
+                    sb.push_str(RST);
+                }
+                2 => {
+                    sb.push_str(C_BORDER_DIM);
+                    for _ in 0..w3 {
+                        sb.push('─');
+                    }
+                    sb.push_str(RST);
+                }
+                _ => push_pane_cell(
+                    &mut sb,
+                    st.panes[2],
+                    r - PANE3_INSPECTOR_ROWS,
+                    w3,
+                    st.active_pane == Pane::Third,
+                ),
+            }
         }
 
         sb.push_str(C_BORDER_DIM);
@@ -415,7 +544,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         "Reload"
     };
     let footer = format!(
-        " [↑/↓] Move  [←/→] Pane  [Type] Fuzzy Filter  [Tab] Append Token  [Ctrl+U] Clear Filter  [Ctrl+R] {reload_action}  [Enter] Accept  [Esc] Exit"
+        " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] {reload_action}  [Enter] Accept  [Esc]"
     );
     push_status_row(&mut sb, C_DIM, &footer, full_inner);
 
@@ -506,6 +635,7 @@ mod tests {
             command_line: String::new(),
             active_param_set: None,
             dialect: ShellDialect::Posix,
+            inspector_expanded: false,
         };
 
         assert_eq!(render_frame(&st).lines().count(), 8);
@@ -535,6 +665,7 @@ mod tests {
                 command_line: "git commit".to_string(),
                 active_param_set: None,
                 dialect: ShellDialect::Posix,
+                inspector_expanded: false,
             };
             let plain = strip_ansi(&render_frame(&st));
             let lines: Vec<&str> = plain.lines().collect();
@@ -559,6 +690,7 @@ mod tests {
             command_line: String::new(),
             active_param_set: None,
             dialect: ShellDialect::PowerShell,
+            inspector_expanded: false,
         }));
         assert!(ps_frame.contains("[Ctrl+R] Sync PS"));
 
@@ -569,6 +701,7 @@ mod tests {
             command_line: String::new(),
             active_param_set: None,
             dialect: ShellDialect::Posix,
+            inspector_expanded: false,
         }));
         assert!(posix_frame.contains("[Ctrl+R] Reload"));
         assert!(!posix_frame.contains("Sync PS"));
@@ -609,6 +742,7 @@ mod tests {
             command_line: "cmd7 --flag4".to_string(),
             active_param_set: None,
             dialect: ShellDialect::Posix,
+            inspector_expanded: false,
         });
 
         assert_eq!(frame.lines().count(), term_h);
@@ -641,6 +775,7 @@ mod tests {
             command_line: "git".to_string(),
             active_param_set: None,
             dialect: ShellDialect::Posix,
+            inspector_expanded: false,
         };
         let (title0, desc0) = inspector_header(&st_p1);
         assert_eq!(title0, " ℹ git [CLI]");
@@ -679,5 +814,43 @@ mod tests {
         buf.clear();
         push_padded_text(&mut buf, "a\nb\tc", 6);
         assert_eq!(buf, "a b c ");
+    }
+
+    #[test]
+    fn test_expanded_inspector_drawer_wraps_full_description_and_metadata() {
+        let param = Entry::new(
+            "-Id",
+            "-Id (-PID)",
+            EntryKind::Param,
+            "Gets processes that are identified by one or more process IDs on the local host.",
+        )
+        .with_aliases(vec!["PID".to_string()])
+        .with_parameter_sets(vec!["Id".to_string(), "IdWithUserName".to_string()]);
+        let pane1 = PaneList::new(vec![Entry::new(
+            "Get-Process",
+            "Get-Process",
+            EntryKind::Cmdlet,
+            "",
+        )]);
+        let pane2 = PaneList::new(vec![param]);
+        let empty = PaneList::default();
+
+        let plain = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 18),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "Get-Process -Id".to_string(),
+            active_param_set: Some("Id"),
+            dialect: ShellDialect::PowerShell,
+            inspector_expanded: true,
+        }));
+
+        assert_eq!(plain.lines().count(), 18);
+        assert!(plain.contains("3. Inspector [F1 Close]"));
+        assert!(plain.contains("Token: -Id  Aliases: PID"));
+        assert!(plain.contains("Sets : Id, IdWithUserName"));
+        assert!(plain.contains("Gets processes that are identified by"));
+        assert!(plain.contains("one or more process IDs on the local"));
+        assert!(plain.contains("host."));
     }
 }

@@ -9,8 +9,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
 use discovery::{
-    detect_runtime_context, load_catalog, reload_catalog, sync_powershell_metadata, warm_cli_cache,
-    CliIntrospector, ShellDialect,
+    clear_disk_cache, detect_runtime_context, load_catalog, reload_catalog,
+    sync_powershell_metadata, warm_cli_cache, CliIntrospector, ShellDialect,
 };
 use model::RuntimeContext;
 use session::{MillerSession, SessionOutcome};
@@ -159,6 +159,7 @@ const HELP_TEXT: &str = "\
 zpane - 3-pane Miller column command, parameter & variable explorer
 
 Usage: zpane [OPTIONS] [INITIAL_TOKENS]...
+       zpane init <pwsh|zsh|bash|fish>
 
 Options:
       --initial <TEXT>       Seed the command builder with an existing command buffer
@@ -169,14 +170,119 @@ Options:
       --context-file <PATH>  Read dynamic runtime context JSON payload from <PATH>
       --git-branch <NAME>    Override current Git branch name for runtime context
       --history <CMD>        Add a recent command to the top of Pane 1 (repeatable)
+      --init <SHELL>         Print shell integration snippet (`pwsh`, `zsh`, `bash`, `fish`) and exit
       --sync-ps              Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
       --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
+      --clear-cache          Delete persisted CLI help & PowerShell metadata cache files and exit
   -h, --help                 Print help
   -V, --version              Print version
 
 Environment:
   ZPANE_SHELL                Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($status)
+  ZPANE_CONFIG               Override user config path (`config.toml`)
 ";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellInitTarget {
+    Pwsh,
+    Zsh,
+    Bash,
+    Fish,
+}
+
+impl ShellInitTarget {
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "pwsh" | "powershell" => Ok(ShellInitTarget::Pwsh),
+            "zsh" => Ok(ShellInitTarget::Zsh),
+            "bash" => Ok(ShellInitTarget::Bash),
+            "fish" => Ok(ShellInitTarget::Fish),
+            other => anyhow::bail!(
+                "Unknown shell target '{other}' (expected one of: pwsh, zsh, bash, fish)"
+            ),
+        }
+    }
+}
+
+fn render_shell_init(target: ShellInitTarget) -> &'static str {
+    match target {
+        ShellInitTarget::Pwsh => {
+            r#"Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
+    $line = $null
+    $cursor = $null
+    [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
+
+    $tmp = [System.IO.Path]::GetTempFileName()
+    $ctxFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $histPath = (Get-PSReadLineOption).HistorySavePath
+        $recent = @()
+        if ($histPath -and (Test-Path $histPath)) {
+            $recent = Get-Content -Path $histPath -Tail 15 -ErrorAction SilentlyContinue
+            [array]::Reverse($recent)
+        }
+        $ctxPayload = @{ history = @($recent) } | ConvertTo-Json -Compress
+        [System.IO.File]::WriteAllText($ctxFile, $ctxPayload, [System.Text.UTF8Encoding]::new($false))
+
+        zpane --initial "$line" --context-file "$ctxFile" --out-file "$tmp"
+        if (Test-Path $tmp) {
+            $accepted = (Get-Content -Path $tmp -Raw -ErrorAction SilentlyContinue)
+            if ($accepted) {
+                $accepted = $accepted.Trim()
+                [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $accepted)
+            }
+        }
+    } finally {
+        Remove-Item -Path $tmp, $ctxFile -Force -ErrorAction SilentlyContinue
+    }
+}
+"#
+        }
+        ShellInitTarget::Zsh => {
+            r#"_zpane_widget() {
+    local tmp="$(mktemp)"
+    zpane --initial "$BUFFER" --out-file "$tmp"
+    if [[ -s "$tmp" ]]; then
+        BUFFER="$(<"$tmp")"
+        CURSOR=${#BUFFER}
+    fi
+    rm -f "$tmp"
+    zle redisplay
+}
+zle -N _zpane_widget
+bindkey '^[m' _zpane_widget
+"#
+        }
+        ShellInitTarget::Bash => {
+            r#"_zpane_readline() {
+    local tmp
+    tmp="$(mktemp)"
+    zpane --initial "$READLINE_LINE" --out-file "$tmp"
+    if [[ -s "$tmp" ]]; then
+        READLINE_LINE="$(<"$tmp")"
+        READLINE_POINT=${#READLINE_LINE}
+    fi
+    rm -f "$tmp"
+}
+bind -x '"\em": _zpane_readline'
+"#
+        }
+        ShellInitTarget::Fish => {
+            r#"function _zpane_fish
+    set -l tmp (mktemp)
+    zpane --initial (commandline -b) --out-file "$tmp"
+    if test -s "$tmp"
+        commandline -r (string trim (cat "$tmp"))
+        commandline -C (string length (commandline -b))
+    end
+    rm -f "$tmp"
+    commandline -f repaint
+end
+bind \em _zpane_fish
+"#
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
@@ -191,6 +297,8 @@ struct CliOptions {
 enum CliCommand {
     Version,
     Help,
+    Init(ShellInitTarget),
+    ClearCache,
     SyncPs { warm: bool },
     Interactive(CliOptions),
 }
@@ -232,6 +340,21 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return Ok(CliCommand::Help);
+    }
+    if args.iter().any(|a| a == "--clear-cache") {
+        return Ok(CliCommand::ClearCache);
+    }
+    if args.first().map(String::as_str) == Some("init") {
+        let Some(target) = args.get(1) else {
+            anyhow::bail!("Missing shell target for `init` (expected: pwsh, zsh, bash, fish)");
+        };
+        return Ok(CliCommand::Init(ShellInitTarget::parse(target)?));
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--init") {
+        let Some(target) = args.get(pos + 1) else {
+            anyhow::bail!("Missing value for option --init");
+        };
+        return Ok(CliCommand::Init(ShellInitTarget::parse(target)?));
     }
     if args.iter().any(|a| a == "--sync-ps" || a == "--warm") {
         let warm = args.iter().any(|a| a == "--warm");
@@ -319,6 +442,15 @@ fn main() -> anyhow::Result<()> {
         }
         CliCommand::Help => {
             print!("{HELP_TEXT}");
+            return Ok(());
+        }
+        CliCommand::Init(target) => {
+            print!("{}", render_shell_init(target));
+            return Ok(());
+        }
+        CliCommand::ClearCache => {
+            let removed = clear_disk_cache()?;
+            eprintln!("Cleared {removed} cached metadata file(s).");
             return Ok(());
         }
         CliCommand::SyncPs { warm } => {
@@ -546,6 +678,53 @@ mod tests {
         let err_file =
             parse_cli_args(&s(&["--context-file", "/nonexistent/zpane_ctx.json"])).unwrap_err();
         assert!(err_file.to_string().contains("Failed to read context file"));
+    }
+
+    #[test]
+    fn test_parse_cli_args_init_shells_and_clear_cache() {
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            parse_cli_args(&s(&["--clear-cache"])).unwrap(),
+            CliCommand::ClearCache
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["init", "pwsh"])).unwrap(),
+            CliCommand::Init(ShellInitTarget::Pwsh)
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--init", "powershell"])).unwrap(),
+            CliCommand::Init(ShellInitTarget::Pwsh)
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["init", "zsh"])).unwrap(),
+            CliCommand::Init(ShellInitTarget::Zsh)
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["init", "bash"])).unwrap(),
+            CliCommand::Init(ShellInitTarget::Bash)
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["init", "fish"])).unwrap(),
+            CliCommand::Init(ShellInitTarget::Fish)
+        );
+
+        for target in [
+            ShellInitTarget::Pwsh,
+            ShellInitTarget::Zsh,
+            ShellInitTarget::Bash,
+            ShellInitTarget::Fish,
+        ] {
+            let script = render_shell_init(target);
+            assert!(script.contains("zpane --initial"));
+            assert!(script.contains("--out-file"));
+        }
+
+        let err_missing = parse_cli_args(&s(&["init"])).unwrap_err();
+        assert!(err_missing.to_string().contains("Missing shell target"));
+
+        let err_unknown = parse_cli_args(&s(&["init", "nushell"])).unwrap_err();
+        assert!(err_unknown.to_string().contains("Unknown shell target"));
     }
 
     #[test]

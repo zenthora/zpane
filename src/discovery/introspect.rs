@@ -5,7 +5,7 @@ use super::catalog::{
 use super::help_parser::parse_cli_help;
 use crate::model::{Entry, EntryKind, RuntimeContext};
 use rayon::prelude::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -14,7 +14,7 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
 struct BgRequest {
@@ -49,23 +49,123 @@ pub trait Introspect {
     fn query(&mut self, chain: &[&str]) -> Vec<Entry>;
     fn poll_updates(&mut self) -> PollResult;
     fn flush(&mut self) -> bool;
+    fn invalidate_command(&mut self, _exe: &str) {}
+}
+
+const CLI_CACHE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedChainRecord {
+    #[serde(default)]
+    schema_version: u32,
+    #[serde(default)]
+    exe_fingerprint: Option<(u64, u64)>,
+    entries: Vec<Entry>,
+}
+
+fn find_executable_in_path(exe: &str) -> Option<PathBuf> {
+    let trimmed = exe.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path_val = std::env::var_os("PATH")?;
+    let has_ext = Path::new(trimmed).extension().is_some();
+    for dir in std::env::split_paths(&path_val) {
+        let direct = dir.join(trimmed);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if cfg!(windows) && !has_ext {
+            for ext in ["exe", "cmd", "bat"] {
+                let candidate = dir.join(format!("{trimmed}.{ext}"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn executable_fingerprint(exe: &str) -> Option<(u64, u64)> {
+    let path = find_executable_in_path(exe)?;
+    let meta = fs::metadata(path).ok()?;
+    let secs = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some((secs, meta.len()))
 }
 
 fn cli_cache_path() -> PathBuf {
     cache_dir().join("cli_cache.json")
 }
 
-fn load_cli_disk_cache_from(path: &Path) -> HashMap<String, Vec<Entry>> {
-    if let Ok(bytes) = fs::read(path) {
-        if let Ok(map) = serde_json::from_slice::<HashMap<String, Vec<Entry>>>(&bytes) {
-            return map;
+/// Removes persisted CLI help (`cli_cache.json`) and PowerShell metadata (`ps_metadata.json`) caches.
+pub fn clear_disk_cache() -> anyhow::Result<usize> {
+    let mut removed = 0usize;
+    for path in [cli_cache_path(), ps_metadata_path()] {
+        if path.exists() {
+            fs::remove_file(&path)?;
+            removed += 1;
         }
     }
-    HashMap::new()
+    Ok(removed)
+}
+
+fn load_cli_disk_cache_with_fingerprint<F>(path: &Path, fp_fn: F) -> HashMap<String, Vec<Entry>>
+where
+    F: Fn(&str) -> Option<(u64, u64)>,
+{
+    let Ok(bytes) = fs::read(path) else {
+        return HashMap::new();
+    };
+    let Ok(records) = serde_json::from_slice::<HashMap<String, CachedChainRecord>>(&bytes) else {
+        return HashMap::new();
+    };
+
+    let mut out = HashMap::new();
+    for (key, rec) in records {
+        if rec.schema_version != CLI_CACHE_SCHEMA_VERSION {
+            continue;
+        }
+        if let Some(saved_fp) = rec.exe_fingerprint {
+            let root_exe = key.split("::").next().unwrap_or(key.as_str());
+            if let Some(cur_fp) = fp_fn(root_exe) {
+                if saved_fp != cur_fp {
+                    continue;
+                }
+            }
+        }
+        out.insert(key, rec.entries);
+    }
+    out
+}
+
+fn load_cli_disk_cache_from(path: &Path) -> HashMap<String, Vec<Entry>> {
+    load_cli_disk_cache_with_fingerprint(path, executable_fingerprint)
 }
 
 fn save_cli_disk_cache_to(path: &Path, cache: &HashMap<String, Vec<Entry>>) {
-    if let Ok(json) = serde_json::to_vec(cache) {
+    let mut records: HashMap<String, CachedChainRecord> = HashMap::with_capacity(cache.len());
+    let mut fp_cache: HashMap<String, Option<(u64, u64)>> = HashMap::new();
+    for (key, entries) in cache {
+        let root_exe = key.split("::").next().unwrap_or(key.as_str());
+        let fp = *fp_cache
+            .entry(root_exe.to_string())
+            .or_insert_with(|| executable_fingerprint(root_exe));
+        records.insert(
+            key.clone(),
+            CachedChainRecord {
+                schema_version: CLI_CACHE_SCHEMA_VERSION,
+                exe_fingerprint: fp,
+                entries: entries.clone(),
+            },
+        );
+    }
+    if let Ok(json) = serde_json::to_vec(&records) {
         ensure_parent_dir(path);
         let _ = fs::write(path, json);
     }
@@ -255,15 +355,56 @@ where
     let mut entries = parse_cli_help(&text);
 
     // Secondary Introspection Bridge: query `carapace <exe> export <chain...> ""`
-    // when primary help parsing yields nothing and carapace-bin is available.
-    if entries.is_empty() && carapace_enabled && !exe.eq_ignore_ascii_case("carapace") {
+    // when primary help parsing yields nothing, or on subcommand chains when `--help`
+    // returned only flags/params and no subcommands or dynamic value candidates.
+    let needs_carapace = carapace_enabled
+        && !exe.eq_ignore_ascii_case("carapace")
+        && (entries.is_empty()
+            || (chain.len() >= 2
+                && !entries.iter().any(|e| {
+                    matches!(
+                        e.kind,
+                        EntryKind::Subcmd
+                            | EntryKind::Arg
+                            | EntryKind::Enum
+                            | EntryKind::Value
+                            | EntryKind::Path
+                    )
+                })));
+    if needs_carapace {
         let mut c_args = Vec::with_capacity(chain.len() + 3);
         c_args.push(exe);
         c_args.push("export");
         c_args.extend_from_slice(chain);
         c_args.push("");
         if let Some(carapace_out) = run_cmd("carapace", &c_args) {
-            entries = parse_carapace_export(&carapace_out);
+            let carapace_entries = parse_carapace_export(&carapace_out);
+            if entries.is_empty() {
+                entries = carapace_entries;
+            } else if !carapace_entries.is_empty() {
+                let mut merged = Vec::with_capacity(entries.len() + carapace_entries.len());
+                let mut seen: HashSet<String> = HashSet::new();
+                let mut extra_flags = Vec::new();
+                for item in carapace_entries {
+                    let key = item.text.to_ascii_lowercase();
+                    if matches!(item.kind, EntryKind::Flag | EntryKind::Param) {
+                        extra_flags.push(item);
+                    } else if seen.insert(key) {
+                        merged.push(item);
+                    }
+                }
+                for item in entries {
+                    if seen.insert(item.text.to_ascii_lowercase()) {
+                        merged.push(item);
+                    }
+                }
+                for item in extra_flags {
+                    if seen.insert(item.text.to_ascii_lowercase()) {
+                        merged.push(item);
+                    }
+                }
+                entries = merged;
+            }
         }
     }
 
@@ -539,6 +680,23 @@ impl CliIntrospector {
         true
     }
 
+    /// Invalidates all cached introspection chains rooted at `exe` so subsequent queries re-run `--help`.
+    pub fn invalidate_command(&mut self, exe: &str) {
+        let root = exe.trim().to_ascii_lowercase();
+        if root.is_empty() {
+            return;
+        }
+        let prefix = format!("{root}::");
+        let before = self.cache.len();
+        self.cache
+            .retain(|k, _| k != &root && !k.starts_with(&prefix));
+        self.pending_keys
+            .retain(|k| k != &root && !k.starts_with(&prefix));
+        if self.cache.len() != before {
+            self.dirty = true;
+        }
+    }
+
     /// Pre-warms the CLI cache in parallel for all installed tools in `PRIORITY_CLI_TOOLS`
     /// using the canonical cache key format. Returns the number of installed priority tools warmed.
     fn warm_priority_tools(&mut self, col1_entries: &[Entry]) -> usize {
@@ -608,6 +766,10 @@ impl Introspect for CliIntrospector {
 
     fn flush(&mut self) -> bool {
         CliIntrospector::flush(self)
+    }
+
+    fn invalidate_command(&mut self, exe: &str) {
+        CliIntrospector::invalidate_command(self, exe)
     }
 }
 
@@ -1060,5 +1222,126 @@ start a working area
         assert!(!recorded.iter().any(
             |(exe, args)| exe == "carapace" && args.first().map(String::as_str) == Some("git")
         ));
+    }
+
+    #[test]
+    fn test_subcommand_merges_carapace_dynamic_values_when_help_has_only_flags() {
+        let mut introspector = CliIntrospector::with_runner_and_carapace(
+            ShellDialect::Posix,
+            None,
+            true,
+            |exe, args| match (exe, args) {
+                ("docker", ["exec", "--help"]) => Some(
+                    "\
+Options:
+  -i, --interactive    Keep STDIN open
+  -t, --tty            Allocate a pseudo-TTY
+"
+                    .to_string(),
+                ),
+                ("carapace", ["docker", "export", "docker", "exec", ""]) => Some(
+                    r#"{
+  "values": [
+    { "value": "web-api", "description": "Running container", "tag": "containers" },
+    { "value": "--detach", "description": "Detached mode", "tag": "flags" }
+  ]
+}"#
+                    .to_string(),
+                ),
+                _ => None,
+            },
+        );
+
+        let _ = introspector.query(&["docker", "exec"]);
+        assert!(introspector.poll_blocking());
+        let entries = introspector.query(&["docker", "exec"]);
+        let texts: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(texts[0], "web-api");
+        assert!(texts.contains(&"--interactive"));
+        assert!(texts.contains(&"--detach"));
+    }
+
+    #[test]
+    fn test_invalidate_command_and_cache_freshness_rejects_stale_records() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_path = env::temp_dir().join(format!(
+            "zpane_test_fresh_cache_{}_{}.json",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let _ = fs::remove_file(&temp_path);
+
+        // 1. Write stale schema_version and mismatched exe_fingerprint records
+        let mut raw_records = HashMap::new();
+        raw_records.insert(
+            "stale_ver".to_string(),
+            CachedChainRecord {
+                schema_version: CLI_CACHE_SCHEMA_VERSION - 1,
+                exe_fingerprint: Some((100, 200)),
+                entries: vec![Entry::new("old", "old", EntryKind::Subcmd, "")],
+            },
+        );
+        raw_records.insert(
+            "upgraded_bin".to_string(),
+            CachedChainRecord {
+                schema_version: CLI_CACHE_SCHEMA_VERSION,
+                exe_fingerprint: Some((100, 200)),
+                entries: vec![Entry::new("old-bin", "old-bin", EntryKind::Subcmd, "")],
+            },
+        );
+        raw_records.insert(
+            "fresh_bin::sub".to_string(),
+            CachedChainRecord {
+                schema_version: CLI_CACHE_SCHEMA_VERSION,
+                exe_fingerprint: Some((555, 999)),
+                entries: vec![Entry::new("ok", "ok", EntryKind::Subcmd, "")],
+            },
+        );
+        fs::write(&temp_path, serde_json::to_vec(&raw_records).unwrap()).unwrap();
+
+        let loaded = load_cli_disk_cache_with_fingerprint(&temp_path, |exe| match exe {
+            "upgraded_bin" => Some((101, 200)),
+            "fresh_bin" => Some((555, 999)),
+            _ => None,
+        });
+        assert!(!loaded.contains_key("stale_ver"));
+        assert!(!loaded.contains_key("upgraded_bin"));
+        assert!(loaded.contains_key("fresh_bin::sub"));
+        let _ = fs::remove_file(&temp_path);
+
+        // 2. invalidate_command drops root and subcommand chains and triggers re-introspection
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        let mut introspector =
+            CliIntrospector::with_runner(ShellDialect::Posix, None, move |exe, args| {
+                calls_ref.fetch_add(1, Ordering::SeqCst);
+                match (exe, args) {
+                    ("cargo", ["--help"]) => {
+                        Some("Commands:\n  build    Compile package\n".to_string())
+                    }
+                    ("cargo", ["build", "--help"]) => {
+                        Some("Options:\n  --release    Release build\n".to_string())
+                    }
+                    ("other", ["--help"]) => Some("Options:\n  --flag    Other\n".to_string()),
+                    _ => None,
+                }
+            });
+
+        let _ = introspector.query(&["cargo"]);
+        let _ = introspector.query(&["cargo", "build"]);
+        let _ = introspector.query(&["other"]);
+        assert!(introspector.poll_blocking());
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        introspector.invalidate_command("cargo");
+        assert!(introspector
+            .query(&["other"])
+            .iter()
+            .any(|e| e.text == "--flag"));
+        assert!(introspector.query(&["cargo"])[0].is_loading());
+        assert!(introspector.query(&["cargo", "build"])[0].is_loading());
+        assert!(introspector.poll_blocking());
+        assert_eq!(calls.load(Ordering::SeqCst), 5);
     }
 }
