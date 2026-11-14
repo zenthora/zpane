@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous Tasks
 
 - *(skills)* Add project agent skills
+- *(release)* Bump version to 0.4.0 and update CHANGELOG.md
+- *(git)* Ignore and untrack .agents
 
 ## [0.3.0] - 2026-11-14
 
