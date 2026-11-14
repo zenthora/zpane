@@ -7,17 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.1] - 2026-11-14
 
+### Performance
+
+- *(session)* Harden shell quoting and optimize hot-path pane syncing
+- *(packaging)* Optimize release profile, deterministic packaging, and CI security
+
 ### Bug Fixes
 
 - *(discovery)* Harden spec, help, introspection cache, and shell catalog parsing
 - *(session)* Harden tokenization, subcommand sliding, parameter matching, and seeding
 - *(ui)* Harden Unicode rendering, CLI parsing, fuzzy scrolling, and init wrappers
 - *(scripts)* Add Python packaging fallback to package-linux.sh
+- *(discovery)* Harden parsing/spawning and optimize cross-distro discovery
+- *(session)* Block BiDi marks and path double-quote/flag bypasses
+- *(ui)* Harden terminal escapes, file/shell paths, and optimize fuzzy rendering
 
 ### Miscellaneous Tasks
 
 - *(git)* Remove migrated .kilo skill
 - *(release)* Bump version to 0.4.1 and update CHANGELOG.md
+- *(release)* Update CHANGELOG.md for 0.4.1
 
 ## [0.4.0] - 2026-11-14
 

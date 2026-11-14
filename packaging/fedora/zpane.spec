@@ -41,7 +41,7 @@ install -Dm0644 "%{_sourcedir}/LICENSE" "%{buildroot}%{_datadir}/licenses/zpane/
 
 %changelog
 * Sat Nov 14 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.4.1-1
-- Release zpane 0.4.1 (discovery, session/model, UI/CLI hardening and bug fixes)
+- Release zpane 0.4.1 (discovery, session/model, UI/CLI/packaging optimization and security hardening)
 
 * Sat Nov 14 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.4.0-1
 - Release zpane 0.4.0 (multi-level subcommand sliding, shell init, cache freshness, inspector overlay)
