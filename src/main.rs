@@ -66,6 +66,8 @@ mod conout {
         }
 
         fn enable_vt(&self) {
+            // SAFETY: `self.handle()` returns the live `CONOUT$` Win32 console HANDLE owned by
+            // `self.file` for the duration of `&self`, and `&mut mode` points to an initialized u32.
             unsafe {
                 let h = self.handle();
                 let mut mode: u32 = 0;
@@ -86,6 +88,9 @@ mod conout {
             while offset < self.utf16_buf.len() {
                 let chunk_len = (self.utf16_buf.len() - offset).min(16384) as u32;
                 let mut written: u32 = 0;
+                // SAFETY: `self.handle()` returns the live `CONOUT$` HANDLE owned by `self.file`,
+                // `utf16_buf[offset..]` holds at least `chunk_len` valid UTF-16 code units, and
+                // `&mut written` points to an initialized stack u32.
                 let ok = unsafe {
                     WriteConsoleW(
                         self.handle(),
@@ -209,7 +214,8 @@ impl ShellInitTarget {
             "bash" => Ok(ShellInitTarget::Bash),
             "fish" => Ok(ShellInitTarget::Fish),
             other => anyhow::bail!(
-                "Unknown shell target '{other}' (expected one of: pwsh, zsh, bash, fish)"
+                "Unknown shell target '{}' (expected one of: pwsh, zsh, bash, fish)",
+                sanitize_error_arg(other)
             ),
         }
     }
@@ -400,72 +406,70 @@ fn parse_context_json(raw: &str) -> anyhow::Result<RuntimeContext> {
 }
 
 fn read_context_file_bounded(path: &str, max_bytes: u64) -> anyhow::Result<String> {
+    let safe_path = sanitize_error_arg(path);
     let meta = fs::metadata(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{safe_path}': {e}"))?;
     if !meta.is_file() {
-        anyhow::bail!("Failed to read context file '{path}': not a regular file");
+        anyhow::bail!("Failed to read context file '{safe_path}': not a regular file");
     }
     if meta.len() > max_bytes {
-        anyhow::bail!("Failed to read context file '{path}': exceeds {max_bytes} byte limit");
+        anyhow::bail!("Failed to read context file '{safe_path}': exceeds {max_bytes} byte limit");
     }
 
     let file = fs::File::open(path)
-        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{safe_path}': {e}"))?;
     let open_meta = file
         .metadata()
-        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{safe_path}': {e}"))?;
     if !open_meta.is_file() {
-        anyhow::bail!("Failed to read context file '{path}': not a regular file");
+        anyhow::bail!("Failed to read context file '{safe_path}': not a regular file");
     }
 
     let mut buf = Vec::with_capacity((open_meta.len() as usize).min(max_bytes as usize));
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)
-        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Failed to read context file '{safe_path}': {e}"))?;
     if buf.len() as u64 > max_bytes {
-        anyhow::bail!("Failed to read context file '{path}': exceeds {max_bytes} byte limit");
+        anyhow::bail!("Failed to read context file '{safe_path}': exceeds {max_bytes} byte limit");
     }
-    String::from_utf8(buf)
-        .map_err(|e| anyhow::anyhow!("Failed to read context file '{path}': invalid UTF-8 ({e})"))
+    String::from_utf8(buf).map_err(|e| {
+        anyhow::anyhow!("Failed to read context file '{safe_path}': invalid UTF-8 ({e})")
+    })
 }
 
 fn ensure_regular_non_symlink_if_exists(path: &Path) -> anyhow::Result<bool> {
+    let safe_path = sanitize_error_arg(&path.to_string_lossy());
     match fs::symlink_metadata(path) {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
-                anyhow::bail!(
-                    "Refusing to access output file through symlink '{}'",
-                    path.display()
-                );
+                anyhow::bail!("Refusing to access output file through symlink '{safe_path}'");
             }
             if !meta.file_type().is_file() {
-                anyhow::bail!("Output path '{}' is not a regular file", path.display());
+                anyhow::bail!("Output path '{safe_path}' is not a regular file");
             }
             Ok(true)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(anyhow::anyhow!(
-            "Failed to inspect output file '{}': {e}",
-            path.display()
+            "Failed to inspect output file '{safe_path}': {e}"
         )),
     }
 }
 
 fn verify_and_secure_out_file(file: &fs::File, path: &Path) -> anyhow::Result<()> {
+    let safe_path = sanitize_error_arg(&path.to_string_lossy());
     if !file
         .metadata()
-        .map_err(|e| anyhow::anyhow!("Failed to inspect output file '{}': {e}", path.display()))?
+        .map_err(|e| anyhow::anyhow!("Failed to inspect output file '{safe_path}': {e}"))?
         .is_file()
     {
-        anyhow::bail!("Output path '{}' is not a regular file", path.display());
+        anyhow::bail!("Output path '{safe_path}' is not a regular file");
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to secure output file '{}': {e}", path.display())
-            })?;
+            .map_err(|e| anyhow::anyhow!("Failed to secure output file '{safe_path}': {e}"))?;
     }
     Ok(())
 }
@@ -586,7 +590,10 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
             return Ok(CliCommand::Help);
         }
         if let Some(extra) = args.get(2) {
-            anyhow::bail!("Unexpected argument '{extra}' for `init`");
+            anyhow::bail!(
+                "Unexpected argument '{}' for `init`",
+                sanitize_error_arg(extra)
+            );
         }
         return Ok(CliCommand::Init(parsed));
     }
@@ -749,7 +756,8 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
             }
             _ => {
                 anyhow::bail!(
-                    "Unknown option '{arg}' (use '--' before positional tokens starting with '-')"
+                    "Unknown option '{}' (use '--' before positional tokens starting with '-')",
+                    sanitize_error_arg(arg)
                 );
             }
         }
@@ -813,6 +821,10 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
 fn sanitize_plain_text(raw: &str, scratch: &mut String) -> String {
     ui::strip_escapes_and_controls_into(raw, scratch);
     scratch.clone()
+}
+
+fn sanitize_error_arg(raw: &str) -> String {
+    sanitize_plain_text(raw, &mut String::new())
 }
 
 fn format_inspect_human(report: &InspectReport) -> String {
@@ -1719,6 +1731,20 @@ mod tests {
             assert!(
                 !err.to_string().trim().is_empty(),
                 "error message should not be empty for {invalid:?}"
+            );
+        }
+
+        for hostile_cli in [
+            vec!["--bogus\x1b[31mflag\u{202e}"],
+            vec!["init", "bad\x1b]0;pwn\x07target"],
+            vec!["init", "pwsh", "extra\x1b[2J\u{202e}arg"],
+        ] {
+            let err = parse_cli_args(&argv(&hostile_cli))
+                .expect_err(&format!("expected error for hostile args {hostile_cli:?}"));
+            let msg = err.to_string();
+            assert!(
+                !msg.contains('\x1b') && !msg.contains('\x07') && !msg.contains('\u{202e}'),
+                "CLI error leaked control/BiDi chars for {hostile_cli:?}: {msg:?}"
             );
         }
     }

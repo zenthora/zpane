@@ -131,9 +131,11 @@ fn is_safe_exe_token(exe: &str) -> bool {
     if has_shell_metachar_or_control(trimmed) || trimmed.contains("..") {
         return false;
     }
-    if trimmed.starts_with("\\\\?\\UNC\\")
-        || trimmed.starts_with("//")
-        || (trimmed.starts_with("\\\\") && !trimmed.starts_with("\\\\?\\"))
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\")
+        || lower.starts_with("\\??\\")
+        || lower.starts_with("//")
+        || lower.starts_with("\\\\")
     {
         return false;
     }
@@ -144,7 +146,9 @@ fn is_safe_exe_token(exe: &str) -> bool {
                 || matches!(c, Component::Prefix(p) if matches!(
                     p.kind(),
                     std::path::Prefix::UNC(..)
+                        | std::path::Prefix::Verbatim(..)
                         | std::path::Prefix::VerbatimUNC(..)
+                        | std::path::Prefix::VerbatimDisk(..)
                         | std::path::Prefix::DeviceNS(..)
                 ))
         });
@@ -2513,6 +2517,9 @@ Options:
             vec!["C:evil.exe".to_string()],
             vec!["/usr/../bin/evil".to_string()],
             vec!["\\\\attacker\\share\\evil.exe".to_string()],
+            vec!["\\\\?\\unc\\attacker\\share\\evil.exe".to_string()],
+            vec!["\\\\?\\GLOBALROOT\\Device\\HarddiskVolume1\\evil.exe".to_string()],
+            vec!["\\??\\C:\\evil.exe".to_string()],
             vec!["//attacker/share/evil".to_string()],
             vec!["git".to_string(), "../sub".to_string()],
             vec!["git;id".to_string()],
