@@ -6,9 +6,21 @@ authors = ["zenthora <105382125+zenthora@users.noreply.github.com>"]
 description = "Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell, Linux, and Termux"
 readme = "README.md"
 license = "MIT"
+homepage = "https://github.com/zenthora/zpane"
 repository = "https://github.com/zenthora/zpane"
 keywords = ["powershell", "tui", "miller-columns", "cli", "autocomplete"]
 categories = ["command-line-utilities", "command-line-interface"]
+exclude = [
+    ".agents/",
+    ".github/",
+    "docs/agents/",
+    "packaging/",
+    "scripts/",
+    "skills-lock.json",
+    "prek.toml",
+    "cliff.toml",
+    "AGENTS.md",
+]
 
 [dependencies]
 anyhow = "1.0"

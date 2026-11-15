@@ -1,8 +1,15 @@
 # `zpane`
 
+[![Release](https://img.shields.io/github/v/release/zenthora/zpane)](https://github.com/zenthora/zpane/releases)
+[![Release Packages](https://github.com/zenthora/zpane/actions/workflows/release.yml/badge.svg)](https://github.com/zenthora/zpane/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/github/license/zenthora/zpane)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20Linux%20%7C%20Termux-7aa2f7)
+
 **Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell, Linux, and Termux.**
 
 `zpane` brings the spatial orientation of 3-column Miller file managers (`yazi`, `ranger`, `lf`) to interactive shell command construction. Instead of cycling through flat 1D tab-completion dropdowns or opening slow GUI dialogs (`Show-Command`), `zpane` lets you visually traverse commands, subcommands, PowerShell parameter sets, enum constraints, and environment variables in a zero-flicker terminal overlay—injecting the assembled command straight back into your active shell prompt buffer.
+
+![zpane 3-pane Miller column explorer](docs/assets/demo.svg)
 
 ```text
 ╭ 1. Command / Scope (4921) ─────────┬ 2. Params [Set: Id] (19) ──────────────────┬ 3. Flags / Values / Info (11) ────────────────────╮
