@@ -2,5 +2,6 @@
 /dist
 /.scratch/
 /.agents/
+/skills-lock.json
 *.log
 session-*.md
