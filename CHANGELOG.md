@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-11-15
+
+### Documentation
+
+- *(readme)* Add animated SVG hero demo, badges, and crates.io package metadata
+- *(readme)* Add crates.io badge and cargo install instructions
+
+### Miscellaneous Tasks
+
+- Remove skills-lock.json and use GitHub noreply email
+
 ## [0.5.0] - 2026-11-15
 
 ### Features
@@ -20,6 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - *(security)* Sanitize CLI error output and document Win32 safety invariants
+
+### Miscellaneous Tasks
+
+- *(release)* Bump version to 0.5.0 and update CHANGELOG.md
 
 ## [0.4.1] - 2026-11-14
 

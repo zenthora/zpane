@@ -1,6 +1,6 @@
 [package]
 name = "zpane"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 authors = ["zenthora <105382125+zenthora@users.noreply.github.com>"]
 description = "Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer for PowerShell, Linux, and Termux"
