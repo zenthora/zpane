@@ -1,5 +1,6 @@
 # `zpane`
 
+[![Crates.io](https://img.shields.io/crates/v/zpane)](https://crates.io/crates/zpane)
 [![Release](https://img.shields.io/github/v/release/zenthora/zpane)](https://github.com/zenthora/zpane/releases)
 [![Release Packages](https://github.com/zenthora/zpane/actions/workflows/release.yml/badge.svg)](https://github.com/zenthora/zpane/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/github/license/zenthora/zpane)](LICENSE)
@@ -70,11 +71,15 @@ See [`docs/prior-art-and-alternatives.md`](docs/prior-art-and-alternatives.md) f
 
 ## Installation
 
-### Windows (Cargo)
+### Cargo (`crates.io` / Source)
 
 ```powershell
-cargo install --path .
+# Install published release from crates.io
+cargo install zpane
 zpane --warm
+
+# Or build and install from a local checkout
+cargo install --path .
 ```
 
 ### Arch Linux (`pacman` / `makepkg`)
