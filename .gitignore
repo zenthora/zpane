@@ -1,7 +1,54 @@
-/target
-/dist
-/.scratch/
+# Rust & build outputs
+/target/
+/dist/
+*.pdb
+
+# Coverage & profiling
+*.profraw
+*.profdata
+lcov.info
+
+# Packaging build artifacts
+*.deb
+*.rpm
+*.pkg.tar.*
+/packaging/arch/pkg/
+/packaging/arch/src/
+
+# Python caches (scripts/)
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+
+# AI & agent tooling
 /.agents/
+/.claude/
+/.cursor/
+/.gemini/
+/.kilo/
+/.windsurf/
+/AGENTS.md
+/CLAUDE.md
+/GEMINI.md
+/docs/agents/
 /skills-lock.json
-*.log
+/.mcp.json
+.aider*
 session-*.md
+
+# Scratch & logs
+/.scratch/
+*.log
+
+# Editors & IDEs
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+
+# OS metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
