@@ -2,7 +2,7 @@ TERMUX_PKG_HOMEPAGE=https://github.com/zenthora/zpane
 TERMUX_PKG_DESCRIPTION="3-pane Miller column command, subcommand, parameter & variable explorer"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="@zenthora"
-TERMUX_PKG_VERSION="0.4.1"
+TERMUX_PKG_VERSION="0.5.0"
 TERMUX_PKG_SRCURL="https://github.com/zenthora/zpane/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz"
 # Security: replace SKIP_CHECKSUM with the release tarball SHA-256 digest when submitting to termux-packages.
 TERMUX_PKG_SHA256=SKIP_CHECKSUM

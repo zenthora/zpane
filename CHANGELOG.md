@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-11-15
+
+### Features
+
+- *(cli)* Add inspect command and --json machine output
+
+### Performance
+
+- *(ui)* Optimize fuzzy matching and frame rendering without unwraps
+- *(session)* Avoid subtree cloning on navigation and catalog key allocs
+- *(discovery)* Optimize help and spec parsing without unwraps
+
+### Bug Fixes
+
+- *(security)* Sanitize CLI error output and document Win32 safety invariants
+
 ## [0.4.1] - 2026-11-14
 
 ### Performance
@@ -26,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(git)* Remove migrated .kilo skill
 - *(release)* Bump version to 0.4.1 and update CHANGELOG.md
+- *(release)* Update CHANGELOG.md for 0.4.1
 - *(release)* Update CHANGELOG.md for 0.4.1
 
 ## [0.4.0] - 2026-11-14
