@@ -106,6 +106,31 @@ struct Pane2CacheState {
     subcmd_chain: Vec<String>,
 }
 
+/// Cache-key equality for Pane 2: only the same Pane 1 source index and
+/// subcommand depth can reuse the cached entries.
+fn pane2_cache_key_matches(
+    prev: &Pane2CacheState,
+    cur_p1_idx: Option<usize>,
+    cur_subcmd_chain: &[String],
+) -> bool {
+    prev.p1_entry_idx == cur_p1_idx && prev.subcmd_chain == cur_subcmd_chain
+}
+
+/// Navigation-context equality for Pane 2: the selected Pane 1 entry identity
+/// and subcommand depth are unchanged, even when a catalog refresh shifted the
+/// entry's source index. This decides whether the user's Pane 2 cursor can be
+/// restored after entries are recomputed.
+fn pane2_navigation_context_matches(
+    prev_p1_identity: Option<&(String, EntryKind)>,
+    cur_p1_identity: Option<&(String, EntryKind)>,
+    prev_subcmd_chain: &[String],
+    cur_subcmd_chain: &[String],
+) -> bool {
+    prev_p1_identity == cur_p1_identity
+        && prev_p1_identity.is_some()
+        && prev_subcmd_chain == cur_subcmd_chain
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pane3CacheState {
     p1_entry_idx: Option<usize>,
@@ -1318,9 +1343,12 @@ fn resolve_pane3_token(
 pub struct MillerSession<I: Introspect = CliIntrospector> {
     panes: [PaneList; 3],
     pane2_cache_state: Option<Pane2CacheState>,
+    /// Pane 2 entries need recomputation even though its navigation context
+    /// (Pane 1 entry and subcommand depth) is unchanged.
+    pane2_cache_stale: bool,
     pane3_cache_state: Option<Pane3CacheState>,
     pane2_tokens_rev: u64,
-    last_p1_text: Option<String>,
+    last_p1_identity: Option<(String, EntryKind)>,
     last_p2_text: Option<String>,
     skip_child_filter_clear_once: bool,
     introspector: I,
@@ -1357,9 +1385,10 @@ impl<I: Introspect> MillerSession<I> {
         let mut session = Self {
             panes: [pane1, PaneList::default(), PaneList::default()],
             pane2_cache_state: None,
+            pane2_cache_stale: false,
             pane3_cache_state: None,
             pane2_tokens_rev: u64::MAX,
-            last_p1_text: None,
+            last_p1_identity: None,
             last_p2_text: None,
             skip_child_filter_clear_once: false,
             introspector,
@@ -1450,7 +1479,7 @@ impl<I: Introspect> MillerSession<I> {
         }
         self.pane2_cache_state = None;
         self.pane3_cache_state = None;
-        self.last_p1_text = None;
+        self.last_p1_identity = None;
         self.last_p2_text = None;
         self.sync_panes();
         self
@@ -1485,11 +1514,13 @@ impl<I: Introspect> MillerSession<I> {
 
     fn apply_catalog_update(&mut self, mut entries: Vec<Entry>) {
         sanitize_catalog_entries(&mut entries, self.dialect, &self.runtime_ctx);
-        let prev_p1_text = self.selected_entry(Pane::First).map(|e| e.text.clone());
+        let prev_p1 = self
+            .selected_entry(Pane::First)
+            .map(|e| (e.text.clone(), e.kind));
         self.panes[0].set_entries(entries);
-        let matched_prev = prev_p1_text
-            .as_deref()
-            .is_some_and(|txt| self.panes[0].select_first_matching(|e| e.text == txt));
+        let matched_prev = prev_p1.as_ref().is_some_and(|(txt, kind)| {
+            self.panes[0].select_first_matching(|e| e.text == *txt && e.kind == *kind)
+        });
         if !matched_prev {
             let matched_seed = self.cmd.tokens().first().is_some_and(|first_tok| {
                 self.panes[0].select_first_matching(|e| e.text.eq_ignore_ascii_case(first_tok))
@@ -1498,22 +1529,28 @@ impl<I: Introspect> MillerSession<I> {
                 self.panes[0].reset_cursor();
             }
         }
-        let next_p1_text = self.selected_entry(Pane::First).map(|e| e.text.clone());
-        if prev_p1_text == next_p1_text && prev_p1_text.is_some() {
+        let next_p1 = self
+            .selected_entry(Pane::First)
+            .map(|e| (e.text.clone(), e.kind));
+        if prev_p1 == next_p1 && prev_p1.is_some() {
             self.skip_child_filter_clear_once = true;
         } else {
             self.cmd.subcmd_chain.clear();
             self.cmd.subcmd_token_indices.clear();
             self.skip_child_filter_clear_once = false;
         }
-        self.pane2_cache_state = None;
+        // The Pane 1 selection identity drives whether Pane 2's navigation
+        // context changed. Mark the cached entries stale instead of dropping
+        // `pane2_cache_state`: the cache is also the record of that context,
+        // and losing it made every live refresh reset the Pane 2 cursor.
+        self.pane2_cache_stale = true;
         self.pane3_cache_state = None;
     }
 
     fn invalidate_loading_panes(&mut self) {
         let pane2_entries = self.panes[1].entries();
         if pane2_entries.is_empty() || pane2_entries.iter().any(Entry::is_loading) {
-            self.pane2_cache_state = None;
+            self.pane2_cache_stale = true;
         }
         // Only refresh Pane 3 when it is still waiting on background data.
         // An unrelated cache completion must not reset the user's Pane 3 cursor.
@@ -2035,12 +2072,15 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn sync_pane2(&mut self, cur_p1_idx: Option<usize>) -> Option<usize> {
+        // A stale refresh recomputes Pane 2 entries while keeping the cached
+        // navigation context so the user's cursor can be restored by text.
+        let force_refresh = std::mem::take(&mut self.pane2_cache_stale);
         let cur_p1 = cur_p1_idx.map(|idx| &self.panes[0].entries()[idx]);
         let mut p1_or_depth_changed = true;
         let mut tokens_changed_only = false;
 
         if let Some(prev) = self.pane2_cache_state.as_ref() {
-            if prev.p1_entry_idx == cur_p1_idx && prev.subcmd_chain == self.cmd.subcmd_chain {
+            if !force_refresh && pane2_cache_key_matches(prev, cur_p1_idx, &self.cmd.subcmd_chain) {
                 p1_or_depth_changed = false;
                 if self.pane2_tokens_rev == self.cmd.tokens_rev {
                     tokens_changed_only = false;
@@ -2075,20 +2115,20 @@ impl<I: Introspect> MillerSession<I> {
                 subcmd_chain: self.cmd.subcmd_chain.clone(),
             };
 
-            if self.pane2_cache_state.as_ref() != Some(&next_state) {
-                let p1_changed = {
-                    let cur_p1_str = cur_p1.map(|e| e.text.as_str());
-                    let changed = self.last_p1_text.as_deref() != cur_p1_str;
-                    if changed {
-                        self.last_p1_text = cur_p1_str.map(str::to_string);
-                    }
-                    changed
-                };
-                let same_p1_depth = !p1_changed
-                    && self.pane2_cache_state.as_ref().is_some_and(|prev| {
-                        prev.p1_entry_idx == cur_p1_idx
-                            && prev.subcmd_chain == self.cmd.subcmd_chain
-                    });
+            if force_refresh || self.pane2_cache_state.as_ref() != Some(&next_state) {
+                let cur_p1_identity = cur_p1.map(|e| (e.text.clone(), e.kind));
+                let same_p1_depth = self.pane2_cache_state.as_ref().is_some_and(|prev| {
+                    pane2_navigation_context_matches(
+                        self.last_p1_identity.as_ref(),
+                        cur_p1_identity.as_ref(),
+                        &prev.subcmd_chain,
+                        &self.cmd.subcmd_chain,
+                    )
+                });
+                let p1_changed = self.last_p1_identity != cur_p1_identity;
+                if p1_changed {
+                    self.last_p1_identity = cur_p1_identity;
+                }
                 let prev_p2_text = if same_p1_depth {
                     self.selected_entry(Pane::Second).map(|it| it.text.clone())
                 } else {
@@ -4531,5 +4571,176 @@ mod tests {
             sess.apply(UserAction::Confirm),
             SessionOutcome::Confirmed("mycli --target ok.txt clean".to_string())
         );
+    }
+
+    fn ps_catalog_with_duplicate_git(with_cmdlets: bool) -> Vec<Entry> {
+        // Mirrors the PowerShell catalog: shell history first, then scope roots,
+        // then the PATH executable that shares its text with a history entry.
+        let mut catalog = vec![
+            Entry::new("git", "git", EntryKind::History, "Recent shell history"),
+            Entry::scope_root("$env:", "$env:Variables", EntryKind::Env, ""),
+            Entry::scope_root("$", "$global:Variables", EntryKind::Var, ""),
+            Entry::scope_root("./", "./ Current Dir", EntryKind::Path, ""),
+            Entry::new("git", "git", EntryKind::Cli, "Tool"),
+            Entry::new("cargo", "cargo", EntryKind::Cli, "Tool"),
+        ];
+        if with_cmdlets {
+            for i in 0..50 {
+                let name = format!("Invoke-Task{i:03}");
+                catalog.push(Entry::new(&name, &name, EntryKind::Cmdlet, "Task"));
+            }
+        }
+        catalog
+    }
+
+    #[test]
+    fn test_catalog_refresh_keeps_duplicate_text_selection_in_powershell() {
+        let fake = FakeIntrospector::empty();
+        let mut sess = MillerSession::new(
+            ps_catalog_with_duplicate_git(false),
+            fake.clone(),
+            "",
+            Viewport::new(100, 24),
+            ShellDialect::PowerShell,
+        );
+
+        // Walk down to the PATH `git` entry. The history `git` at index 0 shares
+        // its text, so a refresh must not reselect the wrong duplicate.
+        for _ in 0..4 {
+            sess.apply(UserAction::MoveDown);
+        }
+        let selected = sess.view().panes[0].selected().cloned().expect("selection");
+        assert_eq!(selected.text, "git");
+        assert_eq!(selected.kind, EntryKind::Cli);
+        assert_eq!(sess.view().panes[0].sel_idx(), 4);
+
+        // The first-run PowerShell metadata sync (or Ctrl+R "Sync PS") swaps the
+        // catalog in place while the user is browsing.
+        fake.push_catalog_reload(ps_catalog_with_duplicate_git(true));
+        assert!(sess.poll_discovery());
+
+        let view = sess.view();
+        let selected = view.panes[0].selected().cloned().expect("selection");
+        assert_eq!(
+            selected.kind,
+            EntryKind::Cli,
+            "refresh jumped from the PATH `git` to the history `git` at the top"
+        );
+        assert_eq!(selected.text, "git");
+        assert_eq!(
+            view.panes[0].sel_idx(),
+            4,
+            "refresh moved the marker to the top"
+        );
+    }
+
+    fn git_chain_fake() -> FakeIntrospector {
+        FakeIntrospector::with_chains([
+            (
+                "git",
+                vec![
+                    Entry::new("clone", "clone", EntryKind::Subcmd, "Clone"),
+                    Entry::new("commit", "commit", EntryKind::Subcmd, "Commit"),
+                    Entry::new("rebase", "rebase", EntryKind::Subcmd, "Rebase"),
+                ],
+            ),
+            (
+                "git::commit",
+                vec![
+                    Entry::new("--all", "--all", EntryKind::Flag, "All"),
+                    Entry::new("--message", "--message", EntryKind::Param, "Msg"),
+                    Entry::new("--amend", "--amend", EntryKind::Flag, "Amend"),
+                ],
+            ),
+        ])
+    }
+
+    fn git_session(fake: &FakeIntrospector) -> MillerSession<FakeIntrospector> {
+        MillerSession::new(
+            vec![Entry::new("git", "git", EntryKind::Cli, "Git VCS")],
+            fake.clone(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+    }
+
+    #[test]
+    fn test_pane3_background_load_preserves_pane2_selection() {
+        let fake = git_chain_fake();
+        let mut session = git_session(&fake);
+
+        // Pane 2 starts as a loading placeholder; deliver the subcommands.
+        fake.complete_next();
+        assert!(session.poll_discovery());
+
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::MoveDown); // commit
+        assert_eq!(
+            session.view().panes[1].selected().map(|e| e.text.as_str()),
+            Some("commit")
+        );
+
+        // Selecting `commit` starts a Pane 3 introspection. Its completion must
+        // not move the Pane 2 marker back to the first subcommand.
+        assert!(session.view().panes[2]
+            .entries()
+            .iter()
+            .any(Entry::is_loading));
+        fake.complete_next();
+        assert!(session.poll_discovery());
+
+        let view = session.view();
+        assert_eq!(
+            view.panes[1].selected().map(|e| e.text.as_str()),
+            Some("commit"),
+            "Pane 3 load reset the Pane 2 selection"
+        );
+        assert_eq!(view.panes[1].sel_idx(), 1);
+    }
+
+    #[test]
+    fn test_catalog_reload_preserves_pane2_selection_when_command_unchanged() {
+        let fake = git_chain_fake();
+        let mut session = git_session(&fake);
+
+        fake.complete_next();
+        assert!(session.poll_discovery());
+
+        session.apply(UserAction::StepRight);
+        session.apply(UserAction::MoveDown);
+        session.apply(UserAction::MoveDown); // rebase
+        assert_eq!(
+            session.view().panes[1].selected().map(|e| e.text.as_str()),
+            Some("rebase")
+        );
+
+        // Background metadata sync replaces the command catalog while the same
+        // command stays selected in Pane 1. Cmdlets are inserted before it, so
+        // its source index shifts.
+        fake.push_catalog_reload(vec![
+            Entry::new("Invoke-One", "Invoke-One", EntryKind::Cmdlet, "Cmdlet"),
+            Entry::new("Invoke-Two", "Invoke-Two", EntryKind::Cmdlet, "Cmdlet"),
+            Entry::new("git", "git", EntryKind::Cli, "Git VCS"),
+            Entry::new("cargo", "cargo", EntryKind::Cli, "Cargo"),
+        ]);
+        assert!(session.poll_discovery());
+
+        let view = session.view();
+        assert_eq!(
+            view.panes[0].selected().map(|e| e.text.as_str()),
+            Some("git")
+        );
+        assert_eq!(
+            view.panes[0].sel_idx(),
+            2,
+            "catalog reload should re-find `git`"
+        );
+        assert_eq!(
+            view.panes[1].selected().map(|e| e.text.as_str()),
+            Some("rebase"),
+            "catalog reload reset the Pane 2 selection"
+        );
+        assert_eq!(view.panes[1].sel_idx(), 2);
     }
 }
