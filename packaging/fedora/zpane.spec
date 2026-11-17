@@ -1,5 +1,5 @@
 Name:           zpane
-Version:        0.5.1
+Version:        0.5.2
 Release:        1%{?dist}
 Summary:        3-pane Miller column command, subcommand, parameter & variable explorer
 License:        MIT
@@ -40,6 +40,9 @@ install -Dm0644 "%{_sourcedir}/LICENSE" "%{buildroot}%{_datadir}/licenses/zpane/
 %license %attr(0644,root,root) %{_datadir}/licenses/zpane/LICENSE
 
 %changelog
+* Tue Nov 17 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.5.2-1
+- Release zpane 0.5.2 (preserve Pane 2 selection during background catalog refresh)
+
 * Sun Nov 15 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.5.1-1
 - Release zpane 0.5.1 (README crates.io installation instructions and maintainer metadata cleanup)
 

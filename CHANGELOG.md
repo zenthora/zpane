@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] - 2026-11-17
+
+### Bug Fixes
+
+- *(session)* Preserve pane 2 selection across catalog refresh
+
+### Miscellaneous Tasks
+
+- *(git)* Expand .gitignore and untrack AGENTS.md and docs/agents
+
 ## [0.5.1] - 2026-11-15
 
 ### Documentation
@@ -15,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous Tasks
 
 - Remove skills-lock.json and use GitHub noreply email
+- *(release)* Bump version to 0.5.1 and update CHANGELOG.md
 
 ## [0.5.0] - 2026-11-15
 

@@ -88,7 +88,7 @@ Install the prebuilt `.pkg.tar.zst` release package or build from [`packaging/ar
 
 ```bash
 # Install release package directly
-sudo pacman -U dist/zpane-0.5.1-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/zpane-0.5.2-1-x86_64.pkg.tar.zst
 
 # Or build from PKGBUILD
 cd packaging/arch && makepkg -si
@@ -97,7 +97,7 @@ cd packaging/arch && makepkg -si
 ### Debian / Ubuntu (`.deb`)
 
 ```bash
-sudo dpkg -i dist/zpane_0.5.1-1_amd64.deb
+sudo dpkg -i dist/zpane_0.5.2-1_amd64.deb
 ```
 
 ### Fedora / RHEL / openSUSE (`.rpm`)
@@ -105,9 +105,9 @@ sudo dpkg -i dist/zpane_0.5.1-1_amd64.deb
 Install the prebuilt `.rpm` package via `dnf` / `rpm` or build from [`packaging/fedora/zpane.spec`](packaging/fedora/zpane.spec):
 
 ```bash
-sudo dnf install ./dist/zpane-0.5.1-1.x86_64.rpm
+sudo dnf install ./dist/zpane-0.5.2-1.x86_64.rpm
 # or
-sudo rpm -Uvh dist/zpane-0.5.1-1.x86_64.rpm
+sudo rpm -Uvh dist/zpane-0.5.2-1.x86_64.rpm
 ```
 
 ### Android Termux (`aarch64`)
@@ -115,7 +115,7 @@ sudo rpm -Uvh dist/zpane-0.5.1-1.x86_64.rpm
 Install the Termux `.deb` package (built with the `/data/data/com.termux/files/usr` prefix) or see [`packaging/termux/build.sh`](packaging/termux/build.sh):
 
 ```bash
-dpkg -i zpane_0.5.1_aarch64.deb
+dpkg -i zpane_0.5.2_aarch64.deb
 zpane --warm
 ```
 
