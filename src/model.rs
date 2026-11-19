@@ -1,5 +1,6 @@
 use crate::discovery::ShellDialect;
-use crate::sanitize::{has_disallowed_control, is_disallowed_control};
+use crate::sanitize::has_disallowed_control;
+use crate::shell::quote_literal_for_dialect;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -103,104 +104,6 @@ pub struct RuntimeContext {
     /// Recent shell session commands (newest first) surfaced at the top of Pane 1.
     #[serde(default)]
     pub history: Vec<String>,
-}
-
-#[inline]
-pub(crate) fn is_safe_unquoted_char(ch: char, allow_ps_backslash: bool) -> bool {
-    if ch.is_ascii() {
-        matches!(
-            ch,
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' | '/' | '+' | ':' | '='
-        ) || (allow_ps_backslash && ch == '\\')
-    } else {
-        !ch.is_whitespace()
-            && !is_disallowed_control(ch)
-            && !matches!(
-                ch,
-                '\u{00AB}'
-                    | '\u{00BB}'
-                    | '\u{2013}'..='\u{2015}'
-                    | '\u{2018}'..='\u{201F}'
-                    | '\u{2039}'
-                    | '\u{203A}'
-            )
-    }
-}
-
-#[inline]
-pub(crate) fn is_safe_unquoted_token(s: &str, dialect: Option<ShellDialect>) -> bool {
-    if s.is_empty() || s.starts_with('=') {
-        return false;
-    }
-    let allow_ps_backslash = dialect == Some(ShellDialect::PowerShell);
-    s.chars()
-        .all(|ch| is_safe_unquoted_char(ch, allow_ps_backslash))
-}
-
-#[inline]
-pub(crate) fn is_benign_double_quotable(s: &str, dialect: Option<ShellDialect>) -> bool {
-    let allow_ps_backslash = dialect == Some(ShellDialect::PowerShell);
-    s.chars().all(|ch| {
-        ch == '"'
-            || (ch.is_whitespace() && !is_disallowed_control(ch))
-            || is_safe_unquoted_char(ch, allow_ps_backslash)
-    })
-}
-
-pub(crate) fn quote_single_for_dialect(raw: &str, dialect: Option<ShellDialect>) -> String {
-    let mut out = String::with_capacity(raw.len() + 4);
-    out.push('\'');
-    match dialect {
-        Some(ShellDialect::PowerShell) => {
-            for ch in raw.chars() {
-                if ch == '\'' {
-                    out.push_str("''");
-                } else {
-                    out.push(ch);
-                }
-            }
-        }
-        Some(ShellDialect::Fish) => {
-            for ch in raw.chars() {
-                match ch {
-                    '\\' => out.push_str("\\\\"),
-                    '\'' => out.push_str("\\'"),
-                    _ => out.push(ch),
-                }
-            }
-        }
-        Some(ShellDialect::Posix) | None => {
-            for ch in raw.chars() {
-                if ch == '\'' {
-                    out.push_str("'\\''");
-                } else {
-                    out.push(ch);
-                }
-            }
-        }
-    }
-    out.push('\'');
-    out
-}
-
-pub(crate) fn quote_literal_for_dialect(
-    raw: &str,
-    dialect: Option<ShellDialect>,
-    allow_double_for_spaces_only: bool,
-) -> String {
-    if is_safe_unquoted_token(raw, dialect) {
-        return raw.to_string();
-    }
-    if allow_double_for_spaces_only
-        && !raw.contains('"')
-        && !raw.contains('\\')
-        && raw.chars().all(|ch| {
-            (ch.is_whitespace() && !is_disallowed_control(ch)) || is_safe_unquoted_char(ch, false)
-        })
-    {
-        return format!("\"{raw}\"");
-    }
-    quote_single_for_dialect(raw, dialect)
 }
 
 #[inline]

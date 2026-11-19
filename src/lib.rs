@@ -6,4 +6,5 @@ pub mod fuzzy;
 pub mod model;
 pub mod sanitize;
 pub mod session;
+pub mod shell;
 pub mod ui;

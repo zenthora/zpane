@@ -1,9 +1,9 @@
 use super::catalog::{
-    cache_dir, collect_path_dirs_with_prefix, hide_window, load_catalog, ps_metadata_path,
-    read_bounded_bytes, sync_powershell_metadata, write_secure_file, ShellDialect,
-    PRIORITY_CLI_TOOLS,
+    cache_dir, collect_path_dirs_with_prefix, hide_window, load_catalog, read_bounded_bytes,
+    write_secure_file, ShellDialect, PRIORITY_CLI_TOOLS,
 };
 use super::help_parser::parse_cli_help;
+use super::powershell::{ps_metadata_path, sync_powershell_metadata};
 use crate::model::{Entry, EntryKind, RuntimeContext};
 use crate::sanitize::{
     contains_ignore_ascii_case, is_unsafe_display_char, sanitize_multiline_desc,

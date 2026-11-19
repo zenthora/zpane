@@ -1,11 +1,16 @@
 use crate::discovery::{CliIntrospector, Introspect, ShellDialect};
 use crate::fuzzy::PaneList;
 use crate::model::{
-    is_benign_double_quotable, is_safe_unquoted_char, is_safe_unquoted_token,
-    is_safe_variable_token, quote_literal_for_dialect, quote_single_for_dialect,
-    sanitize_variable_token, Entry, EntryKind, Pane, RuntimeContext,
+    is_safe_variable_token, sanitize_variable_token, Entry, EntryKind, Pane, RuntimeContext,
 };
 use crate::sanitize::{has_disallowed_control, is_disallowed_control, strip_disallowed_controls};
+use crate::shell::{
+    format_custom_value_token, is_safe_unquoted_char, is_safe_unquoted_token,
+    is_valid_single_quoted, quote_literal_for_dialect, sanitize_initial_buffer,
+    sanitize_literal_value_text, split_pipeline_prefix_for_dialect,
+    tokenize_shell_words_for_dialect,
+};
+pub use crate::shell::{split_pipeline_prefix, tokenize_shell_words};
 use crate::ui::{render_frame, RenderState, Viewport};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::borrow::Cow;
@@ -140,194 +145,6 @@ struct Pane3CacheState {
 }
 
 type CatalogLoader = Box<dyn FnMut(ShellDialect) -> Vec<Entry>>;
-
-/// Splits a seeded shell command buffer at the last top-level unquoted pipeline/chain
-/// separator (`||`, `&&`, `|`, `;`), returning `(pipeline_prefix, active_segment)`.
-pub fn split_pipeline_prefix(input: &str) -> (Option<String>, &str) {
-    split_pipeline_prefix_impl(input, None)
-}
-
-fn split_pipeline_prefix_for_dialect(input: &str, dialect: ShellDialect) -> (Option<String>, &str) {
-    split_pipeline_prefix_impl(input, Some(dialect))
-}
-
-fn split_pipeline_prefix_impl(
-    input: &str,
-    dialect: Option<ShellDialect>,
-) -> (Option<String>, &str) {
-    let bytes = input.as_bytes();
-    let ps_mode = dialect.is_some_and(ShellDialect::is_powershell);
-    let fish_mode = dialect == Some(ShellDialect::Fish);
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut paren_depth = 0usize;
-    let mut brace_depth = 0usize;
-    let mut last_sep_end: Option<usize> = None;
-    let mut i = 0;
-
-    while let Some(ch) = input.get(i..).and_then(|rest| rest.chars().next()) {
-        let ch_len = ch.len_utf8();
-        if escaped {
-            escaped = false;
-            i += ch_len;
-            continue;
-        }
-        match ch {
-            '`' if ps_mode && !in_single => escaped = true,
-            '\\' if !ps_mode && !in_single && (in_double || dialect.is_some()) => escaped = true,
-            '\\' if fish_mode && in_single => escaped = true,
-            '"' if !in_single => in_double = !in_double,
-            '\'' if !in_double => in_single = !in_single,
-            '(' if !in_single && !in_double => paren_depth += 1,
-            ')' if !in_single && !in_double => paren_depth = paren_depth.saturating_sub(1),
-            '{' if !in_single && !in_double => brace_depth += 1,
-            '}' if !in_single && !in_double => brace_depth = brace_depth.saturating_sub(1),
-            '|' if !in_single && !in_double && paren_depth == 0 && brace_depth == 0 => {
-                if bytes.get(i + 1) == Some(&b'|') || (!ps_mode && bytes.get(i + 1) == Some(&b'&'))
-                {
-                    last_sep_end = Some(i + 2);
-                    i += 2;
-                    continue;
-                } else {
-                    last_sep_end = Some(i + 1);
-                }
-            }
-            '&' if !in_single
-                && !in_double
-                && paren_depth == 0
-                && brace_depth == 0
-                && bytes.get(i + 1) == Some(&b'&') =>
-            {
-                last_sep_end = Some(i + 2);
-                i += 2;
-                continue;
-            }
-            ';' if !in_single && !in_double && paren_depth == 0 && brace_depth == 0 => {
-                last_sep_end = Some(i + 1);
-            }
-            _ => {}
-        }
-        i += ch_len;
-    }
-
-    if let Some(sep_end) = last_sep_end {
-        let prefix = input[..sep_end].trim();
-        let tail = input[sep_end..].trim();
-        if prefix.is_empty() {
-            (None, tail)
-        } else {
-            (Some(prefix.to_string()), tail)
-        }
-    } else {
-        (None, input.trim())
-    }
-}
-
-/// Tokenizes a single shell command segment on unquoted whitespace while keeping quoted
-/// multi-word arguments intact as single tokens.
-#[cfg(test)]
-pub fn tokenize_shell_words(segment: &str) -> Vec<String> {
-    tokenize_shell_words_impl(segment, None)
-}
-
-fn tokenize_shell_words_for_dialect(segment: &str, dialect: ShellDialect) -> Vec<String> {
-    tokenize_shell_words_impl(segment, Some(dialect))
-}
-
-fn tokenize_shell_words_impl(segment: &str, dialect: Option<ShellDialect>) -> Vec<String> {
-    let ps_mode = dialect.is_some_and(ShellDialect::is_powershell);
-    let fish_mode = dialect == Some(ShellDialect::Fish);
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-
-    for ch in segment.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '`' if ps_mode && !in_single => {
-                current.push(ch);
-                escaped = true;
-            }
-            '\\' if !ps_mode && !in_single && (in_double || dialect.is_some()) => {
-                current.push(ch);
-                escaped = true;
-            }
-            '\\' if fish_mode && in_single => {
-                current.push(ch);
-                escaped = true;
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                current.push(ch);
-            }
-            '\'' if !in_double => {
-                in_single = !in_single;
-                current.push(ch);
-            }
-            c if c.is_whitespace() && !in_single && !in_double => {
-                if !current.is_empty() {
-                    tokens.push(std::mem::take(&mut current));
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
-fn sanitize_initial_buffer(raw: &str, dialect: ShellDialect) -> Cow<'_, str> {
-    if !has_disallowed_control(raw) {
-        return Cow::Borrowed(raw);
-    }
-    let ps_mode = dialect.is_powershell();
-    let fish_mode = dialect == ShellDialect::Fish;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut escaped = false;
-    let mut out = String::with_capacity(raw.len());
-
-    for ch in raw.chars() {
-        if escaped {
-            escaped = false;
-            if !is_disallowed_control(ch) {
-                out.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '`' if ps_mode && !in_single => {
-                escaped = true;
-                out.push(ch);
-            }
-            '\\' if !ps_mode && (!in_single || fish_mode) => {
-                escaped = true;
-                out.push(ch);
-            }
-            '"' if !in_single => {
-                in_double = !in_double;
-                out.push(ch);
-            }
-            '\'' if !in_double => {
-                in_single = !in_single;
-                out.push(ch);
-            }
-            '\n' | '\t' if !in_single && !in_double => out.push(' '),
-            c if is_disallowed_control(c) => {}
-            c => out.push(c),
-        }
-    }
-    Cow::Owned(out)
-}
 
 #[inline]
 fn is_safe_entry_for_emit(entry: &Entry, dialect: ShellDialect) -> bool {
@@ -880,74 +697,6 @@ fn is_git_branch_target(exe: &str, p2: &Entry) -> bool {
         .any(|kw| t.eq_ignore_ascii_case(kw))
 }
 
-fn escape_benign_double_quoted(raw: &str, dialect: ShellDialect) -> String {
-    let mut out = String::with_capacity(raw.len() + 4);
-    out.push('"');
-    for ch in raw.chars() {
-        if ch == '"' {
-            if dialect.is_powershell() {
-                out.push_str("`\"");
-            } else {
-                out.push_str("\\\"");
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn format_custom_value_token(raw: &str, dialect: ShellDialect) -> String {
-    let cleaned = strip_disallowed_controls(raw);
-    let trimmed = cleaned.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-
-    if trimmed.starts_with('"') {
-        let inner = trimmed
-            .strip_prefix('"')
-            .map(|rest| rest.strip_suffix('"').unwrap_or(rest))
-            .unwrap_or("");
-        if !inner.is_empty()
-            && !inner.contains('"')
-            && !inner.contains('\\')
-            && inner
-                .chars()
-                .all(|ch| ch.is_whitespace() || is_safe_unquoted_char(ch, false))
-        {
-            return format!("\"{inner}\"");
-        }
-    } else if trimmed.starts_with('\'') {
-        let inner = trimmed
-            .strip_prefix('\'')
-            .map(|rest| rest.strip_suffix('\'').unwrap_or(rest))
-            .unwrap_or("");
-        if !inner.is_empty()
-            && !inner.contains('\'')
-            && !inner.contains('\\')
-            && inner
-                .chars()
-                .all(|ch| ch.is_whitespace() || is_safe_unquoted_char(ch, false))
-        {
-            return format!("'{inner}'");
-        }
-    }
-
-    if is_safe_unquoted_token(trimmed, Some(dialect)) {
-        return trimmed.to_string();
-    }
-
-    if is_benign_double_quotable(trimmed, Some(dialect))
-        && !(dialect.is_powershell() && trimmed.contains('\\'))
-    {
-        return escape_benign_double_quoted(trimmed, dialect);
-    }
-
-    quote_single_for_dialect(trimmed, Some(dialect))
-}
-
 fn resolve_pane2_entries<I: Introspect>(
     pane1_entry: Option<&Entry>,
     tokens: &[String],
@@ -1000,66 +749,6 @@ struct SessionRuntimeCache<'a> {
     cwd_all: &'a [Entry],
     cwd_dirs: &'a [Entry],
     git_branches: &'a [Entry],
-}
-
-fn sanitize_literal_value_text(raw: &str, dialect: ShellDialect) -> Option<String> {
-    if has_disallowed_control(raw) {
-        return None;
-    }
-    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-        let inner = &raw[1..raw.len() - 1];
-        if !inner.contains('"')
-            && is_benign_double_quotable(inner, Some(dialect))
-            && (dialect.is_powershell() || !inner.contains('\\'))
-        {
-            return Some(raw.to_string());
-        }
-        return Some(quote_single_for_dialect(inner, Some(dialect)));
-    }
-    Some(quote_literal_for_dialect(raw, Some(dialect), true))
-}
-
-fn is_valid_single_quoted(token: &str, dialect: ShellDialect) -> bool {
-    if token.len() < 2
-        || !token.starts_with('\'')
-        || !token.ends_with('\'')
-        || has_disallowed_control(token)
-    {
-        return false;
-    }
-    let inner = &token[1..token.len() - 1];
-    match dialect {
-        ShellDialect::PowerShell => {
-            let mut chars = inner.chars();
-            while let Some(ch) = chars.next() {
-                if ch == '\'' && chars.next() != Some('\'') {
-                    return false;
-                }
-            }
-            true
-        }
-        ShellDialect::Posix => {
-            let mut rest = inner;
-            while let Some(pos) = rest.find('\'') {
-                if !rest[pos..].starts_with("'\\''") {
-                    return false;
-                }
-                rest = &rest[pos + 4..];
-            }
-            true
-        }
-        ShellDialect::Fish => {
-            let mut chars = inner.chars();
-            while let Some(ch) = chars.next() {
-                match ch {
-                    '\'' => return false,
-                    '\\' if !matches!(chars.next(), Some('\\' | '\'')) => return false,
-                    _ => {}
-                }
-            }
-            true
-        }
-    }
 }
 
 fn sanitize_scope_children(entries: &mut Vec<Entry>, dialect: ShellDialect, in_var_scope: bool) {
@@ -4505,49 +4194,6 @@ mod tests {
             session.apply(UserAction::Confirm),
             SessionOutcome::Confirmed("az svc00 op00 --dry-run".to_string())
         );
-    }
-
-    #[test]
-    fn test_pentest_split_pipeline_prefix_adversarial_and_unicode_boundaries() {
-        assert_eq!(
-            split_pipeline_prefix("echo 🦀|🚀; grep ☃"),
-            (Some("echo 🦀|🚀;".to_string()), "grep ☃")
-        );
-        assert_eq!(
-            split_pipeline_prefix("echo café&&ls --all"),
-            (Some("echo café&&".to_string()), "ls --all")
-        );
-        assert_eq!(
-            split_pipeline_prefix("((a | b) && {c; d}) | tail"),
-            (Some("((a | b) && {c; d}) |".to_string()), "tail")
-        );
-        assert_eq!(
-            split_pipeline_prefix("echo 'a|b' \"c;d\""),
-            (None, "echo 'a|b' \"c;d\"")
-        );
-        assert_eq!(split_pipeline_prefix("echo \\"), (None, "echo \\"));
-        assert_eq!(
-            split_pipeline_prefix("echo 'unclosed"),
-            (None, "echo 'unclosed")
-        );
-        assert_eq!(
-            split_pipeline_prefix("echo \"unclosed"),
-            (None, "echo \"unclosed")
-        );
-        assert_eq!(
-            split_pipeline_prefix("| cmd"),
-            (Some("|".to_string()), "cmd")
-        );
-        assert_eq!(split_pipeline_prefix("a |"), (Some("a |".to_string()), ""));
-        assert_eq!(split_pipeline_prefix(";;;"), (Some(";;;".to_string()), ""));
-
-        let ps_pipe_amp =
-            split_pipeline_prefix_for_dialect("echo ok |& grep err", ShellDialect::PowerShell);
-        assert_eq!(ps_pipe_amp, (Some("echo ok |".to_string()), "& grep err"));
-
-        let posix_pipe_amp =
-            split_pipeline_prefix_for_dialect("echo ok |& grep err", ShellDialect::Posix);
-        assert_eq!(posix_pipe_amp, (Some("echo ok |&".to_string()), "grep err"));
     }
 
     #[test]
