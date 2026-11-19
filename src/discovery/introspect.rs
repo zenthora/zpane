@@ -4,10 +4,11 @@ use super::catalog::{
 };
 use super::help_parser::parse_cli_help;
 use super::powershell::{ps_metadata_path, sync_powershell_metadata};
+use super::project_tasks::{merge_task_entries_front, project_task_entries_for_chain};
 use crate::model::{Entry, EntryKind, RuntimeContext};
 use crate::sanitize::{
     contains_ignore_ascii_case, is_unsafe_display_char, sanitize_multiline_desc,
-    sanitize_single_line,
+    sanitize_single_line, strip_help_text_escapes,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,10 @@ pub trait Introspect {
 const CLI_CACHE_SCHEMA_VERSION: u32 = 3;
 const MAX_CLI_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CMD_OUTPUT_BYTES: usize = 512 * 1024;
+const MAX_MAN_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_MAN_LINES: usize = 4_096;
+const MAX_MAN_ENTRIES: usize = 512;
+const MAN_TIMEOUT_MS: u64 = 500;
 const MAX_CARAPACE_ENTRIES: usize = 1_024;
 const MAX_CHAIN_DEPTH: usize = 8;
 const MAX_INSPECT_INPUT_BYTES: usize = 4_096;
@@ -495,6 +500,59 @@ fn run_command_with_timeout(exe_path: &Path, args: &[&str], timeout_ms: u64) -> 
     combined
 }
 
+fn run_man_with_timeout(man_path: &Path, args: &[&str], timeout_ms: u64) -> String {
+    let mut cmd = Command::new(man_path);
+    cmd.args(args)
+        .env("MANPAGER", "cat")
+        .env("PAGER", "cat")
+        .env("COLUMNS", "100")
+        .env("MANWIDTH", "100")
+        .env("NO_COLOR", "1")
+        .env_remove("FORCE_COLOR")
+        .env_remove("CLICOLOR_FORCE")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    hide_window(&mut cmd);
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return String::new(),
+    };
+
+    let mut stdout_pipe = child.stdout.take();
+    let out_handle = thread::spawn(move || {
+        stdout_pipe
+            .take()
+            .map(|p| read_pipe_bounded(p, MAX_MAN_OUTPUT_BYTES))
+            .unwrap_or_default()
+    });
+
+    let start = Instant::now();
+    let limit = Duration::from_millis(timeout_ms);
+    let mut poll_ms = 1u64;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                let elapsed = start.elapsed();
+                if elapsed >= limit {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
+                let remaining = limit - elapsed;
+                thread::sleep(Duration::from_millis(poll_ms).min(remaining));
+                poll_ms = (poll_ms * 2).min(8);
+            }
+            Err(_) => break,
+        }
+    }
+
+    let out_bytes = out_handle.join().unwrap_or_default();
+    String::from_utf8_lossy(&out_bytes).into_owned()
+}
+
 /// Adapter signature for running a CLI command (`exe`, `args`) and returning combined help text.
 type CommandRunner = dyn Fn(&str, &[&str]) -> Option<String> + Send + Sync;
 
@@ -504,7 +562,11 @@ fn default_command_runner() -> Arc<CommandRunner> {
             return None;
         }
         let resolved = find_executable_in_path(exe)?;
-        let out = run_command_with_timeout(&resolved, args, 450);
+        let out = if exe == "man" {
+            run_man_with_timeout(&resolved, args, MAN_TIMEOUT_MS)
+        } else {
+            run_command_with_timeout(&resolved, args, 450)
+        };
         if out.trim().is_empty() {
             None
         } else {
@@ -594,6 +656,206 @@ fn parse_carapace_export(json_str: &str) -> Vec<Entry> {
     entries
 }
 
+fn is_man_fallback_enabled() -> bool {
+    cfg!(unix) && find_executable_in_path("man").is_some()
+}
+
+fn is_safe_man_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg.len() <= 64
+        && seg.as_bytes()[0].is_ascii_alphanumeric()
+        && seg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && !seg.contains("..")
+}
+
+fn man_page_for_chain(clean_chain: &[&str]) -> Option<String> {
+    let exe = *clean_chain.first()?;
+    if exe_stem_eq(exe, "man") {
+        return None;
+    }
+    let exe_base = Path::new(exe).file_stem()?.to_str()?;
+    if !is_safe_man_segment(exe_base) {
+        return None;
+    }
+    match clean_chain.len() {
+        1 => Some(exe_base.to_string()),
+        2 => {
+            let sub = clean_chain[1];
+            if is_safe_man_segment(sub) {
+                Some(format!("{exe_base}-{sub}"))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn strip_man_overstrike_and_sanitize(raw: &str) -> String {
+    let mut end = raw.len().min(MAX_MAN_OUTPUT_BYTES);
+    while end > 0 && !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let bounded = &raw[..end];
+
+    let mut plain = String::with_capacity(bounded.len());
+    for ch in bounded.chars() {
+        if ch == '\x08' {
+            if plain.chars().last().is_some_and(|prev| prev != '\n') {
+                plain.pop();
+            }
+        } else if ch == '\u{2212}' {
+            // Normalize Unicode minus emitted by UTF-8 groff to ASCII hyphen-minus.
+            plain.push('-');
+        } else {
+            plain.push(ch);
+        }
+    }
+
+    strip_help_text_escapes(&plain).into_owned()
+}
+
+fn classify_man_section_header(line: &str) -> Option<bool> {
+    if line.is_empty() || line.starts_with(char::is_whitespace) || line.starts_with('-') {
+        return None;
+    }
+    let trimmed = line.trim();
+    if trimmed.len() < 2 || trimmed.len() > 64 || trimmed.contains("  ") || trimmed.contains('\t') {
+        return None;
+    }
+    let is_caps = trimmed
+        .chars()
+        .all(|c| !c.is_alphabetic() || c.is_uppercase());
+    if !is_caps {
+        return None;
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if matches!(
+        upper.as_str(),
+        "NAME"
+            | "SYNOPSIS"
+            | "USAGE"
+            | "EXAMPLES"
+            | "EXAMPLE"
+            | "ENVIRONMENT"
+            | "FILES"
+            | "EXIT STATUS"
+            | "RETURN VALUE"
+            | "DIAGNOSTICS"
+            | "ERRORS"
+            | "BUGS"
+            | "AUTHOR"
+            | "AUTHORS"
+            | "REPORTING BUGS"
+            | "COPYRIGHT"
+            | "SEE ALSO"
+            | "HISTORY"
+            | "NOTES"
+            | "STANDARDS"
+            | "CONFORMING TO"
+            | "CAVEATS"
+            | "SECURITY"
+            | "COLOPHON"
+    ) {
+        return Some(false);
+    }
+    if matches!(
+        upper.as_str(),
+        "OPTIONS" | "DESCRIPTION" | "FLAGS" | "ARGUMENTS" | "SWITCHES" | "PARAMETERS"
+    ) || upper.contains("OPTION")
+        || upper.contains("FLAG")
+    {
+        return Some(true);
+    }
+    None
+}
+
+fn normalize_man_lowercase_header_metavar(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('-') || trimmed.contains("  ") || trimmed.contains('\t') {
+        return None;
+    }
+    let indent_len = line.len() - line.trim_start().len();
+    if !(1..=10).contains(&indent_len) {
+        return None;
+    }
+    let (flag, arg) = trimmed.split_once(' ')?;
+    if arg.contains(' ')
+        || arg.starts_with(['<', '[', '{', '-'])
+        || arg.is_empty()
+        || arg.len() > 32
+        || !arg.as_bytes()[0].is_ascii_lowercase()
+        || !arg
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return None;
+    }
+    let flag_valid = (flag.starts_with("--") && flag.len() >= 3)
+        || (flag.len() == 2 && flag.as_bytes()[1].is_ascii_alphanumeric());
+    flag_valid.then(|| format!("{}{flag} <{arg}>", &line[..indent_len]))
+}
+
+/// Bounded `man` page option extractor used as a last-resort fallback when `--help`, `-h`,
+/// declarative specs, and `carapace` yield no entries.
+fn parse_man_page_options(man_text: &str) -> Vec<Entry> {
+    if man_text.trim().is_empty() {
+        return Vec::new();
+    }
+    let clean = strip_man_overstrike_and_sanitize(man_text);
+    let mut filtered = String::from("Options:\n");
+    let mut in_option_section = false;
+    let mut saw_option_section = false;
+
+    for raw_line in clean.lines().take(MAX_MAN_LINES) {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            if in_option_section {
+                filtered.push('\n');
+            }
+            continue;
+        }
+        // Skip column-0 page headers/footers like `LS(1)   User Commands   LS(1)`.
+        if !raw_line.starts_with(char::is_whitespace)
+            && (trimmed.contains("  ") || trimmed.contains('\t'))
+        {
+            continue;
+        }
+        if let Some(is_opts) = classify_man_section_header(raw_line) {
+            in_option_section = is_opts;
+            if is_opts {
+                saw_option_section = true;
+            }
+            continue;
+        }
+        if !in_option_section {
+            continue;
+        }
+        if let Some(normalized) = normalize_man_lowercase_header_metavar(raw_line) {
+            filtered.push_str(&normalized);
+        } else {
+            filtered.push_str(raw_line);
+        }
+        filtered.push('\n');
+    }
+
+    if !saw_option_section {
+        return Vec::new();
+    }
+
+    let mut entries: Vec<Entry> = parse_cli_help(&filtered)
+        .into_iter()
+        .filter(|e| matches!(e.kind, EntryKind::Flag | EntryKind::Param))
+        .take(MAX_MAN_ENTRIES)
+        .collect();
+    for entry in &mut entries {
+        entry.desc = sanitize_single_line(&entry.desc).into_owned();
+    }
+    entries
+}
+
 fn exe_stem_eq(exe: &str, expected: &str) -> bool {
     Path::new(exe)
         .file_stem()
@@ -601,10 +863,24 @@ fn exe_stem_eq(exe: &str, expected: &str) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case(expected))
 }
 
+#[cfg(test)]
 fn introspect_cli_chain_with<F>(
     chain: &[&str],
     dialect: ShellDialect,
     carapace_enabled: bool,
+    run_cmd: &F,
+) -> Vec<Entry>
+where
+    F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
+{
+    introspect_cli_chain_with_fallbacks(chain, dialect, carapace_enabled, false, run_cmd)
+}
+
+fn introspect_cli_chain_with_fallbacks<F>(
+    chain: &[&str],
+    dialect: ShellDialect,
+    carapace_enabled: bool,
+    man_enabled: bool,
     run_cmd: &F,
 ) -> Vec<Entry>
 where
@@ -704,6 +980,16 @@ where
         }
     }
 
+    // Tertiary Introspection Fallback (Unix / injected runner): bounded `man` option extractor
+    // when `--help`, `-h`, and `carapace` all yielded no entries.
+    if entries.is_empty() && man_enabled {
+        if let Some(man_page) = man_page_for_chain(clean_chain) {
+            if let Some(man_out) = run_cmd("man", &[man_page.as_str()]) {
+                entries = parse_man_page_options(&man_out);
+            }
+        }
+    }
+
     // If this is a subcommand or leaf level, also append helpful shell variables
     if clean_chain.len() >= 2 {
         let vars = dialect.common_var_entries();
@@ -741,7 +1027,9 @@ pub struct CliIntrospector {
     dirty: bool,
     dialect: ShellDialect,
     carapace_enabled: bool,
+    man_enabled: bool,
     cache_path: Option<PathBuf>,
+    project_dir: Option<PathBuf>,
     runner: Arc<CommandRunner>,
     req_tx: Option<Sender<BgRequest>>,
     res_rx: Option<Receiver<BgResponse>>,
@@ -758,14 +1046,18 @@ impl CliIntrospector {
         let cache = load_cli_disk_cache_from(&path, dialect);
         let runner = default_command_runner();
         let carapace_enabled = is_carapace_installed();
+        let man_enabled = is_man_fallback_enabled();
+        let project_dir = std::env::current_dir().ok();
         let catalog_rx = maybe_spawn_ps_sync(dialect, runtime_ctx.clone());
-        Self::build_with_carapace(
+        Self::build_with_fallbacks(
             dialect,
             cache,
             Some(path),
+            project_dir,
             runner,
             true,
             carapace_enabled,
+            man_enabled,
             catalog_rx,
         )
     }
@@ -776,13 +1068,16 @@ impl CliIntrospector {
         let cache = load_cli_disk_cache_from(&path, dialect);
         let runner = default_command_runner();
         let carapace_enabled = is_carapace_installed();
-        Self::build_with_carapace(
+        let man_enabled = is_man_fallback_enabled();
+        Self::build_with_fallbacks(
             dialect,
             cache,
             Some(path),
+            None,
             runner,
             false,
             carapace_enabled,
+            man_enabled,
             None,
         )
     }
@@ -793,7 +1088,7 @@ impl CliIntrospector {
     where
         F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
     {
-        Self::with_runner_and_carapace(dialect, cache_path, false, runner)
+        Self::with_runner_and_fallbacks(dialect, cache_path, false, false, runner)
     }
 
     /// Creates a `CliIntrospector` with an injected command-output adapter and configurable Carapace fallback.
@@ -807,17 +1102,62 @@ impl CliIntrospector {
     where
         F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
     {
+        Self::with_runner_and_fallbacks(dialect, cache_path, carapace_enabled, false, runner)
+    }
+
+    /// Creates a `CliIntrospector` with an injected command-output adapter and configurable Carapace and `man` fallbacks.
+    #[cfg(test)]
+    fn with_runner_and_fallbacks<F>(
+        dialect: ShellDialect,
+        cache_path: Option<PathBuf>,
+        carapace_enabled: bool,
+        man_enabled: bool,
+        runner: F,
+    ) -> Self
+    where
+        F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
+    {
         let cache = cache_path
             .as_deref()
             .map(|p| load_cli_disk_cache_from(p, dialect))
             .unwrap_or_default();
-        Self::build_with_carapace(
+        Self::build_with_fallbacks(
             dialect,
             cache,
             cache_path,
+            None,
             Arc::new(runner),
             true,
             carapace_enabled,
+            man_enabled,
+            None,
+        )
+    }
+
+    /// Creates a `CliIntrospector` with an injected command-output adapter and explicit project directory.
+    #[cfg(test)]
+    fn with_runner_and_project_dir<F>(
+        dialect: ShellDialect,
+        cache_path: Option<PathBuf>,
+        project_dir: PathBuf,
+        runner: F,
+    ) -> Self
+    where
+        F: Fn(&str, &[&str]) -> Option<String> + Send + Sync + 'static,
+    {
+        let cache = cache_path
+            .as_deref()
+            .map(|p| load_cli_disk_cache_from(p, dialect))
+            .unwrap_or_default();
+        Self::build_with_fallbacks(
+            dialect,
+            cache,
+            cache_path,
+            Some(project_dir),
+            Arc::new(runner),
+            true,
+            false,
+            false,
             None,
         )
     }
@@ -831,31 +1171,43 @@ impl CliIntrospector {
         spawn_worker: bool,
         catalog_rx: Option<Receiver<Vec<Entry>>>,
     ) -> Self {
-        Self::build_with_carapace(
+        Self::build_with_fallbacks(
             dialect,
             cache,
             cache_path,
+            None,
             runner,
             spawn_worker,
+            false,
             false,
             catalog_rx,
         )
     }
 
-    fn build_with_carapace(
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_fallbacks(
         dialect: ShellDialect,
         cache: HashMap<String, Vec<Entry>>,
         cache_path: Option<PathBuf>,
+        project_dir: Option<PathBuf>,
         runner: Arc<CommandRunner>,
         spawn_worker: bool,
         carapace_enabled: bool,
+        man_enabled: bool,
         catalog_rx: Option<Receiver<Vec<Entry>>>,
     ) -> Self {
         let (req_tx, res_rx) = if spawn_worker {
             let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
             let (res_tx, res_rx) = mpsc::channel::<BgResponse>();
             let worker_runner = Arc::clone(&runner);
-            spawn_background_worker(req_rx, res_tx, dialect, carapace_enabled, worker_runner);
+            spawn_background_worker(
+                req_rx,
+                res_tx,
+                dialect,
+                carapace_enabled,
+                man_enabled,
+                worker_runner,
+            );
             (Some(req_tx), Some(res_rx))
         } else {
             (None, None)
@@ -868,7 +1220,9 @@ impl CliIntrospector {
             dirty: false,
             dialect,
             carapace_enabled,
+            man_enabled,
             cache_path,
+            project_dir,
             runner,
             req_tx,
             res_rx,
@@ -919,7 +1273,15 @@ impl CliIntrospector {
             .unwrap_or(0)
     }
 
-    /// Queries the cache for `chain`. On cache hit, returns the cached entries.
+    fn overlay_project_tasks(&self, clean_chain: &[&str], entries: &mut Vec<Entry>) {
+        if let Some(ref dir) = self.project_dir {
+            let tasks = project_task_entries_for_chain(dir, clean_chain);
+            merge_task_entries_front(entries, tasks);
+        }
+    }
+
+    /// Queries the cache for `chain`. On cache hit, returns the cached entries (with any
+    /// CWD-local project task targets overlaid without polluting the global disk cache).
     /// On cache miss, enqueues a deduplicated background introspection job and returns a loading placeholder entry.
     pub fn query(&mut self, chain: &[&str]) -> Vec<Entry> {
         let mut stack_chain = [""; MAX_CHAIN_DEPTH];
@@ -930,13 +1292,17 @@ impl CliIntrospector {
 
         if clean_chain.len() == 1 && !clean_chain[0].bytes().any(|b| b.is_ascii_uppercase()) {
             if let Some(cached) = self.cache.get(clean_chain[0]) {
-                return cached.clone();
+                let mut out = cached.clone();
+                self.overlay_project_tasks(clean_chain, &mut out);
+                return out;
             }
         }
 
         let key = Self::chain_key(clean_chain);
         if let Some(cached) = self.cache.get(&key) {
-            return cached.clone();
+            let mut out = cached.clone();
+            self.overlay_project_tasks(clean_chain, &mut out);
+            return out;
         }
 
         let generation = self.current_generation(&key);
@@ -1085,13 +1451,19 @@ impl CliIntrospector {
 
         let dialect = self.dialect;
         let carapace_enabled = self.carapace_enabled;
+        let man_enabled = self.man_enabled;
         let runner = Arc::clone(&self.runner);
         let results: Vec<(String, Vec<Entry>)> = available
             .par_iter()
             .map(|&tool| {
                 let chain = [tool];
-                let entries =
-                    introspect_cli_chain_with(&chain, dialect, carapace_enabled, &*runner);
+                let entries = introspect_cli_chain_with_fallbacks(
+                    &chain,
+                    dialect,
+                    carapace_enabled,
+                    man_enabled,
+                    &*runner,
+                );
                 (Self::chain_key(&chain), entries)
             })
             .collect();
@@ -1165,6 +1537,7 @@ fn spawn_background_worker(
     tx: Sender<BgResponse>,
     dialect: ShellDialect,
     carapace_enabled: bool,
+    man_enabled: bool,
     runner: Arc<CommandRunner>,
 ) {
     thread::spawn(move || {
@@ -1182,8 +1555,13 @@ fn spawn_background_worker(
             }
             if let Some(req) = stack.pop() {
                 let chain_refs: Vec<&str> = req.cmd_chain.iter().map(|s| s.as_str()).collect();
-                let entries =
-                    introspect_cli_chain_with(&chain_refs, dialect, carapace_enabled, &*runner);
+                let entries = introspect_cli_chain_with_fallbacks(
+                    &chain_refs,
+                    dialect,
+                    carapace_enabled,
+                    man_enabled,
+                    &*runner,
+                );
                 if tx
                     .send(BgResponse {
                         cache_key: req.cache_key,
@@ -1353,9 +1731,36 @@ pub fn inspect_command_chain_with<F>(
 where
     F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
 {
+    inspect_command_chain_with_fallbacks(
+        dialect,
+        catalog,
+        raw_chain,
+        cache_path,
+        carapace_enabled,
+        false,
+        None,
+        runner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_command_chain_with_fallbacks<F>(
+    dialect: ShellDialect,
+    catalog: &[Entry],
+    raw_chain: &[String],
+    cache_path: Option<&Path>,
+    carapace_enabled: bool,
+    man_enabled: bool,
+    project_dir: Option<&Path>,
+    runner: &F,
+) -> anyhow::Result<InspectReport>
+where
+    F: Fn(&str, &[&str]) -> Option<String> + ?Sized,
+{
     let chain = parse_inspect_chain(raw_chain)?;
     let root_tok = &chain[0];
     let matched_root = find_catalog_root(catalog, root_tok);
+    let chain_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
 
     let is_catalog_cmd = matched_root.is_some_and(|e| {
         matches!(
@@ -1385,26 +1790,38 @@ where
         };
         if let Some(node) = target {
             if !node.children.is_empty() {
+                let mut entries = node.children.clone();
+                if let Some(dir) = project_dir {
+                    merge_task_entries_front(
+                        &mut entries,
+                        project_task_entries_for_chain(dir, &chain_refs),
+                    );
+                }
                 return Ok(InspectReport {
                     dialect: dialect_cache_tag(dialect).to_string(),
                     chain,
                     command,
-                    entries: node.children.clone(),
+                    entries,
                 });
             }
         }
     }
 
-    let chain_refs: Vec<&str> = chain.iter().map(String::as_str).collect();
     let key = CliIntrospector::chain_key(&chain_refs);
     let mut cache = cache_path
         .map(|p| load_cli_disk_cache_from(p, dialect))
         .unwrap_or_default();
 
-    let entries = if let Some(cached) = cache.get(&key) {
+    let mut entries = if let Some(cached) = cache.get(&key) {
         cached.clone()
     } else if is_safe_exe_token(root_tok) {
-        let discovered = introspect_cli_chain_with(&chain_refs, dialect, carapace_enabled, runner);
+        let discovered = introspect_cli_chain_with_fallbacks(
+            &chain_refs,
+            dialect,
+            carapace_enabled,
+            man_enabled,
+            runner,
+        );
         if has_discovered_cli_entries(chain_refs.len(), chain_refs[0], &discovered) {
             if let Some(path) = cache_path {
                 cache.insert(key, discovered.clone());
@@ -1416,6 +1833,13 @@ where
         Vec::new()
     };
 
+    if let Some(dir) = project_dir {
+        merge_task_entries_front(
+            &mut entries,
+            project_task_entries_for_chain(dir, &chain_refs),
+        );
+    }
+
     Ok(InspectReport {
         dialect: dialect_cache_tag(dialect).to_string(),
         chain,
@@ -1425,7 +1849,7 @@ where
 }
 
 /// Synchronously inspects a command or subcommand chain against the Command Catalog,
-/// persisted CLI introspection cache, and live `--help`/`-h`/carapace introspection.
+/// persisted CLI introspection cache, and live `--help`/`-h`/carapace/`man` introspection.
 pub fn inspect_command_chain(
     dialect: ShellDialect,
     runtime_ctx: &RuntimeContext,
@@ -1435,13 +1859,17 @@ pub fn inspect_command_chain(
     let catalog = load_catalog(dialect, runtime_ctx);
     let cache_path = cli_cache_path_for(dialect);
     let carapace_enabled = is_carapace_installed();
+    let man_enabled = is_man_fallback_enabled();
+    let project_dir = std::env::current_dir().ok();
     let runner = default_command_runner();
-    inspect_command_chain_with(
+    inspect_command_chain_with_fallbacks(
         dialect,
         &catalog,
         raw_chain,
         Some(&cache_path),
         carapace_enabled,
+        man_enabled,
+        project_dir.as_deref(),
         &*runner,
     )
 }
@@ -2549,5 +2977,275 @@ Options:
                 "error message leaked unsafe control chars for {raw_chain:?}: {msg:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_man_fallback_extracts_options_only_when_help_and_carapace_yield_nothing() {
+        use std::sync::Mutex;
+
+        let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
+        let calls_ref = Arc::clone(&calls);
+
+        // Includes groff bold/underline backspace overstrikes, Unicode minus, ANSI SGR, and BiDi chars
+        let ls_man_fixture = concat!(
+            "LS(1)                           User Commands                          LS(1)\n\n",
+            "NAME\n",
+            "       ls - list directory contents\n\n",
+            "SYNOPSIS\n",
+            "       ls [-Z] [OPTION]... [FILE]...\n\n",
+            "DESCRIPTION\n",
+            "       List information about the FILEs.\n\n",
+            "       -\x08-a\x08a, -\x08--\x08-a\x08al\x08ll\x08l\n",
+            "              do not ignore entries starting with .\x1b[31m\u{202e}\n\n",
+            "       \u{2212}w, \u{2212}\u{2212}width=_\x08C_\x08O_\x08L_\x08S\n",
+            "              set output width to COLS\n\n",
+            "       --color[=WHEN]\n",
+            "              color the output WHEN\n\n",
+            "       -1     list one file per line\n\n",
+            "EXAMPLES\n",
+            "       -X     example flag that must be ignored\n\n",
+            "AUTHOR\n",
+            "       Written by contributors.\n",
+        );
+
+        let mut introspector = CliIntrospector::with_runner_and_fallbacks(
+            ShellDialect::Posix,
+            None,
+            true,
+            true,
+            move |exe, args| {
+                calls_ref.lock().unwrap().push((
+                    exe.to_string(),
+                    args.iter().map(|s| (*s).to_string()).collect(),
+                ));
+                match (exe, args) {
+                    ("bsdls", ["--help"] | ["-h"]) => None,
+                    ("carapace", ["bsdls", ..]) => None,
+                    ("man", ["bsdls"]) => Some(ls_man_fixture.to_string()),
+                    ("helptool", ["--help"]) => {
+                        Some("Options:\n  --native    From --help\n".to_string())
+                    }
+                    ("man", ["helptool"]) => {
+                        panic!("man fallback must not run when --help yielded entries")
+                    }
+                    ("man", ["man"]) => panic!("man fallback must never invoke man on itself"),
+                    _ => None,
+                }
+            },
+        );
+
+        let _ = introspector.query(&["bsdls"]);
+        let _ = introspector.query(&["helptool"]);
+        let _ = introspector.query(&["man"]);
+        assert!(introspector.poll_blocking());
+
+        let ls_entries = introspector.query(&["bsdls"]);
+        let all_flag = ls_entries
+            .iter()
+            .find(|e| e.text == "--all")
+            .expect("--all from man page");
+        assert_eq!(all_flag.kind, EntryKind::Flag);
+        assert_eq!(all_flag.aliases, vec!["-a"]);
+        assert!(all_flag.desc.contains("do not ignore entries"));
+        assert!(!all_flag.desc.contains('\x1b'));
+        assert!(!all_flag.desc.contains('\u{202e}'));
+
+        let width_param = ls_entries
+            .iter()
+            .find(|e| e.text == "--width")
+            .expect("--width from Unicode minus man page");
+        assert_eq!(width_param.kind, EntryKind::Param);
+        assert_eq!(width_param.aliases, vec!["-w"]);
+
+        let color_param = ls_entries
+            .iter()
+            .find(|e| e.text == "--color")
+            .expect("--color from man page");
+        assert_eq!(color_param.kind, EntryKind::Param);
+
+        assert!(ls_entries
+            .iter()
+            .any(|e| e.text == "-1" && e.kind == EntryKind::Flag));
+        assert!(
+            !ls_entries.iter().any(|e| e.text == "-X" || e.text == "-Z"),
+            "SYNOPSIS and EXAMPLES sections must be ignored by man extractor"
+        );
+
+        let recorded = calls.lock().unwrap();
+        assert!(recorded
+            .iter()
+            .any(|(exe, args)| exe == "man" && args == &["bsdls"]));
+        assert!(!recorded
+            .iter()
+            .any(|(exe, args)| exe == "man" && args == &["helptool"]));
+
+        // Pre-populated declarative spec in catalog must bypass man fallback entirely
+        let mut spec_entry = Entry::new("bsdls", "bsdls", EntryKind::Cli, "Declarative spec");
+        spec_entry.children = vec![Entry::new(
+            "--from-spec",
+            "--from-spec",
+            EntryKind::Flag,
+            "",
+        )];
+        let report = inspect_command_chain_with_fallbacks(
+            ShellDialect::Posix,
+            &[spec_entry],
+            &["bsdls".to_string()],
+            None,
+            true,
+            true,
+            None,
+            &|exe, _| panic!("pre-populated spec must not invoke runner: {exe}"),
+        )
+        .unwrap();
+        assert_eq!(report.entries[0].text, "--from-spec");
+    }
+
+    #[test]
+    fn test_parse_man_page_options_ignores_error_output_and_enforces_entry_bounds() {
+        assert!(parse_man_page_options("No manual entry for nonexistent").is_empty());
+
+        let mut huge_man = String::from("OPTIONS\n");
+        for i in 0..700 {
+            huge_man.push_str(&format!("       --opt-{i:04}\n              Option {i}\n"));
+        }
+        let parsed = parse_man_page_options(&huge_man);
+        assert_eq!(parsed.len(), MAX_MAN_ENTRIES);
+    }
+
+    #[test]
+    fn test_introspector_and_inspect_surface_project_tasks_without_polluting_disk_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let proj_dir = env::temp_dir().join(format!(
+            "zpane_introspect_proj_{}_{nonce}",
+            std::process::id()
+        ));
+        let cache_path = proj_dir.join("cli_cache_posix.json");
+        let _ = fs::remove_dir_all(&proj_dir);
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        fs::write(
+            proj_dir.join("justfile"),
+            "# Build project\nbuild:\n    cargo build\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("Makefile"),
+            "all: ## Build all targets\n\techo all\n",
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("package.json"),
+            r#"{"scripts":{"dev":"vite","test":"vitest"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            proj_dir.join("mise.toml"),
+            "[tasks.check]\ndescription = \"Run CI checks\"\nrun = \"cargo test\"\n",
+        )
+        .unwrap();
+
+        let mut introspector = CliIntrospector::with_runner_and_project_dir(
+            ShellDialect::Posix,
+            Some(cache_path.clone()),
+            proj_dir.clone(),
+            |exe, args| match (exe, args) {
+                ("just", ["--help"]) => {
+                    Some("Options:\n  --list    List available recipes\n".to_string())
+                }
+                ("npm", ["run", "--help"]) => {
+                    Some("Options:\n  --if-present    Ignore missing scripts\n".to_string())
+                }
+                _ => None,
+            },
+        );
+
+        let _ = introspector.query(&["just"]);
+        let _ = introspector.query(&["npm", "run"]);
+        assert!(introspector.poll_blocking());
+
+        let just_entries = introspector.query(&["just"]);
+        assert_eq!(just_entries[0].text, "build");
+        assert!(just_entries.iter().any(|e| e.text == "--list"));
+
+        let npm_run_entries = introspector.query(&["npm", "run"]);
+        let npm_texts: Vec<&str> = npm_run_entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(npm_texts[0], "dev");
+        assert_eq!(npm_texts[1], "test");
+        assert!(npm_texts.contains(&"--if-present"));
+
+        // Global disk cache must NOT contain CWD-local project tasks
+        assert!(introspector.flush());
+        let saved = load_cli_disk_cache_from(&cache_path, ShellDialect::Posix);
+        assert!(
+            !saved
+                .get("just")
+                .is_some_and(|v| v.iter().any(|e| e.text == "build")),
+            "disk cache must not persist CWD-local justfile recipes"
+        );
+        assert!(
+            !saved
+                .get("npm::run")
+                .is_some_and(|v| v.iter().any(|e| e.text == "dev")),
+            "disk cache must not persist CWD-local package.json scripts"
+        );
+
+        // inspect_command_chain_with_fallbacks surfaces project tasks for make, pnpm, bun, mise
+        let make_report = inspect_command_chain_with_fallbacks(
+            ShellDialect::Posix,
+            &[],
+            &["make".to_string()],
+            None,
+            false,
+            false,
+            Some(&proj_dir),
+            &|_, _| None,
+        )
+        .unwrap();
+        assert_eq!(make_report.entries[0].text, "all");
+
+        let pnpm_report = inspect_command_chain_with_fallbacks(
+            ShellDialect::Posix,
+            &[],
+            &["pnpm".to_string()],
+            None,
+            false,
+            false,
+            Some(&proj_dir),
+            &|_, _| None,
+        )
+        .unwrap();
+        assert!(pnpm_report.entries.iter().any(|e| e.text == "dev"));
+
+        let bun_report = inspect_command_chain_with_fallbacks(
+            ShellDialect::Posix,
+            &[],
+            &["bun".to_string(), "run".to_string()],
+            None,
+            false,
+            false,
+            Some(&proj_dir),
+            &|_, _| None,
+        )
+        .unwrap();
+        assert_eq!(bun_report.entries[0].text, "dev");
+
+        let mise_report = inspect_command_chain_with_fallbacks(
+            ShellDialect::Posix,
+            &[],
+            &["mise".to_string(), "run".to_string()],
+            None,
+            false,
+            false,
+            Some(&proj_dir),
+            &|_, _| None,
+        )
+        .unwrap();
+        assert_eq!(mise_report.entries[0].text, "check");
+
+        let _ = fs::remove_dir_all(&proj_dir);
     }
 }

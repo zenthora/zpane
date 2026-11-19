@@ -1,5 +1,6 @@
 use super::catalog::{
-    cache_dir, ends_with_ignore_ascii_case, is_safe_command_token, MAX_SPEC_BYTES,
+    cache_dir, ends_with_ignore_ascii_case, is_safe_command_token, non_empty_abs_env_path,
+    MAX_SPEC_BYTES,
 };
 use crate::model::{Entry, EntryKind};
 use crate::sanitize::{is_disallowed_control, sanitize_multiline_desc, sanitize_single_line};
@@ -13,10 +14,100 @@ const MAX_YAML_LINES: usize = 16_384;
 const MAX_SPEC_TREE_DEPTH: usize = 24;
 const MAX_SPEC_CHILDREN: usize = 1_024;
 
-/// Returns the local directory searched for declarative JSON/YAML CLI specifications:
-/// `%LOCALAPPDATA%\zpane\specs` on Windows, `$XDG_CACHE_HOME/zpane/specs` or `~/.cache/zpane/specs` on Unix.
-pub(super) fn specs_dir() -> PathBuf {
-    cache_dir().join("specs")
+#[derive(Debug, Clone)]
+struct SpecDirEnv {
+    is_windows: bool,
+    xdg_config_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    appdata: Option<PathBuf>,
+    local_appdata: Option<PathBuf>,
+    userprofile: Option<PathBuf>,
+    cache_dir: PathBuf,
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf, is_windows: bool) {
+    let dup = dirs.iter().any(|existing| {
+        if is_windows {
+            existing
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&candidate.to_string_lossy())
+        } else {
+            existing == &candidate
+        }
+    });
+    if !dup {
+        dirs.push(candidate);
+    }
+}
+
+fn spec_search_dirs_from(env: &SpecDirEnv) -> Vec<PathBuf> {
+    let mut dirs = Vec::with_capacity(5);
+    if env.is_windows {
+        let roaming = env.appdata.clone().or_else(|| {
+            env.userprofile
+                .as_ref()
+                .map(|p| p.join("AppData").join("Roaming"))
+        });
+        let local = env.local_appdata.clone().or_else(|| {
+            env.userprofile
+                .as_ref()
+                .map(|p| p.join("AppData").join("Local"))
+        });
+
+        // 1. Highest priority: zpane config specs (%APPDATA%\zpane\specs then %LOCALAPPDATA%\zpane\specs)
+        if let Some(ref base) = roaming {
+            push_unique_dir(&mut dirs, base.join("zpane").join("specs"), true);
+        }
+        if let Some(ref base) = local {
+            push_unique_dir(&mut dirs, base.join("zpane").join("specs"), true);
+        }
+
+        // 2. Second priority: Carapace specs (%APPDATA%\carapace\specs then %LOCALAPPDATA%\carapace\specs)
+        if let Some(ref base) = roaming {
+            push_unique_dir(&mut dirs, base.join("carapace").join("specs"), true);
+        }
+        if let Some(ref base) = local {
+            push_unique_dir(&mut dirs, base.join("carapace").join("specs"), true);
+        }
+    } else {
+        let config_base = env
+            .xdg_config_home
+            .clone()
+            .or_else(|| env.home.as_ref().map(|h| h.join(".config")));
+
+        // 1. Highest priority: $XDG_CONFIG_HOME/zpane/specs (or ~/.config/zpane/specs)
+        if let Some(ref base) = config_base {
+            push_unique_dir(&mut dirs, base.join("zpane").join("specs"), false);
+        }
+
+        // 2. Second priority: $XDG_CONFIG_HOME/carapace/specs (or ~/.config/carapace/specs)
+        if let Some(ref base) = config_base {
+            push_unique_dir(&mut dirs, base.join("carapace").join("specs"), false);
+        }
+    }
+
+    // 3. Fallback: legacy cache specs directory
+    push_unique_dir(&mut dirs, env.cache_dir.join("specs"), env.is_windows);
+    dirs
+}
+
+/// Returns declarative spec directories in strict precedence order:
+/// 1. `$XDG_CONFIG_HOME/zpane/specs` (`~/.config/zpane/specs` on Unix;
+///    `%APPDATA%\zpane\specs` then `%LOCALAPPDATA%\zpane\specs` on Windows)
+/// 2. `$XDG_CONFIG_HOME/carapace/specs` (`~/.config/carapace/specs` on Unix;
+///    `%APPDATA%\carapace\specs` then `%LOCALAPPDATA%\carapace\specs` on Windows)
+/// 3. Legacy cache fallback (`cache_dir().join("specs")`).
+pub(super) fn spec_search_dirs() -> Vec<PathBuf> {
+    let env = SpecDirEnv {
+        is_windows: cfg!(windows),
+        xdg_config_home: non_empty_abs_env_path("XDG_CONFIG_HOME"),
+        home: non_empty_abs_env_path("HOME"),
+        appdata: non_empty_abs_env_path("APPDATA"),
+        local_appdata: non_empty_abs_env_path("LOCALAPPDATA"),
+        userprofile: non_empty_abs_env_path("USERPROFILE"),
+        cache_dir: cache_dir(),
+    };
+    spec_search_dirs_from(&env)
 }
 
 /// Returns true if a filename is a safe basename with a supported declarative spec extension (`.json`, `.yaml`, `.yml`).
@@ -1526,5 +1617,122 @@ commands:
         assert_eq!(opt.children.len(), 1);
         assert_eq!(opt.children[0].text, "good");
         assert_eq!(opt.children[0].desc, "Clean\nLine2");
+    }
+
+    #[test]
+    fn test_spec_search_dirs_unix_xdg_and_home_precedence() {
+        let with_xdg = spec_search_dirs_from(&SpecDirEnv {
+            is_windows: false,
+            xdg_config_home: Some(PathBuf::from("/xdg/config")),
+            home: Some(PathBuf::from("/home/alice")),
+            appdata: None,
+            local_appdata: None,
+            userprofile: None,
+            cache_dir: PathBuf::from("/xdg/cache/zpane"),
+        });
+        assert_eq!(
+            with_xdg,
+            vec![
+                PathBuf::from("/xdg/config/zpane/specs"),
+                PathBuf::from("/xdg/config/carapace/specs"),
+                PathBuf::from("/xdg/cache/zpane/specs"),
+            ]
+        );
+
+        let with_home_fallback = spec_search_dirs_from(&SpecDirEnv {
+            is_windows: false,
+            xdg_config_home: None,
+            home: Some(PathBuf::from("/home/alice")),
+            appdata: None,
+            local_appdata: None,
+            userprofile: None,
+            cache_dir: PathBuf::from("/home/alice/.cache/zpane"),
+        });
+        assert_eq!(
+            with_home_fallback,
+            vec![
+                PathBuf::from("/home/alice/.config/zpane/specs"),
+                PathBuf::from("/home/alice/.config/carapace/specs"),
+                PathBuf::from("/home/alice/.cache/zpane/specs"),
+            ]
+        );
+
+        let cache_only = spec_search_dirs_from(&SpecDirEnv {
+            is_windows: false,
+            xdg_config_home: None,
+            home: None,
+            appdata: None,
+            local_appdata: None,
+            userprofile: None,
+            cache_dir: PathBuf::from("/tmp/zpane"),
+        });
+        assert_eq!(cache_only, vec![PathBuf::from("/tmp/zpane/specs")]);
+    }
+
+    #[test]
+    fn test_spec_search_dirs_windows_appdata_localappdata_and_cache_dedup() {
+        let standard = spec_search_dirs_from(&SpecDirEnv {
+            is_windows: true,
+            xdg_config_home: None,
+            home: None,
+            appdata: Some(PathBuf::from(r"C:\Users\alice\AppData\Roaming")),
+            local_appdata: Some(PathBuf::from(r"C:\Users\alice\AppData\Local")),
+            userprofile: Some(PathBuf::from(r"C:\Users\alice")),
+            cache_dir: PathBuf::from(r"C:\Users\alice\AppData\Local\zpane"),
+        });
+        assert_eq!(
+            standard,
+            vec![
+                PathBuf::from(r"C:\Users\alice\AppData\Roaming")
+                    .join("zpane")
+                    .join("specs"),
+                PathBuf::from(r"C:\Users\alice\AppData\Local")
+                    .join("zpane")
+                    .join("specs"),
+                PathBuf::from(r"C:\Users\alice\AppData\Roaming")
+                    .join("carapace")
+                    .join("specs"),
+                PathBuf::from(r"C:\Users\alice\AppData\Local")
+                    .join("carapace")
+                    .join("specs"),
+            ],
+            "cache_dir/specs equal to %LOCALAPPDATA%\\zpane\\specs must be deduplicated"
+        );
+
+        let distinct_cache = spec_search_dirs_from(&SpecDirEnv {
+            is_windows: true,
+            xdg_config_home: None,
+            home: None,
+            appdata: None,
+            local_appdata: None,
+            userprofile: Some(PathBuf::from(r"C:\Users\bob")),
+            cache_dir: PathBuf::from(r"D:\legacy_cache\zpane"),
+        });
+        assert_eq!(
+            distinct_cache,
+            vec![
+                PathBuf::from(r"C:\Users\bob")
+                    .join("AppData")
+                    .join("Roaming")
+                    .join("zpane")
+                    .join("specs"),
+                PathBuf::from(r"C:\Users\bob")
+                    .join("AppData")
+                    .join("Local")
+                    .join("zpane")
+                    .join("specs"),
+                PathBuf::from(r"C:\Users\bob")
+                    .join("AppData")
+                    .join("Roaming")
+                    .join("carapace")
+                    .join("specs"),
+                PathBuf::from(r"C:\Users\bob")
+                    .join("AppData")
+                    .join("Local")
+                    .join("carapace")
+                    .join("specs"),
+                PathBuf::from(r"D:\legacy_cache\zpane").join("specs"),
+            ]
+        );
     }
 }

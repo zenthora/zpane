@@ -2,8 +2,9 @@ use super::config::{load_user_config, UserConfig};
 use super::powershell::{
     parse_ps_metadata_entries, ps_metadata_path, sync_powershell_metadata, MAX_PS_METADATA_BYTES,
 };
+use super::project_tasks::{discover_project_task_specs, merge_task_entries_front};
 use super::shell_rc::{collect_shell_rc_files, parse_posix_fish_definitions};
-use super::specs::{is_spec_filename, parse_spec_str, specs_dir};
+use super::specs::{is_spec_filename, parse_spec_str, spec_search_dirs};
 use crate::model::{Entry, EntryKind, RuntimeContext};
 use crate::sanitize::{contains_ignore_ascii_case, is_disallowed_control, sanitize_single_line};
 use crate::shell::quote_single_for_dialect;
@@ -585,10 +586,20 @@ pub(super) fn collect_path_dirs_with_prefix(
     dirs
 }
 
-pub(super) fn load_specs_from_dir(dir: &Path) -> Vec<(String, String)> {
+fn load_specs_from_dir_bounded(
+    dir: &Path,
+    max_files: usize,
+    seen_canon_dirs: &mut HashSet<PathBuf>,
+) -> Vec<(String, String)> {
+    if max_files == 0 {
+        return Vec::new();
+    }
     let Ok(canon_dir) = fs::canonicalize(dir) else {
         return Vec::new();
     };
+    if !seen_canon_dirs.insert(canon_dir.clone()) {
+        return Vec::new();
+    }
     let Ok(entries) = fs::read_dir(&canon_dir) else {
         return Vec::new();
     };
@@ -615,7 +626,7 @@ pub(super) fn load_specs_from_dir(dir: &Path) -> Vec<(String, String)> {
         })
         .collect();
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    files.truncate(MAX_SPEC_FILES);
+    files.truncate(max_files);
 
     files
         .into_iter()
@@ -623,6 +634,23 @@ pub(super) fn load_specs_from_dir(dir: &Path) -> Vec<(String, String)> {
             read_bounded_string(&path, MAX_SPEC_BYTES as u64).map(|body| (name, body))
         })
         .collect()
+}
+
+pub(super) fn load_specs_from_dirs(dirs: &[PathBuf]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut seen_canon_dirs = HashSet::new();
+    for dir in dirs {
+        let remaining = MAX_SPEC_FILES.saturating_sub(out.len());
+        if remaining == 0 {
+            break;
+        }
+        out.extend(load_specs_from_dir_bounded(
+            dir,
+            remaining,
+            &mut seen_canon_dirs,
+        ));
+    }
+    out
 }
 
 /// Injectable environment/filesystem source for building the Pane 1 Command Catalog.
@@ -636,6 +664,9 @@ pub(super) trait EnvSource {
         UserConfig::default()
     }
     fn shell_rc_files(&self, _dialect: ShellDialect) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    fn project_task_specs(&self) -> Vec<Entry> {
         Vec::new()
     }
 }
@@ -676,7 +707,7 @@ impl EnvSource for OsEnv {
     }
 
     fn spec_files(&self) -> Vec<(String, String)> {
-        load_specs_from_dir(&specs_dir())
+        load_specs_from_dirs(&spec_search_dirs())
     }
 
     fn user_config(&self) -> UserConfig {
@@ -685,6 +716,13 @@ impl EnvSource for OsEnv {
 
     fn shell_rc_files(&self, dialect: ShellDialect) -> Vec<(String, String)> {
         collect_shell_rc_files(dialect)
+    }
+
+    fn project_task_specs(&self) -> Vec<Entry> {
+        env::current_dir()
+            .ok()
+            .map(|cwd| discover_project_task_specs(&cwd))
+            .unwrap_or_default()
     }
 }
 
@@ -901,6 +939,13 @@ fn merge_spec_into_entry(target: &mut Entry, spec: Entry) {
     }
 }
 
+fn merge_project_task_spec_into_entry(target: &mut Entry, task_spec: Entry) {
+    if target.desc.is_empty() && !task_spec.desc.is_empty() {
+        target.desc = task_spec.desc;
+    }
+    merge_task_entries_front(&mut target.children, task_spec.children);
+}
+
 pub(super) fn load_catalog_with_context(
     dialect: ShellDialect,
     env_src: &dyn EnvSource,
@@ -1017,13 +1062,15 @@ pub(super) fn load_catalog_with_context(
         }
     }
 
-    // 3b. Load declarative specs (carapace-spec / Fig) and merge or register commands
+    // 3b. Load declarative specs (carapace-spec / Fig) in strict precedence order
+    //     so higher-precedence specs win cleanly without duplicate conflicts.
+    let mut seen_spec_cmds: HashSet<String> = HashSet::new();
     for (file_name, content) in env_src.spec_files() {
         let Ok(spec_entry) = parse_spec_str(&file_name, &content) else {
             continue;
         };
         let key = spec_entry.text.to_ascii_lowercase();
-        if disabled.contains(&key) {
+        if disabled.contains(&key) || !seen_spec_cmds.insert(key.clone()) {
             continue;
         }
         if let Some(cli_entry) = cli_map.get_mut(&key) {
@@ -1033,6 +1080,23 @@ pub(super) fn load_catalog_with_context(
         } else {
             cli_order.push(key.clone());
             cli_map.insert(key, spec_entry);
+        }
+    }
+
+    // 3c. Merge project-local task targets (justfile, Makefile, package.json, mise.toml)
+    //     from the active working directory so Pane 2/3 immediately surfaces them.
+    for task_spec in env_src.project_task_specs() {
+        let key = task_spec.text.to_ascii_lowercase();
+        if disabled.contains(&key) {
+            continue;
+        }
+        if let Some(cli_entry) = cli_map.get_mut(&key) {
+            merge_project_task_spec_into_entry(cli_entry, task_spec);
+        } else if let Some(ps_entry) = ps_map.get_mut(&key) {
+            merge_project_task_spec_into_entry(ps_entry, task_spec);
+        } else {
+            cli_order.push(key.clone());
+            cli_map.insert(key, task_spec);
         }
     }
 
@@ -1766,5 +1830,224 @@ commands:
             .map(|e| e.text.as_str())
             .collect();
         assert_eq!(cli_names, vec!["git", "MyTool", "lowercase_only"]);
+    }
+
+    #[test]
+    fn test_declarative_spec_precedence_zpane_over_carapace_over_legacy_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "zpane_spec_prec_test_{}_{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        let zpane_specs = root.join("config").join("zpane").join("specs");
+        let carapace_specs = root.join("config").join("carapace").join("specs");
+        let cache_specs = root.join("cache").join("zpane").join("specs");
+        fs::create_dir_all(&zpane_specs).unwrap();
+        fs::create_dir_all(&carapace_specs).unwrap();
+        fs::create_dir_all(&cache_specs).unwrap();
+
+        // Tier 1 (highest): overrides `kubectl`, has invalid YAML for `helm` (should fall back to Tier 2)
+        fs::write(
+            zpane_specs.join("kubectl.yaml"),
+            "name: kubectl\ndescription: Zpane kubectl\nflags:\n  --context=: Zpane context\ncommands:\n  - name: apply\n    description: Apply manifests\n",
+        )
+        .unwrap();
+        fs::write(zpane_specs.join("helm.yaml"), "name: helm\n\tbroken: tab\n").unwrap();
+
+        // Tier 2 (carapace): conflicting `kubectl` (must lose), valid `helm` (must win over Tier 3)
+        fs::write(
+            carapace_specs.join("kubectl.json"),
+            r#"{"name":"kubectl","description":"Carapace kubectl","flags":{"--context":"Lower flag","--carapace-only":"Should not leak"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            carapace_specs.join("helm.yaml"),
+            "name: helm\ndescription: Carapace helm\ncommands:\n  - name: upgrade\n    description: Upgrade release\n",
+        )
+        .unwrap();
+
+        // Tier 3 (legacy cache): conflicting `kubectl`/`helm` (must lose), unique `legacytool` (must load)
+        fs::write(
+            cache_specs.join("kubectl.yaml"),
+            "name: kubectl\ndescription: Legacy kubectl\nflags:\n  --legacy: Stale flag\n",
+        )
+        .unwrap();
+        fs::write(
+            cache_specs.join("helm.yaml"),
+            "name: helm\ndescription: Legacy helm\n",
+        )
+        .unwrap();
+        fs::write(
+            cache_specs.join("legacytool.yaml"),
+            "name: legacytool\ndescription: Legacy cache tool\nflags:\n  --old: Legacy option\n",
+        )
+        .unwrap();
+
+        // Passing duplicate dir path must not scan it twice
+        let loaded_specs = load_specs_from_dirs(&[
+            zpane_specs.clone(),
+            zpane_specs,
+            carapace_specs,
+            cache_specs,
+        ]);
+
+        let bin_dir = PathBuf::from("/fake/bin");
+        let fake = FakeEnv {
+            vars: vec![],
+            path_dirs: vec![bin_dir.clone()],
+            bins: HashMap::from([(
+                bin_dir,
+                vec![("kubectl".to_string(), PathBuf::from("/fake/bin/kubectl"))],
+            )]),
+            ps_metadata: None,
+            specs: loaded_specs,
+            user_config: UserConfig::default(),
+            shell_rc: Vec::new(),
+        };
+
+        let catalog = load_catalog_with(ShellDialect::Posix, &fake);
+
+        let kubectl = catalog
+            .iter()
+            .find(|e| e.text == "kubectl")
+            .expect("kubectl in catalog");
+        assert!(kubectl.desc.contains("Zpane kubectl"));
+        assert!(!kubectl.desc.contains("Carapace kubectl"));
+        assert!(!kubectl.desc.contains("Legacy kubectl"));
+        assert_eq!(
+            kubectl
+                .children
+                .iter()
+                .filter(|c| c.text == "--context")
+                .count(),
+            1
+        );
+        let ctx_param = kubectl
+            .children
+            .iter()
+            .find(|c| c.text == "--context")
+            .unwrap();
+        assert_eq!(ctx_param.kind, EntryKind::Param);
+        assert_eq!(ctx_param.desc, "Zpane context");
+        assert!(kubectl.children.iter().any(|c| c.text == "apply"));
+        assert!(!kubectl.children.iter().any(|c| c.text == "--carapace-only"));
+        assert!(!kubectl.children.iter().any(|c| c.text == "--legacy"));
+
+        let helm = catalog
+            .iter()
+            .find(|e| e.text == "helm")
+            .expect("helm falls back to Tier 2 when Tier 1 spec is corrupt");
+        assert_eq!(helm.desc, "Carapace helm");
+        assert!(helm.children.iter().any(|c| c.text == "upgrade"));
+
+        let legacy = catalog
+            .iter()
+            .find(|e| e.text == "legacytool")
+            .expect("legacytool loads from Tier 3 cache fallback");
+        assert_eq!(legacy.desc, "Legacy cache tool");
+        assert!(legacy.children.iter().any(|c| c.text == "--old"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_catalog_merges_project_tasks_with_declarative_specs_and_path_commands() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let proj_dir = env::temp_dir().join(format!(
+            "zpane_cat_proj_tasks_{}_{nonce}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&proj_dir);
+        fs::create_dir_all(&proj_dir).unwrap();
+        fs::write(
+            proj_dir.join("package.json"),
+            r#"{"scripts":{"dev":"vite","test":"vitest"}}"#,
+        )
+        .unwrap();
+        fs::write(proj_dir.join("justfile"), "build:\n    cargo build\n").unwrap();
+
+        struct ProjectFakeEnv {
+            inner: FakeEnv,
+            project_dir: PathBuf,
+        }
+        impl EnvSource for ProjectFakeEnv {
+            fn env_vars(&self) -> Vec<(String, String)> {
+                self.inner.env_vars()
+            }
+            fn path_dirs(&self) -> Vec<PathBuf> {
+                self.inner.path_dirs()
+            }
+            fn dir_executables(&self, dir: &Path) -> Vec<(String, PathBuf)> {
+                self.inner.dir_executables(dir)
+            }
+            fn read_ps_metadata(&self) -> Option<Vec<u8>> {
+                self.inner.read_ps_metadata()
+            }
+            fn spec_files(&self) -> Vec<(String, String)> {
+                self.inner.spec_files()
+            }
+            fn user_config(&self) -> UserConfig {
+                self.inner.user_config()
+            }
+            fn shell_rc_files(&self, dialect: ShellDialect) -> Vec<(String, String)> {
+                self.inner.shell_rc_files(dialect)
+            }
+            fn project_task_specs(&self) -> Vec<Entry> {
+                discover_project_task_specs(&self.project_dir)
+            }
+        }
+
+        let npm_spec = r#"
+name: npm
+description: Node package manager
+commands:
+  - name: install
+    description: Install dependencies
+  - name: run
+    description: Run script
+    flags:
+      --if-present: Skip missing script
+"#;
+        let bin_dir = PathBuf::from("/fake/bin");
+        let fake = ProjectFakeEnv {
+            inner: FakeEnv {
+                vars: vec![],
+                path_dirs: vec![bin_dir.clone()],
+                bins: HashMap::from([(
+                    bin_dir,
+                    vec![
+                        ("npm".to_string(), PathBuf::from("/fake/bin/npm")),
+                        ("just".to_string(), PathBuf::from("/fake/bin/just")),
+                    ],
+                )]),
+                ps_metadata: None,
+                specs: vec![("npm.yaml".to_string(), npm_spec.to_string())],
+                user_config: UserConfig::default(),
+                shell_rc: Vec::new(),
+            },
+            project_dir: proj_dir.clone(),
+        };
+
+        let catalog = load_catalog_with(ShellDialect::Posix, &fake);
+
+        let npm = catalog.iter().find(|e| e.text == "npm").expect("npm");
+        assert!(npm.children.iter().any(|c| c.text == "install"));
+        assert_eq!(npm.children.iter().filter(|c| c.text == "run").count(), 1);
+        let npm_run = npm.walk_chain(&["run"]).expect("npm run");
+        let run_texts: Vec<&str> = npm_run.children.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(run_texts, vec!["dev", "test", "--if-present"]);
+
+        let just = catalog.iter().find(|e| e.text == "just").expect("just");
+        assert!(just.children.iter().any(|c| c.text == "build"));
+
+        let _ = fs::remove_dir_all(&proj_dir);
     }
 }

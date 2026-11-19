@@ -1,4 +1,4 @@
-use super::catalog::starts_with_ignore_ascii_case;
+use super::catalog::{ends_with_ignore_ascii_case, starts_with_ignore_ascii_case};
 use crate::model::{Entry, EntryKind};
 use crate::sanitize::{contains_ignore_ascii_case, strip_help_text_escapes};
 use regex::Regex;
@@ -19,6 +19,7 @@ enum HelpSection {
     None,
     Commands,
     Flags,
+    Positional,
     Ignore,
 }
 
@@ -53,9 +54,69 @@ fn leading_ws_count(line: &str) -> usize {
     idx
 }
 
+fn extract_box_header_title(trimmed: &str) -> Option<&str> {
+    let inner = trimmed
+        .strip_prefix('╭')
+        .and_then(|s| s.strip_suffix('╮'))
+        .or_else(|| trimmed.strip_prefix('┌').and_then(|s| s.strip_suffix('┐')))
+        .or_else(|| trimmed.strip_prefix('+').and_then(|s| s.strip_suffix('+')))?;
+    let title = inner.trim_matches(|c: char| c == '─' || c == '-' || c.is_whitespace());
+    (!title.is_empty() && title.len() <= 64).then_some(title)
+}
+
+fn is_box_bottom_border(trimmed: &str) -> bool {
+    (trimmed.starts_with('╰') && trimmed.ends_with('╯'))
+        || (trimmed.starts_with('└') && trimmed.ends_with('┘'))
+        || (trimmed.starts_with('+')
+            && trimmed.ends_with('+')
+            && trimmed.len() >= 4
+            && trimmed[1..trimmed.len() - 1].bytes().all(|b| b == b'-'))
+}
+
+fn unwrap_box_row(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.strip_prefix('│')?.strip_suffix('│')?;
+    Some(format!(" {}", inner.trim_end()))
+}
+
+fn classify_section_title(title: &str) -> Option<HelpSection> {
+    if starts_with_ignore_ascii_case(title, "positional argument") {
+        return Some(HelpSection::Positional);
+    }
+    if contains_ignore_ascii_case(title, "command")
+        || contains_ignore_ascii_case(title, "subcommand")
+        || contains_ignore_ascii_case(title, "groups")
+    {
+        return Some(HelpSection::Commands);
+    }
+    if contains_ignore_ascii_case(title, "flag")
+        || contains_ignore_ascii_case(title, "option")
+        || contains_ignore_ascii_case(title, "argument")
+        || contains_ignore_ascii_case(title, "selection")
+        || contains_ignore_ascii_case(title, "switch")
+        || contains_ignore_ascii_case(title, "parameter")
+    {
+        return Some(HelpSection::Flags);
+    }
+    None
+}
+
 fn classify_section_header(line: &str) -> Option<HelpSection> {
     let trimmed = line.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.starts_with('-') {
+    if trimmed.is_empty() || trimmed.len() > 256 || trimmed.starts_with('-') {
+        return None;
+    }
+
+    if let Some(box_title) = extract_box_header_title(trimmed) {
+        if starts_with_ignore_ascii_case(box_title, "usage")
+            || starts_with_ignore_ascii_case(box_title, "examples")
+        {
+            return Some(HelpSection::Ignore);
+        }
+        return classify_section_title(box_title);
+    }
+
+    if trimmed.len() > 128 {
         return None;
     }
 
@@ -134,19 +195,25 @@ fn classify_section_header(line: &str) -> Option<HelpSection> {
     }
 
     if ends_with_colon || is_all_caps() {
-        if contains_ignore_ascii_case(trimmed, "command")
-            || contains_ignore_ascii_case(trimmed, "subcommand")
-        {
-            return Some(HelpSection::Commands);
+        if let Some(sec) = classify_section_title(trimmed) {
+            return Some(sec);
         }
-        if contains_ignore_ascii_case(trimmed, "flag")
-            || contains_ignore_ascii_case(trimmed, "option")
-            || contains_ignore_ascii_case(trimmed, "argument")
-            || contains_ignore_ascii_case(trimmed, "selection")
-            || contains_ignore_ascii_case(trimmed, "switch")
-            || contains_ignore_ascii_case(trimmed, "parameter")
+    }
+
+    // Azure CLI (`az` / `knack`) uses column-0 section headings without trailing colons,
+    // such as `Arguments`, `Global Arguments`, or `Subgroups`.
+    if leading_spaces == 0 && trimmed.len() <= 48 && trimmed.split_whitespace().count() <= 4 {
+        if ends_with_ignore_ascii_case(trimmed, "arguments")
+            || ends_with_ignore_ascii_case(trimmed, "options")
+            || ends_with_ignore_ascii_case(trimmed, "flags")
         {
             return Some(HelpSection::Flags);
+        }
+        if ends_with_ignore_ascii_case(trimmed, "commands")
+            || ends_with_ignore_ascii_case(trimmed, "subgroups")
+            || ends_with_ignore_ascii_case(trimmed, "groups")
+        {
+            return Some(HelpSection::Commands);
         }
     }
 
@@ -175,19 +242,184 @@ fn normalize_flag_token(raw_flag: &str) -> Cow<'_, str> {
     }
 }
 
-fn build_flag_entry(short: &str, flag: Cow<'_, str>, arg_hint: &str, desc: &str) -> Entry {
-    let kind = if arg_hint.is_empty() {
-        EntryKind::Flag
+fn is_short_flag_token(tok: &str) -> bool {
+    let bytes = tok.as_bytes();
+    bytes.len() == 2 && bytes[0] == b'-' && (bytes[1].is_ascii_alphanumeric() || bytes[1] == b'?')
+}
+
+fn is_separated_metavar_token(tok: &str) -> bool {
+    if tok.is_empty() || tok.len() > 64 {
+        return false;
+    }
+    if (tok.starts_with('<') && tok.ends_with('>') && tok.len() >= 3)
+        || (tok.starts_with('{') && tok.ends_with('}') && tok.contains(','))
+        || (tok.starts_with('[') && tok.ends_with(']') && tok.contains('|'))
+    {
+        return true;
+    }
+    tok.len() >= 2
+        && tok.len() <= 24
+        && tok != "DEPRECATED"
+        && tok.as_bytes()[0].is_ascii_uppercase()
+        && tok
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+fn split_at_column_gap(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'\t' || (bytes[i] == b' ' && bytes[i + 1] == b' ') {
+            let head = s[..i].trim_end();
+            let tail = s[i..].trim_start();
+            if !head.is_empty() && !tail.is_empty() {
+                return Some((head, tail));
+            }
+        }
+    }
+    None
+}
+
+fn refine_flag_parts<'a>(
+    short: &'a str,
+    raw_flag: &str,
+    mut arg_hint: &'a str,
+    mut desc: &'a str,
+) -> (Vec<&'a str>, &'a str, &'a str, bool) {
+    let mut aliases: Vec<&'a str> = Vec::new();
+    let mut force_param = false;
+
+    if !short.is_empty() && short != raw_flag {
+        aliases.push(short);
+    }
+
+    // 1. Click/Typer boolean toggle pair: `--verbose / --no-verbose`
+    if let Some(after_slash) = arg_hint.strip_prefix('/') {
+        let toggle = after_slash.trim();
+        if toggle.starts_with('-') {
+            let toggle_tok = toggle.split_whitespace().next().unwrap_or("");
+            if !toggle_tok.is_empty() && toggle_tok != raw_flag && !aliases.contains(&toggle_tok) {
+                aliases.push(toggle_tok);
+            }
+            arg_hint = "";
+        }
+    }
+
+    // 2. Long-first short alias (Azure CLI `az`/knack: `--output -o`, `--resource-group -g`)
+    if aliases.is_empty() && raw_flag.starts_with("--") && !arg_hint.is_empty() {
+        let mut parts = arg_hint.split_whitespace();
+        if let Some(first) = parts.next() {
+            if is_short_flag_token(first) {
+                aliases.push(first);
+                let rest = arg_hint[first.len()..].trim();
+                if rest.eq_ignore_ascii_case("[required]") {
+                    force_param = true;
+                    arg_hint = "";
+                } else {
+                    arg_hint = rest;
+                }
+            }
+        }
+    }
+
+    // 3. Typer Rich separated short flag / metavar column inside `desc`:
+    //    `--verbose   -v   Enable verbose` or `--config   -c   TEXT   Config path`
+    if arg_hint.is_empty() && raw_flag.starts_with("--") {
+        if aliases.is_empty() {
+            if let Some((head, tail)) = split_at_column_gap(desc) {
+                if is_short_flag_token(head) {
+                    aliases.push(head);
+                    desc = tail;
+                }
+            } else if is_short_flag_token(desc) {
+                aliases.push(desc);
+                desc = "";
+            }
+        }
+        if let Some((head, tail)) = split_at_column_gap(desc) {
+            if is_separated_metavar_token(head) {
+                arg_hint = head;
+                desc = tail;
+            }
+        }
+    }
+
+    // 4. Azure CLI `[Required] : <desc>` and `: <desc>` separators
+    if let Some(rest) = desc
+        .strip_prefix("[Required]")
+        .or_else(|| desc.strip_prefix("[required]"))
+    {
+        let after = rest.trim_start();
+        if let Some(after_colon) = after.strip_prefix(':') {
+            force_param = true;
+            desc = after_colon.trim_start();
+        }
+    } else if let Some(after_colon) = desc.strip_prefix(':') {
+        if after_colon.is_empty() || after_colon.starts_with(char::is_whitespace) {
+            desc = after_colon.trim_start();
+        }
+    }
+
+    (aliases, arg_hint, desc, force_param)
+}
+
+fn populate_arg_hint_enums(entry: &mut Entry, arg_hint: &str) {
+    let trimmed = arg_hint.trim();
+    let (inner, sep) = if let Some(s) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}'))
+    {
+        if !s.contains(',') {
+            return;
+        }
+        (s, ',')
+    } else if let Some(s) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if !s.contains('|') {
+            return;
+        }
+        (s, '|')
     } else {
-        EntryKind::Param
+        return;
     };
 
-    let has_distinct_short = !short.is_empty() && short != flag.as_ref();
-    let label = if has_distinct_short {
+    for raw in inner
+        .split(sep)
+        .map(str::trim)
+        .filter(|v| !v.is_empty() && v.len() <= 128 && !v.chars().any(char::is_whitespace))
+        .take(MAX_ENUM_VALUES)
+    {
+        if !entry.children.iter().any(|c| c.text == raw) {
+            entry.children.push(Entry::new(
+                raw,
+                raw,
+                EntryKind::Enum,
+                format!("Allowed value for {}", entry.text),
+            ));
+        }
+    }
+    if entry.children.iter().any(|c| c.kind == EntryKind::Enum) {
+        entry.kind = EntryKind::Param;
+    }
+}
+
+fn build_flag_entry(
+    aliases: &[&str],
+    flag: Cow<'_, str>,
+    arg_hint: &str,
+    desc: &str,
+    force_param: bool,
+) -> Entry {
+    let kind = if !arg_hint.is_empty() || force_param {
+        EntryKind::Param
+    } else {
+        EntryKind::Flag
+    };
+
+    let primary_alias = aliases.first().copied().unwrap_or("");
+    let has_distinct_alias = !primary_alias.is_empty() && primary_alias != flag.as_ref();
+    let label = if has_distinct_alias {
         if !arg_hint.is_empty() {
-            format!("{flag} {arg_hint} ({short})")
+            format!("{flag} {arg_hint} ({primary_alias})")
         } else {
-            format!("{flag} ({short})")
+            format!("{flag} ({primary_alias})")
         }
     } else if !arg_hint.is_empty() {
         format!("{flag} {arg_hint}")
@@ -196,9 +428,12 @@ fn build_flag_entry(short: &str, flag: Cow<'_, str>, arg_hint: &str, desc: &str)
     };
 
     let mut entry = Entry::new(flag.into_owned(), label, kind, desc);
-    if has_distinct_short {
-        entry.aliases.push(short.to_string());
+    for &alias in aliases {
+        if !alias.is_empty() && alias != entry.text && !entry.aliases.iter().any(|a| a == alias) {
+            entry.aliases.push(alias.to_string());
+        }
     }
+    populate_arg_hint_enums(&mut entry, arg_hint);
     entry
 }
 
@@ -214,11 +449,14 @@ fn try_push_flag_entry(
     if seen.contains(flag.as_ref()) {
         return None;
     }
+    let (aliases, clean_hint, clean_desc, force_param) =
+        refine_flag_parts(short, flag.as_ref(), arg_hint, desc);
     let entry = build_flag_entry(
-        short,
+        &aliases,
         flag,
-        arg_hint,
-        truncate_utf8_prefix(desc, MAX_DESC_BYTES),
+        clean_hint,
+        truncate_utf8_prefix(clean_desc, MAX_DESC_BYTES),
+        force_param,
     );
     seen.insert(entry.text.clone());
     flags.push(entry);
@@ -398,8 +636,56 @@ fn append_desc_line(entry: &mut Entry, trimmed_line: &str) {
         .push_str(truncate_utf8_prefix(trimmed_line, remaining));
 }
 
-/// Parses `--help` / `-h` output from Cobra, Clap, winget, git, and generic CLIs
-/// into Pane 2/3 [`Entry`] values (subcommands, Parameters, Flags, enums, and defaults).
+fn strip_leading_colon_desc(desc: &str) -> &str {
+    if let Some(rest) = desc.strip_prefix(':') {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return rest.trim_start();
+        }
+    }
+    desc
+}
+
+fn parse_brace_subcommands(trimmed: &str) -> Option<Vec<String>> {
+    let rest = trimmed.strip_prefix('{')?;
+    let close = rest.find('}')?;
+    let inner = &rest[..close];
+    if inner.is_empty() {
+        return None;
+    }
+    let mut cmds = Vec::new();
+    for raw in inner.split(',').take(MAX_HELP_ENTRIES) {
+        let name = raw.trim();
+        if !name.is_empty()
+            && name.len() <= 64
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            && name.as_bytes()[0].is_ascii_alphanumeric()
+        {
+            cmds.push(name.to_string());
+        }
+    }
+    (!cmds.is_empty()).then_some(cmds)
+}
+
+fn flush_positional_subcommands(
+    pending: &mut Vec<String>,
+    pending_set: &mut HashSet<String>,
+    subcmds: &mut Vec<Entry>,
+    seen: &mut HashSet<String>,
+) {
+    for cmd in pending.drain(..) {
+        if subcmds.len() >= MAX_HELP_ENTRIES {
+            break;
+        }
+        try_push_subcmd_entry(subcmds, seen, &cmd, "", "");
+    }
+    pending_set.clear();
+}
+
+/// Parses `--help` / `-h` output from Cobra, Clap, winget, git, Azure CLI (`az`/`knack`),
+/// `gcloud`, Python (`argparse`/`click`/`typer`), and generic CLIs into Pane 2/3 [`Entry`]
+/// values (subcommands, Parameters, Flags, enums, and defaults).
 pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
     static RE_SECTION_SUBCMD: OnceLock<Option<Regex>> = OnceLock::new();
     static RE_SECTION_SUBCMD_HEADER: OnceLock<Option<Regex>> = OnceLock::new();
@@ -411,7 +697,7 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
 
     let re_sec_sub = cached_regex(
         &RE_SECTION_SUBCMD,
-        r"^\s{2,8}([a-zA-Z0-9][a-zA-Z0-9_-]*)(?::|,\s*([a-zA-Z0-9][a-zA-Z0-9_-]*))?(?:\s{2,}|\t|\s*:\s+)(.+)$",
+        r"^\s{2,10}([a-zA-Z0-9][a-zA-Z0-9_-]*)(?::|,\s*([a-zA-Z0-9][a-zA-Z0-9_-]*))?(?:\s{2,}|\t|\s*:\s+)(.+)$",
     );
     let re_sec_sub_header = cached_regex(
         &RE_SECTION_SUBCMD_HEADER,
@@ -420,11 +706,11 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
 
     let re_sec_flag = cached_regex(
         &RE_SECTION_FLAG,
-        r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?:[ =]([^\s].*?)|(\[[^\]]+\]))?(?:\s{2,}|\t)(.+)$",
+        r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|\{[^}]+\}|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?:[ =]([^\s].*?)|(\[[^\]]+\]))?(?:\s{2,}|\t)(.+)$",
     );
     let re_sec_flag_header = cached_regex(
         &RE_SECTION_FLAG_HEADER,
-        r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?: (<[^>]+>|\[[^\]]+\]|[A-Z][A-Z0-9_.-]*)|=([^\s]+)|(\[[^\]]+\]))?\s*$",
+        r"^\s{1,10}(?:(-[a-zA-Z0-9\?])(?:\s+(?:<[^>]+>|\[[^\]]+\]|\{[^}]+\}|[A-Za-z0-9_-]+)\s*(?:,|\|)|,?\s*(?:\||,)?)\s*)?(--(?:\[no-\])?[a-zA-Z0-9][a-zA-Z0-9_\.-]*|-[a-zA-Z0-9\?])(?: (<[^>]+>|\[[^\]]+\]|\{[^}]+\}|[A-Z][A-Z0-9_.-]*)|=([^\s]+)|(\[[^\]]+\]))?\s*$",
     );
 
     let bounded_help = truncate_utf8_prefix(help_text, MAX_HELP_BYTES);
@@ -439,18 +725,38 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
     let mut detected_sections = false;
     let mut active_item: Option<(HelpSection, usize, usize, usize)> = None;
     let mut section_cmd_indent: Option<usize> = None;
+    let mut positional_subcmds: Vec<String> = Vec::new();
+    let mut positional_subcmd_set: HashSet<String> = HashSet::new();
 
     for raw_line in clean_help.lines().take(MAX_HELP_LINES) {
-        let line = truncate_utf8_prefix(raw_line, MAX_HELP_LINE_BYTES);
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        let bounded_line = truncate_utf8_prefix(raw_line, MAX_HELP_LINE_BYTES);
+        let raw_trimmed = bounded_line.trim();
+        if raw_trimmed.is_empty() {
             if matches!(current_sec, HelpSection::Ignore | HelpSection::None) {
                 active_item = None;
             }
             continue;
         }
-        if trimmed.len() <= 128 && !trimmed.starts_with('-') {
+        if is_box_bottom_border(raw_trimmed) {
+            active_item = None;
+            continue;
+        }
+        let unwrapped_box = unwrap_box_row(bounded_line);
+        let line = unwrapped_box.as_deref().unwrap_or(bounded_line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if unwrapped_box.is_none() && trimmed.len() <= 256 && !trimmed.starts_with('-') {
             if let Some(sec) = classify_section_header(line) {
+                if current_sec == HelpSection::Positional {
+                    flush_positional_subcommands(
+                        &mut positional_subcmds,
+                        &mut positional_subcmd_set,
+                        &mut subcmds,
+                        &mut seen,
+                    );
+                }
                 current_sec = sec;
                 detected_sections = true;
                 active_item = None;
@@ -488,7 +794,9 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                     if let Some(caps) = matched_sec_sub {
                         let cmd = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
                         let alias = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
-                        let desc = caps.get(3).map(|m| m.as_str().trim()).unwrap_or("");
+                        let desc = strip_leading_colon_desc(
+                            caps.get(3).map(|m| m.as_str().trim()).unwrap_or(""),
+                        );
                         if let Some(idx) =
                             try_push_subcmd_entry(&mut subcmds, &mut seen, cmd, alias, desc)
                         {
@@ -518,6 +826,49 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                 }
 
                 if let Some((HelpSection::Commands, idx, item_indent, ref mut cont)) = active_item {
+                    if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
+                        append_desc_line(&mut subcmds[idx], trimmed);
+                        *cont += 1;
+                    } else {
+                        active_item = None;
+                    }
+                }
+            }
+            HelpSection::Positional => {
+                if !at_entry_cap && trimmed.starts_with('{') {
+                    if let Some(parsed_cmds) = parse_brace_subcommands(trimmed) {
+                        for cmd in parsed_cmds {
+                            if positional_subcmd_set.insert(cmd.clone()) {
+                                positional_subcmds.push(cmd);
+                            }
+                        }
+                        active_item = None;
+                        continue;
+                    }
+                }
+                if !at_entry_cap
+                    && !positional_subcmd_set.is_empty()
+                    && (2..=10).contains(&line_indent)
+                    && (trimmed.contains('\t') || has_two_adjacent_ws(trimmed))
+                {
+                    if let Some(caps) = re_sec_sub.and_then(|re| re.captures(line)) {
+                        let cmd = caps.get(1).map(|m| m.as_str().trim()).unwrap_or("");
+                        if positional_subcmd_set.contains(cmd) {
+                            let alias = caps.get(2).map(|m| m.as_str().trim()).unwrap_or("");
+                            let desc = strip_leading_colon_desc(
+                                caps.get(3).map(|m| m.as_str().trim()).unwrap_or(""),
+                            );
+                            if let Some(idx) =
+                                try_push_subcmd_entry(&mut subcmds, &mut seen, cmd, alias, desc)
+                            {
+                                active_item = Some((HelpSection::Positional, idx, line_indent, 0));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                if let Some((HelpSection::Positional, idx, item_indent, ref mut cont)) = active_item
+                {
                     if line_indent > item_indent && *cont < MAX_CONTINUATION_LINES {
                         append_desc_line(&mut subcmds[idx], trimmed);
                         *cont += 1;
@@ -586,6 +937,15 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
                 active_item = None;
             }
         }
+    }
+
+    if !positional_subcmds.is_empty() {
+        flush_positional_subcommands(
+            &mut positional_subcmds,
+            &mut positional_subcmd_set,
+            &mut subcmds,
+            &mut seen,
+        );
     }
 
     if !detected_sections || (subcmds.is_empty() && flags.is_empty()) {
@@ -1184,5 +1544,304 @@ work on the current change (see also: git help everyday)
         let exec = fb.iter().find(|e| e.text == "--exec").expect("--exec");
         assert!(!exec.desc.contains('\u{202e}'));
         assert!(!exec.desc.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_parse_az_knack_and_gcloud_subgroups_groups_help() {
+        let az_help = r#"
+Group
+    az vm : Manage Linux or Windows virtual machines.
+
+Subgroups:
+    application          : Manage applications for VM.
+    availability-set     : Group resources into availability sets.
+    disk                 : Manage the managed data disks attached to a VM.
+
+Commands:
+    create               : Create an Azure Virtual Machine.
+    deallocate           : Deallocate a VM so that computing resources are no longer allocated.
+    list                 : List details of Virtual Machines.
+
+Arguments
+    --resource-group -g  [Required] : Name of resource group.
+    --output -o                     : Output format.  Allowed values: json, jsonc, none, table, tsv, yaml.  Default: json.
+    --verbose                       : Increase logging verbosity.
+    --help -h                       : Show this help message and exit.
+"#;
+        let items = parse_cli_help(az_help);
+        let subcmds: Vec<&str> = items
+            .iter()
+            .filter(|i| i.kind == EntryKind::Subcmd)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(
+            subcmds,
+            vec![
+                "application",
+                "availability-set",
+                "disk",
+                "create",
+                "deallocate",
+                "list"
+            ]
+        );
+        let app = items.iter().find(|i| i.text == "application").unwrap();
+        assert_eq!(app.desc, "Manage applications for VM.");
+
+        let rg = items
+            .iter()
+            .find(|i| i.text == "--resource-group")
+            .expect("--resource-group");
+        assert_eq!(rg.kind, EntryKind::Param);
+        assert_eq!(rg.aliases, vec!["-g"]);
+
+        let output = items
+            .iter()
+            .find(|i| i.text == "--output")
+            .expect("--output");
+        assert_eq!(output.kind, EntryKind::Param);
+        assert_eq!(output.aliases, vec!["-o"]);
+        let out_enums: Vec<&str> = output.children.iter().map(|c| c.text.as_str()).collect();
+        assert!(out_enums.contains(&"json"));
+        assert!(out_enums.contains(&"table"));
+        assert!(out_enums.contains(&"yaml"));
+
+        let verbose = items
+            .iter()
+            .find(|i| i.text == "--verbose")
+            .expect("--verbose");
+        assert_eq!(verbose.kind, EntryKind::Flag);
+        assert_eq!(verbose.desc, "Increase logging verbosity.");
+
+        let help_flag = items.iter().find(|i| i.text == "--help").expect("--help");
+        assert_eq!(help_flag.kind, EntryKind::Flag);
+        assert_eq!(help_flag.aliases, vec!["-h"]);
+
+        let gcloud_help = r#"
+GROUPS
+    GROUP is one of the following:
+
+     compute
+        Create and manipulate Compute Engine resources.
+
+     storage
+        Create and manage Cloud Storage buckets and objects.
+
+COMMANDS
+    COMMAND is one of the following:
+
+     auth
+        Manage oauth2 credentials for the Google Cloud CLI.
+"#;
+        let gcloud_items = parse_cli_help(gcloud_help);
+        let gcloud_subs: Vec<&str> = gcloud_items
+            .iter()
+            .filter(|i| i.kind == EntryKind::Subcmd)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(gcloud_subs, vec!["compute", "storage", "auth"]);
+        let compute = gcloud_items.iter().find(|i| i.text == "compute").unwrap();
+        assert!(compute.desc.contains("Compute Engine"));
+    }
+
+    #[test]
+    fn test_parse_python_argparse_help_with_subparsers_and_wrapped_metavars() {
+        let help = r#"
+usage: pytool [-h] [-v] [-f FILE] [--format {json,yaml,text}] {init,build,deploy} ...
+
+A sample Python argparse CLI tool.
+
+positional arguments:
+  {init,build,deploy}   Available subcommands
+    init                Initialize a new project
+    build               Build project artifacts
+    deploy              Deploy to target environment
+
+optional arguments:
+  -h, --help            show this help message and exit
+  -v, --verbose         enable verbose logging
+  -f FILE, --file FILE  path to configuration file
+  -o, --output OUTPUT   destination output path
+  --format {json,yaml,text}
+                        output serialization format
+  --dry-run             preview actions without executing
+"#;
+        let items = parse_cli_help(help);
+        let subcmds: Vec<&str> = items
+            .iter()
+            .filter(|i| i.kind == EntryKind::Subcmd)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(subcmds, vec!["init", "build", "deploy"]);
+        assert_eq!(
+            items.iter().find(|i| i.text == "build").unwrap().desc,
+            "Build project artifacts"
+        );
+
+        let file_param = items.iter().find(|i| i.text == "--file").expect("--file");
+        assert_eq!(file_param.kind, EntryKind::Param);
+        assert_eq!(file_param.aliases, vec!["-f"]);
+
+        let output_param = items
+            .iter()
+            .find(|i| i.text == "--output")
+            .expect("--output");
+        assert_eq!(output_param.kind, EntryKind::Param);
+        assert_eq!(output_param.aliases, vec!["-o"]);
+
+        let format_param = items
+            .iter()
+            .find(|i| i.text == "--format")
+            .expect("--format");
+        assert_eq!(format_param.kind, EntryKind::Param);
+        assert!(format_param.desc.contains("output serialization format"));
+        let fmt_vals: Vec<&str> = format_param
+            .children
+            .iter()
+            .map(|c| c.text.as_str())
+            .collect();
+        assert_eq!(fmt_vals, vec!["json", "yaml", "text"]);
+
+        let dry_run = items
+            .iter()
+            .find(|i| i.text == "--dry-run")
+            .expect("--dry-run");
+        assert_eq!(dry_run.kind, EntryKind::Flag);
+
+        // Python 3.10+ `options:` heading and non-subparser `positional arguments:` must not create fake subcommands
+        let py312_help = r#"
+usage: copytool [-h] [--force] src dst
+
+positional arguments:
+  src        Source path
+  dst        Destination path
+
+options:
+  -h, --help   show this help message and exit
+  --force      overwrite existing destination
+"#;
+        let py312_items = parse_cli_help(py312_help);
+        assert!(
+            py312_items.iter().all(|i| i.kind != EntryKind::Subcmd),
+            "plain positional arguments without {{...}} subparsers must not become Subcmd entries"
+        );
+        assert!(py312_items
+            .iter()
+            .any(|i| i.text == "--force" && i.kind == EntryKind::Flag));
+    }
+
+    #[test]
+    fn test_parse_python_click_and_typer_help_fixtures() {
+        let click_help = r#"
+Usage: clickcli [OPTIONS] COMMAND [ARGS]...
+
+  Sample Click CLI application.
+
+Options:
+  -c, --config PATH               Path to config file.
+  -f, --format [json|yaml|table]  Output format.  [default: table]
+  -v, --verbose / --no-verbose    Enable verbose output.
+  --help                          Show this message and exit.
+
+Commands:
+  build   Build the project.
+  deploy  Deploy the application.
+"#;
+        let click_items = parse_cli_help(click_help);
+        let click_subs: Vec<&str> = click_items
+            .iter()
+            .filter(|i| i.kind == EntryKind::Subcmd)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(click_subs, vec!["build", "deploy"]);
+
+        let config = click_items
+            .iter()
+            .find(|i| i.text == "--config")
+            .expect("--config");
+        assert_eq!(config.kind, EntryKind::Param);
+        assert_eq!(config.aliases, vec!["-c"]);
+
+        let fmt = click_items
+            .iter()
+            .find(|i| i.text == "--format")
+            .expect("--format");
+        assert_eq!(fmt.kind, EntryKind::Param);
+        assert_eq!(fmt.aliases, vec!["-f"]);
+        let fmt_vals: Vec<&str> = fmt.children.iter().map(|c| c.text.as_str()).collect();
+        assert!(fmt_vals.contains(&"json"));
+        assert!(fmt_vals.contains(&"yaml"));
+        assert!(fmt_vals.contains(&"table"));
+
+        let verbose = click_items
+            .iter()
+            .find(|i| i.text == "--verbose")
+            .expect("--verbose");
+        assert_eq!(verbose.kind, EntryKind::Flag);
+        assert!(verbose.aliases.contains(&"-v".to_string()));
+        assert!(verbose.aliases.contains(&"--no-verbose".to_string()));
+
+        let typer_rich_help = r#"
+ Usage: typercli [OPTIONS] COMMAND [ARGS]...
+
+ Manage workspace services.
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --install-completion        [bash|zsh|fish|pwsh]  Install completion         │
+│ --verbose             -v                          Enable verbose output.     │
+│ --config              -c    TEXT                  Config path                │
+│                                                   [default: config.toml]     │
+│ --env                 -e    [dev|staging|prod]    Target environment         │
+│ --help                -h                          Show this message and      │
+│                                                   exit.                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Commands ───────────────────────────────────────────────────────────────────╮
+│ deploy   Deploy services to target environment.                              │
+│ status   Check current service health.                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+"#;
+        let typer_items = parse_cli_help(typer_rich_help);
+        let typer_subs: Vec<&str> = typer_items
+            .iter()
+            .filter(|i| i.kind == EntryKind::Subcmd)
+            .map(|i| i.text.as_str())
+            .collect();
+        assert_eq!(typer_subs, vec!["deploy", "status"]);
+
+        let t_verbose = typer_items
+            .iter()
+            .find(|i| i.text == "--verbose")
+            .expect("typer --verbose");
+        assert_eq!(t_verbose.kind, EntryKind::Flag);
+        assert_eq!(t_verbose.aliases, vec!["-v"]);
+        assert_eq!(t_verbose.desc, "Enable verbose output.");
+
+        let t_config = typer_items
+            .iter()
+            .find(|i| i.text == "--config")
+            .expect("typer --config");
+        assert_eq!(t_config.kind, EntryKind::Param);
+        assert_eq!(t_config.aliases, vec!["-c"]);
+        assert!(t_config.desc.contains("Config path"));
+        assert!(t_config
+            .children
+            .iter()
+            .any(|c| c.text == "config.toml" && c.kind == EntryKind::Value));
+
+        let t_env = typer_items
+            .iter()
+            .find(|i| i.text == "--env")
+            .expect("typer --env");
+        assert_eq!(t_env.kind, EntryKind::Param);
+        assert_eq!(t_env.aliases, vec!["-e"]);
+        let env_vals: Vec<&str> = t_env.children.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(env_vals, vec!["dev", "staging", "prod"]);
+
+        let t_comp = typer_items
+            .iter()
+            .find(|i| i.text == "--install-completion")
+            .expect("typer --install-completion");
+        assert_eq!(t_comp.kind, EntryKind::Param);
+        assert!(t_comp.children.iter().any(|c| c.text == "fish"));
     }
 }

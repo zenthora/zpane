@@ -5,6 +5,7 @@ mod help_parser;
 mod history;
 mod introspect;
 mod powershell;
+mod project_tasks;
 mod shell_rc;
 mod specs;
 
