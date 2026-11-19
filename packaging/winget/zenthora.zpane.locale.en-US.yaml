@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+# Default-locale manifest template; render with scripts/render-package-manifests.py.
+PackageIdentifier: zenthora.zpane
+PackageVersion: __VERSION__
+PackageLocale: en-US
+Publisher: zenthora
+PublisherUrl: https://github.com/zenthora
+PackageName: zpane
+PackageUrl: https://github.com/zenthora/zpane
+License: MIT
+LicenseUrl: https://github.com/zenthora/zpane/blob/main/LICENSE
+ShortDescription: 3-pane Miller column command, subcommand, parameter & variable explorer
+Description: zpane brings the spatial orientation of 3-column Miller file managers to interactive shell command construction across PowerShell and POSIX shells.
+Moniker: zpane
+Tags:
+  - cli
+  - miller-columns
+  - powershell
+  - tui
+ReleaseNotesUrl: https://github.com/zenthora/zpane/releases/tag/v__VERSION__
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

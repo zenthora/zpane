@@ -289,11 +289,12 @@ build_rpm_fallback() {
     local readme="$4"
     local license_file="$5"
     local out_rpm="$6"
+    local arch="$7"
     if [[ -z "${PYTHON_BIN}" ]]; then
         echo "Error: rpmbuild not found and Python fallback unavailable" >&2
         exit 1
     fi
-    "${PYTHON_BIN}" - "${version}" "${rel}" "$(host_path "${x86_bin}")" "$(host_path "${readme}")" "$(host_path "${license_file}")" "$(host_path "${out_rpm}")" <<'PY'
+    "${PYTHON_BIN}" - "${version}" "${rel}" "$(host_path "${x86_bin}")" "$(host_path "${readme}")" "$(host_path "${license_file}")" "$(host_path "${out_rpm}")" "${arch}" <<'PY'
 import gzip
 import hashlib
 import os
@@ -301,7 +302,10 @@ import struct
 import sys
 import time
 
-version, rel, x86_bin, readme, license_file, out_rpm = sys.argv[1:7]
+version, rel, x86_bin, readme, license_file, out_rpm, rpm_arch = sys.argv[1:8]
+rpm_arch_nums = {"x86_64": 1, "aarch64": 19}
+if rpm_arch not in rpm_arch_nums:
+    raise RuntimeError(f"Unsupported RPM architecture: {rpm_arch}")
 mtime = int(os.environ.get("SOURCE_DATE_EPOCH") or time.time())
 
 files_spec = [
@@ -372,7 +376,7 @@ main_entries = [
     (1016, 9, 1, b"Applications/System\x00"),
     (1020, 6, 1, b"https://github.com/zenthora/zpane\x00"),
     (1021, 6, 1, b"linux\x00"),
-    (1022, 6, 1, b"x86_64\x00"),
+    (1022, 6, 1, rpm_arch.encode("utf-8") + b"\x00"),
     (1028, 4, 3, struct.pack(">III", *(len(b) for b in blobs))),
     (1030, 3, 3, struct.pack(">HHH", *(f[4] for f in files_spec))),
     (1034, 4, 3, struct.pack(">III", mtime, mtime, mtime)),
@@ -401,7 +405,7 @@ sig_hdr = pack_rpm_header(sig_entries)
 sig_pad = b"\x00" * ((8 - len(sig_hdr) % 8) % 8)
 
 nvr = f"zpane-{version}-{rel}".encode("utf-8")[:65]
-lead = struct.pack(">4sBBHH66sHH16x", b"\xed\xab\xee\xdb", 3, 0, 0, 1, nvr, 1, 5)
+lead = struct.pack(">4sBBHH66sHH16x", b"\xed\xab\xee\xdb", 3, 0, 0, rpm_arch_nums[rpm_arch], nvr, 1, 5)
 with open(out_rpm, "wb") as f:
     f.write(lead)
     f.write(sig_hdr)
@@ -462,26 +466,31 @@ PY
     )
 }
 
+
 BUILT_ARTIFACTS=()
 
-# 1. Debian / Ubuntu package (zpane_<ver>-<rel>_amd64.deb)
-DEB_STAGE="${WORK_DIR}/deb-amd64"
-mkdir -p "${DEB_STAGE}/DEBIAN" \
-         "${DEB_STAGE}/usr/bin" \
-         "${DEB_STAGE}/usr/share/doc/zpane"
+# Packages a standard Linux .deb for one architecture (zpane_<ver>-<rel>_<amd64|arm64>.deb).
+package_deb() {
+    local deb_arch="$1"
+    local bin="$2"
+    local stage="${WORK_DIR}/deb-${deb_arch}"
+    mkdir -p "${stage}/DEBIAN" \
+             "${stage}/usr/bin" \
+             "${stage}/usr/share/doc/zpane"
 
-install -m 0755 "${X86_BIN}" "${DEB_STAGE}/usr/bin/zpane"
-install -m 0644 "${README_FILE}" "${DEB_STAGE}/usr/share/doc/zpane/README.md"
-install -m 0644 "${LICENSE_FILE}" "${DEB_STAGE}/usr/share/doc/zpane/copyright"
+    install -m 0755 "${bin}" "${stage}/usr/bin/zpane"
+    install -m 0644 "${README_FILE}" "${stage}/usr/share/doc/zpane/README.md"
+    install -m 0644 "${LICENSE_FILE}" "${stage}/usr/share/doc/zpane/copyright"
 
-INSTALLED_KB="$(du -sk "${DEB_STAGE}/usr" | cut -f1)"
-cat > "${DEB_STAGE}/DEBIAN/control" <<EOF
+    local installed_kb
+    installed_kb="$(du -sk "${stage}/usr" | cut -f1)"
+    cat > "${stage}/DEBIAN/control" <<EOF
 Package: zpane
 Version: ${VERSION}-${REL}
 Section: utils
 Priority: optional
-Architecture: amd64
-Installed-Size: ${INSTALLED_KB}
+Architecture: ${deb_arch}
+Installed-Size: ${installed_kb}
 Maintainer: zenthora <105382125+zenthora@users.noreply.github.com>
 Homepage: https://github.com/zenthora/zpane
 Description: 3-pane Miller column command, subcommand, parameter & variable explorer
@@ -489,29 +498,191 @@ Description: 3-pane Miller column command, subcommand, parameter & variable expl
  to interactive shell command construction across PowerShell and POSIX shells.
 EOF
 
-chmod 0755 \
-    "${DEB_STAGE}" \
-    "${DEB_STAGE}/DEBIAN" \
-    "${DEB_STAGE}/usr" \
-    "${DEB_STAGE}/usr/bin" \
-    "${DEB_STAGE}/usr/share" \
-    "${DEB_STAGE}/usr/share/doc" \
-    "${DEB_STAGE}/usr/share/doc/zpane"
-chmod 0755 "${DEB_STAGE}/usr/bin/zpane"
-chmod 0644 \
-    "${DEB_STAGE}/DEBIAN/control" \
-    "${DEB_STAGE}/usr/share/doc/zpane/README.md" \
-    "${DEB_STAGE}/usr/share/doc/zpane/copyright"
-stamp_mtime "${DEB_STAGE}"
+    chmod 0755 \
+        "${stage}" \
+        "${stage}/DEBIAN" \
+        "${stage}/usr" \
+        "${stage}/usr/bin" \
+        "${stage}/usr/share" \
+        "${stage}/usr/share/doc" \
+        "${stage}/usr/share/doc/zpane"
+    chmod 0755 "${stage}/usr/bin/zpane"
+    chmod 0644 \
+        "${stage}/DEBIAN/control" \
+        "${stage}/usr/share/doc/zpane/README.md" \
+        "${stage}/usr/share/doc/zpane/copyright"
+    stamp_mtime "${stage}"
 
-DEB_NAME="zpane_${VERSION}-${REL}_amd64.deb"
-if command -v dpkg-deb >/dev/null 2>&1; then
-    dpkg-deb --root-owner-group -Zgzip -z9 --build "${DEB_STAGE}" "${DIST_DIR}/${DEB_NAME}"
-else
-    build_deb_fallback "${DEB_STAGE}" "${DIST_DIR}/${DEB_NAME}" "0755" "0755"
-fi
-chmod 0644 "${DIST_DIR}/${DEB_NAME}"
-BUILT_ARTIFACTS+=("${DEB_NAME}")
+    local deb_name="zpane_${VERSION}-${REL}_${deb_arch}.deb"
+    if command -v dpkg-deb >/dev/null 2>&1; then
+        dpkg-deb --root-owner-group -Zgzip -z9 --build "${stage}" "${DIST_DIR}/${deb_name}"
+    else
+        build_deb_fallback "${stage}" "${DIST_DIR}/${deb_name}" "0755" "0755"
+    fi
+    chmod 0644 "${DIST_DIR}/${deb_name}"
+    BUILT_ARTIFACTS+=("${deb_name}")
+}
+
+# Packages an Arch Linux pacman package for one architecture
+# (zpane-<ver>-<rel>-<x86_64|aarch64>.pkg.tar.zst, or .pkg.tar.gz when zstd is unavailable).
+package_arch() {
+    local arch="$1"
+    local bin="$2"
+    local stage="${WORK_DIR}/arch-${arch}"
+    mkdir -p "${stage}/usr/bin" \
+             "${stage}/usr/share/doc/zpane" \
+             "${stage}/usr/share/licenses/zpane"
+
+    install -m 0755 "${bin}" "${stage}/usr/bin/zpane"
+    install -m 0644 "${README_FILE}" "${stage}/usr/share/doc/zpane/README.md"
+    install -m 0644 "${LICENSE_FILE}" "${stage}/usr/share/licenses/zpane/LICENSE"
+
+    local arch_bytes
+    arch_bytes="$(du -sb "${stage}/usr" | cut -f1)"
+    cat > "${stage}/.PKGINFO" <<EOF
+pkgname = zpane
+pkgbase = zpane
+pkgver = ${VERSION}-${REL}
+pkgdesc = Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer
+url = https://github.com/zenthora/zpane
+builddate = ${SOURCE_DATE_EPOCH}
+packager = zenthora <105382125+zenthora@users.noreply.github.com>
+size = ${arch_bytes}
+arch = ${arch}
+license = MIT
+optdepend = powershell: PowerShell cmdlet and parameter-set reflection
+EOF
+
+    chmod 0755 \
+        "${stage}" \
+        "${stage}/usr" \
+        "${stage}/usr/bin" \
+        "${stage}/usr/share" \
+        "${stage}/usr/share/doc" \
+        "${stage}/usr/share/doc/zpane" \
+        "${stage}/usr/share/licenses" \
+        "${stage}/usr/share/licenses/zpane"
+    chmod 0755 "${stage}/usr/bin/zpane"
+    chmod 0644 \
+        "${stage}/.PKGINFO" \
+        "${stage}/usr/share/doc/zpane/README.md" \
+        "${stage}/usr/share/licenses/zpane/LICENSE"
+    stamp_mtime "${stage}"
+
+    local zst_name="zpane-${VERSION}-${REL}-${arch}.pkg.tar.zst"
+    local gz_name="zpane-${VERSION}-${REL}-${arch}.pkg.tar.gz"
+    if [[ -n "${PYTHON_BIN}" ]] && { command -v cygpath >/dev/null 2>&1 || ! is_gnu_tar; }; then
+        local arch_tar="${WORK_DIR}/arch-${arch}.tar"
+        build_tar_py "${stage}" "${arch_tar}" "0755" "w" .PKGINFO usr
+        if command -v zstd >/dev/null 2>&1; then
+            zstd -f -q -19 "${arch_tar}" -o "${DIST_DIR}/${zst_name}"
+            chmod 0644 "${DIST_DIR}/${zst_name}"
+            BUILT_ARTIFACTS+=("${zst_name}")
+        elif command -v zstd.exe >/dev/null 2>&1; then
+            zstd.exe -f -q -19 "$(host_path "${arch_tar}")" -o "$(host_path "${DIST_DIR}/${zst_name}")"
+            chmod 0644 "${DIST_DIR}/${zst_name}"
+            BUILT_ARTIFACTS+=("${zst_name}")
+        else
+            gzip -9n -c "${arch_tar}" > "${DIST_DIR}/${gz_name}"
+            chmod 0644 "${DIST_DIR}/${gz_name}"
+            BUILT_ARTIFACTS+=("${gz_name}")
+        fi
+    elif command -v zstd >/dev/null 2>&1; then
+        tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+            -C "${stage}" -cf - .PKGINFO usr | zstd -q -19 > "${DIST_DIR}/${zst_name}"
+        chmod 0644 "${DIST_DIR}/${zst_name}"
+        BUILT_ARTIFACTS+=("${zst_name}")
+    elif command -v zstd.exe >/dev/null 2>&1; then
+        tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+            -C "${stage}" -cf - .PKGINFO usr | zstd.exe -q -19 > "${DIST_DIR}/${zst_name}"
+        chmod 0644 "${DIST_DIR}/${zst_name}"
+        BUILT_ARTIFACTS+=("${zst_name}")
+    else
+        tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+            -C "${stage}" -cf - .PKGINFO usr | gzip -9n > "${DIST_DIR}/${gz_name}"
+        chmod 0644 "${DIST_DIR}/${gz_name}"
+        BUILT_ARTIFACTS+=("${gz_name}")
+    fi
+}
+
+# Packages a Fedora / RHEL / openSUSE RPM for one architecture (zpane-<ver>-<rel>.<x86_64|aarch64>.rpm).
+package_rpm() {
+    local arch="$1"
+    local bin="$2"
+    local rpm_version="${VERSION//-/\~}"
+    local rpm_name="zpane-${rpm_version}-${REL}.${arch}.rpm"
+    if command -v rpmbuild >/dev/null 2>&1; then
+        local rpm_top="${WORK_DIR}/rpmbuild-${arch}"
+        mkdir -p "${rpm_top}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+        chmod 0755 "${rpm_top}" "${rpm_top}/BUILD" "${rpm_top}/RPMS" "${rpm_top}/SOURCES" "${rpm_top}/SPECS" "${rpm_top}/SRPMS"
+        install -m 0755 "${bin}" "${rpm_top}/SOURCES/zpane"
+        install -m 0644 "${README_FILE}" "${rpm_top}/SOURCES/README.md"
+        install -m 0644 "${LICENSE_FILE}" "${rpm_top}/SOURCES/LICENSE"
+        sed -e "s/^Version:.*/Version:        ${rpm_version}/" \
+            -e "s/^Release:.*/Release:        ${REL}/" \
+            -e "s/^BuildArch:.*/BuildArch:      ${arch}/" \
+            "${ROOT_DIR}/packaging/fedora/zpane.spec" > "${rpm_top}/SPECS/zpane.spec"
+        chmod 0644 "${rpm_top}/SPECS/zpane.spec"
+        stamp_mtime "${rpm_top}/SOURCES"
+
+        rpmbuild --define "_topdir ${rpm_top}" \
+                 --define "_build_id_links none" \
+                 --define "use_source_date_epoch_as_buildtime 1" \
+                 --define "clamp_mtime_to_source_date_epoch 1" \
+                 --define "_buildhost reproducible" \
+                 --target "${arch}-linux" \
+                 -bb "${rpm_top}/SPECS/zpane.spec"
+
+        local rpm_files=()
+        shopt -s nullglob
+        rpm_files=("${rpm_top}/RPMS/${arch}/"*.rpm)
+        shopt -u nullglob
+        if [[ ${#rpm_files[@]} -eq 0 ]]; then
+            echo "Error: rpmbuild produced no ${arch} RPM artifacts" >&2
+            exit 1
+        fi
+        local rpm_path rpm_base
+        for rpm_path in "${rpm_files[@]}"; do
+            rpm_base="$(basename "${rpm_path}")"
+            cp -f "${rpm_path}" "${DIST_DIR}/${rpm_base}"
+            chmod 0644 "${DIST_DIR}/${rpm_base}"
+            BUILT_ARTIFACTS+=("${rpm_base}")
+        done
+    else
+        build_rpm_fallback "${rpm_version}" "${REL}" "${bin}" "${README_FILE}" "${LICENSE_FILE}" "${DIST_DIR}/${rpm_name}" "${arch}"
+        chmod 0644 "${DIST_DIR}/${rpm_name}"
+        BUILT_ARTIFACTS+=("${rpm_name}")
+    fi
+}
+
+# Packages a standalone binary tarball named for its Rust target triple
+# (zpane-v<ver>-<triple>.tar.gz) so `cargo binstall` and Homebrew can consume it.
+package_binary_tarball() {
+    local triple="$1"
+    local bin="$2"
+    local stage="${WORK_DIR}/tarball-${triple}"
+    mkdir -p "${stage}"
+    install -m 0755 "${bin}" "${stage}/zpane"
+    install -m 0644 "${README_FILE}" "${stage}/README.md"
+    install -m 0644 "${LICENSE_FILE}" "${stage}/LICENSE"
+    chmod 0755 "${stage}" "${stage}/zpane"
+    chmod 0644 "${stage}/README.md" "${stage}/LICENSE"
+    stamp_mtime "${stage}"
+
+    local tar_name="zpane-v${VERSION}-${triple}.tar.gz"
+    if [[ -n "${PYTHON_BIN}" ]] && { command -v cygpath >/dev/null 2>&1 || ! is_gnu_tar; }; then
+        build_tar_py "${stage}" "${DIST_DIR}/${tar_name}" "0755" "w:gz" zpane README.md LICENSE
+    else
+        tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+            -C "${stage}" -cf - zpane README.md LICENSE | gzip -9n > "${DIST_DIR}/${tar_name}"
+    fi
+    chmod 0644 "${DIST_DIR}/${tar_name}"
+    BUILT_ARTIFACTS+=("${tar_name}")
+}
+
+# 1. Debian / Ubuntu packages (zpane_<ver>-<rel>_amd64.deb, zpane_<ver>-<rel>_arm64.deb)
+package_deb amd64 "${X86_BIN}"
+package_deb arm64 "${ARM_BIN}"
 
 # 2. Termux Android aarch64 package (zpane_<ver>_aarch64.deb)
 TERMUX_PREFIX="/data/data/com.termux/files/usr"
@@ -567,136 +738,17 @@ fi
 chmod 0644 "${DIST_DIR}/${TERMUX_DEB_NAME}"
 BUILT_ARTIFACTS+=("${TERMUX_DEB_NAME}")
 
-# Standalone Termux / ARM64 tarball
-TERMUX_TAR_NAME="zpane-v${VERSION}-aarch64-linux-musl.tar.gz"
-if [[ -n "${PYTHON_BIN}" ]] && { command -v cygpath >/dev/null 2>&1 || ! is_gnu_tar; }; then
-    build_tar_py "${TERMUX_STAGE}${TERMUX_PREFIX}/bin" "${DIST_DIR}/${TERMUX_TAR_NAME}" "0700" "w:gz" zpane
-else
-    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
-        -C "${TERMUX_STAGE}${TERMUX_PREFIX}/bin" -cf - zpane | gzip -9n > "${DIST_DIR}/${TERMUX_TAR_NAME}"
-fi
-chmod 0644 "${DIST_DIR}/${TERMUX_TAR_NAME}"
-BUILT_ARTIFACTS+=("${TERMUX_TAR_NAME}")
+# Standalone static Linux tarballs (Termux / ARM64 and x86_64) for cargo-binstall and Homebrew on Linux
+package_binary_tarball aarch64-unknown-linux-musl "${ARM_BIN}"
+package_binary_tarball x86_64-unknown-linux-musl "${X86_BIN}"
 
-# 3. Arch Linux pacman package (zpane-<ver>-<rel>-x86_64.pkg.tar.zst / .gz)
-ARCH_STAGE="${WORK_DIR}/arch-x86_64"
-mkdir -p "${ARCH_STAGE}/usr/bin" \
-         "${ARCH_STAGE}/usr/share/doc/zpane" \
-         "${ARCH_STAGE}/usr/share/licenses/zpane"
+# 3. Arch Linux pacman packages (zpane-<ver>-<rel>-x86_64.pkg.tar.zst / -aarch64.pkg.tar.zst)
+package_arch x86_64 "${X86_BIN}"
+package_arch aarch64 "${ARM_BIN}"
 
-install -m 0755 "${X86_BIN}" "${ARCH_STAGE}/usr/bin/zpane"
-install -m 0644 "${README_FILE}" "${ARCH_STAGE}/usr/share/doc/zpane/README.md"
-install -m 0644 "${LICENSE_FILE}" "${ARCH_STAGE}/usr/share/licenses/zpane/LICENSE"
-
-ARCH_BYTES="$(du -sb "${ARCH_STAGE}/usr" | cut -f1)"
-BUILD_DATE="${SOURCE_DATE_EPOCH}"
-cat > "${ARCH_STAGE}/.PKGINFO" <<EOF
-pkgname = zpane
-pkgbase = zpane
-pkgver = ${VERSION}-${REL}
-pkgdesc = Blazing-fast 3-pane Miller Column Command, Subcommand, Parameter & Variable Explorer
-url = https://github.com/zenthora/zpane
-builddate = ${BUILD_DATE}
-packager = zenthora <105382125+zenthora@users.noreply.github.com>
-size = ${ARCH_BYTES}
-arch = x86_64
-license = MIT
-optdepend = powershell: PowerShell cmdlet and parameter-set reflection
-EOF
-
-chmod 0755 \
-    "${ARCH_STAGE}" \
-    "${ARCH_STAGE}/usr" \
-    "${ARCH_STAGE}/usr/bin" \
-    "${ARCH_STAGE}/usr/share" \
-    "${ARCH_STAGE}/usr/share/doc" \
-    "${ARCH_STAGE}/usr/share/doc/zpane" \
-    "${ARCH_STAGE}/usr/share/licenses" \
-    "${ARCH_STAGE}/usr/share/licenses/zpane"
-chmod 0755 "${ARCH_STAGE}/usr/bin/zpane"
-chmod 0644 \
-    "${ARCH_STAGE}/.PKGINFO" \
-    "${ARCH_STAGE}/usr/share/doc/zpane/README.md" \
-    "${ARCH_STAGE}/usr/share/licenses/zpane/LICENSE"
-stamp_mtime "${ARCH_STAGE}"
-
-ARCH_ZST_NAME="zpane-${VERSION}-${REL}-x86_64.pkg.tar.zst"
-ARCH_GZ_NAME="zpane-${VERSION}-${REL}-x86_64.pkg.tar.gz"
-if [[ -n "${PYTHON_BIN}" ]] && { command -v cygpath >/dev/null 2>&1 || ! is_gnu_tar; }; then
-    ARCH_TAR="${WORK_DIR}/arch-x86_64.tar"
-    build_tar_py "${ARCH_STAGE}" "${ARCH_TAR}" "0755" "w" .PKGINFO usr
-    if command -v zstd >/dev/null 2>&1; then
-        zstd -f -q -19 "${ARCH_TAR}" -o "${DIST_DIR}/${ARCH_ZST_NAME}"
-        chmod 0644 "${DIST_DIR}/${ARCH_ZST_NAME}"
-        BUILT_ARTIFACTS+=("${ARCH_ZST_NAME}")
-    elif command -v zstd.exe >/dev/null 2>&1; then
-        zstd.exe -f -q -19 "$(host_path "${ARCH_TAR}")" -o "$(host_path "${DIST_DIR}/${ARCH_ZST_NAME}")"
-        chmod 0644 "${DIST_DIR}/${ARCH_ZST_NAME}"
-        BUILT_ARTIFACTS+=("${ARCH_ZST_NAME}")
-    else
-        gzip -9n -c "${ARCH_TAR}" > "${DIST_DIR}/${ARCH_GZ_NAME}"
-        chmod 0644 "${DIST_DIR}/${ARCH_GZ_NAME}"
-        BUILT_ARTIFACTS+=("${ARCH_GZ_NAME}")
-    fi
-elif command -v zstd >/dev/null 2>&1; then
-    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
-        -C "${ARCH_STAGE}" -cf - .PKGINFO usr | zstd -q -19 > "${DIST_DIR}/${ARCH_ZST_NAME}"
-    chmod 0644 "${DIST_DIR}/${ARCH_ZST_NAME}"
-    BUILT_ARTIFACTS+=("${ARCH_ZST_NAME}")
-elif command -v zstd.exe >/dev/null 2>&1; then
-    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
-        -C "${ARCH_STAGE}" -cf - .PKGINFO usr | zstd.exe -q -19 > "${DIST_DIR}/${ARCH_ZST_NAME}"
-    chmod 0644 "${DIST_DIR}/${ARCH_ZST_NAME}"
-    BUILT_ARTIFACTS+=("${ARCH_ZST_NAME}")
-else
-    tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
-        -C "${ARCH_STAGE}" -cf - .PKGINFO usr | gzip -9n > "${DIST_DIR}/${ARCH_GZ_NAME}"
-    chmod 0644 "${DIST_DIR}/${ARCH_GZ_NAME}"
-    BUILT_ARTIFACTS+=("${ARCH_GZ_NAME}")
-fi
-
-# 4. Fedora / RHEL / openSUSE RPM package (zpane-<ver>-<rel>.x86_64.rpm)
-RPM_VERSION="${VERSION//-/\~}"
-RPM_NAME="zpane-${RPM_VERSION}-${REL}.x86_64.rpm"
-if command -v rpmbuild >/dev/null 2>&1; then
-    RPM_TOP="${WORK_DIR}/rpmbuild"
-    mkdir -p "${RPM_TOP}"/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
-    chmod 0755 "${RPM_TOP}" "${RPM_TOP}/BUILD" "${RPM_TOP}/RPMS" "${RPM_TOP}/SOURCES" "${RPM_TOP}/SPECS" "${RPM_TOP}/SRPMS"
-    install -m 0755 "${X86_BIN}" "${RPM_TOP}/SOURCES/zpane"
-    install -m 0644 "${README_FILE}" "${RPM_TOP}/SOURCES/README.md"
-    install -m 0644 "${LICENSE_FILE}" "${RPM_TOP}/SOURCES/LICENSE"
-    sed -e "s/^Version:.*/Version:        ${RPM_VERSION}/" \
-        -e "s/^Release:.*/Release:        ${REL}/" \
-        "${ROOT_DIR}/packaging/fedora/zpane.spec" > "${RPM_TOP}/SPECS/zpane.spec"
-    chmod 0644 "${RPM_TOP}/SPECS/zpane.spec"
-    stamp_mtime "${RPM_TOP}/SOURCES"
-
-    rpmbuild --define "_topdir ${RPM_TOP}" \
-             --define "_build_id_links none" \
-             --define "use_source_date_epoch_as_buildtime 1" \
-             --define "clamp_mtime_to_source_date_epoch 1" \
-             --define "_buildhost reproducible" \
-             --target x86_64-linux \
-             -bb "${RPM_TOP}/SPECS/zpane.spec"
-
-    shopt -s nullglob
-    rpm_files=("${RPM_TOP}/RPMS/x86_64/"*.rpm)
-    shopt -u nullglob
-    if [[ ${#rpm_files[@]} -eq 0 ]]; then
-        echo "Error: rpmbuild produced no RPM artifacts" >&2
-        exit 1
-    fi
-    for rpm_path in "${rpm_files[@]}"; do
-        rpm_base="$(basename "${rpm_path}")"
-        cp -f "${rpm_path}" "${DIST_DIR}/${rpm_base}"
-        chmod 0644 "${DIST_DIR}/${rpm_base}"
-        BUILT_ARTIFACTS+=("${rpm_base}")
-    done
-else
-    build_rpm_fallback "${RPM_VERSION}" "${REL}" "${X86_BIN}" "${README_FILE}" "${LICENSE_FILE}" "${DIST_DIR}/${RPM_NAME}"
-    chmod 0644 "${DIST_DIR}/${RPM_NAME}"
-    BUILT_ARTIFACTS+=("${RPM_NAME}")
-fi
+# 4. Fedora / RHEL / openSUSE RPM packages (zpane-<ver>-<rel>.x86_64.rpm / .aarch64.rpm)
+package_rpm x86_64 "${X86_BIN}"
+package_rpm aarch64 "${ARM_BIN}"
 
 generate_sha256sums "${DIST_DIR}" "${BUILT_ARTIFACTS[@]}"
 

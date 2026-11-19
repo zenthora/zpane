@@ -59,3 +59,14 @@ assets = [
     { source = "README.md", dest = "/usr/share/doc/zpane/README.md", mode = "0644", doc = true },
     { source = "LICENSE", dest = "/usr/share/licenses/zpane/LICENSE", mode = "0644", doc = true },
 ]
+
+# `cargo binstall zpane` downloads the prebuilt archives published by `.github/workflows/release.yml`
+# (zpane-v<version>-<target>.tar.gz, or .zip on Windows) instead of compiling from source.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/zpane-v{ version }-{ target }.tar.gz"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/zpane-v{ version }-{ target }.zip"
+pkg-fmt = "zip"

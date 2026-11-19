@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --locked
+      - name: Build debug binary for shell-init smoke checks
+        run: cargo build --locked
+
+      - name: Install zsh and fish (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - name: Install fish (macOS; zsh is preinstalled)
+        if: runner.os == 'macOS'
+        run: brew install fish
+
+      - name: Shell-init syntax smoke (bash, zsh, fish)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/ci-shell-init-smoke.sh target/debug/zpane bash zsh fish
+      - name: Shell-init syntax smoke (bash)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: bash scripts/ci-shell-init-smoke.sh target/debug/zpane.exe bash
+      - name: Shell-init syntax smoke (PowerShell AST parse)
+        shell: pwsh
+        run: |
+          $exe = if ($IsWindows) { 'target/debug/zpane.exe' } else { 'target/debug/zpane' }
+          ./scripts/ci-shell-init-smoke.ps1 -ZpaneBinary $exe
+
+  packaging:
+    name: Packaging scripts and manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Syntax-check packaging scripts
+        run: |
+          set -euo pipefail
+          bash -n scripts/package-linux.sh
+          bash -n scripts/package-macos.sh
+          bash -n scripts/ci-shell-init-smoke.sh
+          bash -n packaging/termux/build.sh
+          bash -n packaging/arch/PKGBUILD
+          python3 -m py_compile scripts/bump-version.py scripts/render-package-manifests.py scripts/test_render_package_manifests.py
+      - name: Test package manifest renderer
+        run: python3 -m unittest discover -s scripts -v

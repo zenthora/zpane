@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SOURCE_SHA256_PLACEHOLDER = "0" * 64
 
 
 def run(cmd: list[str], *, capture: bool = False) -> str:
@@ -65,6 +66,9 @@ def main() -> int:
     replace_once("packaging/arch/PKGBUILD", r"^pkgver=.*$", f"pkgver={version}")
     replace_once("packaging/fedora/zpane.spec", r"^Version:\s+.*$", f"Version:        {version}")
     replace_once("packaging/termux/build.sh", r'^TERMUX_PKG_VERSION="[^"]+"', f'TERMUX_PKG_VERSION="{version}"')
+    # A digest for the previous release tarball must never be carried over to the new version.
+    # (packaging/{homebrew,scoop,winget}/ keep __VERSION__/__SHA256_*__ placeholders rendered at release time.)
+    replace_once("packaging/termux/build.sh", r"^TERMUX_PKG_SHA256=.*$", f"TERMUX_PKG_SHA256={SOURCE_SHA256_PLACEHOLDER}")
     replace_once("scripts/package-linux.sh", r'^VERSION="\$\{1:-[^}]+\}"', f'VERSION="${{1:-{version}}}"')
     replace_all("README.md", r"zpane[-_]\d+\.\d+\.\d+", lambda m: m.group(0)[:6] + version)
 

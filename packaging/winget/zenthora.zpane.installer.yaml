@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
+# Installer manifest template; render with scripts/render-package-manifests.py.
+PackageIdentifier: zenthora.zpane
+PackageVersion: __VERSION__
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: zpane.exe
+    PortableCommandAlias: zpane
+Commands:
+  - zpane
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/zenthora/zpane/releases/download/v__VERSION__/zpane-v__VERSION__-x86_64-pc-windows-msvc.zip
+    InstallerSha256: __SHA256_X86_64_PC_WINDOWS_MSVC__
+ManifestType: installer
+ManifestVersion: 1.6.0

@@ -4,8 +4,10 @@ TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="@zenthora"
 TERMUX_PKG_VERSION="0.5.2"
 TERMUX_PKG_SRCURL="https://github.com/zenthora/zpane/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz"
-# Security: replace SKIP_CHECKSUM with the release tarball SHA-256 digest when submitting to termux-packages.
-TERMUX_PKG_SHA256=SKIP_CHECKSUM
+# Security: the all-zero digest is a deliberate placeholder that fails verification. The release workflow
+# (scripts/render-package-manifests.py --source-sha256) renders a copy pinned to the v${TERMUX_PKG_VERSION}
+# source tarball SHA-256; submit that copy to termux-packages. scripts/bump-version.py resets this placeholder.
+TERMUX_PKG_SHA256=0000000000000000000000000000000000000000000000000000000000000000
 TERMUX_PKG_BUILD_IN_SRC=true
 TERMUX_PKG_AUTO_UPDATE=true
 
