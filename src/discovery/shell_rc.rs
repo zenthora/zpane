@@ -178,6 +178,37 @@ pub(super) fn collect_shell_rc_files(dialect: ShellDialect) -> Vec<(String, Stri
                 }
             }
         }
+        ShellDialect::Nushell => {
+            let mut dirs = Vec::new();
+            if let Some(xdg) = non_empty_abs_env_path("XDG_CONFIG_HOME") {
+                dirs.push(xdg.join("nushell"));
+            }
+            if cfg!(windows) {
+                if let Some(appdata) = non_empty_abs_env_path("APPDATA") {
+                    dirs.push(appdata.join("nushell"));
+                }
+            }
+            dirs.push(home.join(".config").join("nushell"));
+            if cfg!(target_os = "macos") {
+                dirs.push(
+                    home.join("Library")
+                        .join("Application Support")
+                        .join("nushell"),
+                );
+            }
+            let mut seen_dirs = HashSet::new();
+            for dir in dirs {
+                if !seen_dirs.insert(dir.clone()) {
+                    continue;
+                }
+                for name in ["config.nu", "env.nu"] {
+                    let path = dir.join(name);
+                    if let Some(body) = read_tail_string(&path, MAX_RC_BYTES) {
+                        out.push((name.to_string(), body));
+                    }
+                }
+            }
+        }
         ShellDialect::PowerShell => {}
     }
     out
@@ -205,6 +236,55 @@ pub fn parse_posix_fish_definitions(
                 continue;
             }
             match dialect {
+                ShellDialect::Nushell => {
+                    let body = strip_command_keyword(line, "export").unwrap_or(line);
+                    if let Some(rest) = strip_command_keyword(body, "alias") {
+                        if let Some((name_raw, target_raw)) = rest.split_once('=') {
+                            let name = strip_matching_quotes(name_raw.trim());
+                            let target = sanitize_single_line(
+                                target_raw.trim().trim_end_matches(';').trim(),
+                            );
+                            if is_valid_command_ident(name)
+                                && !target.is_empty()
+                                && seen.insert(name.to_ascii_lowercase())
+                            {
+                                entries.push(Entry::new(
+                                    name,
+                                    name,
+                                    EntryKind::Alias,
+                                    format!("Alias -> {target}"),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some(mut rest) = strip_command_keyword(body, "def") {
+                        while let Some((tok, next)) = next_shell_token(rest) {
+                            if tok.starts_with('-') {
+                                rest = next.trim_start();
+                            } else {
+                                break;
+                            }
+                        }
+                        if let Some((raw_name, _)) = next_shell_token(rest) {
+                            let name = raw_name
+                                .split(['[', '{', '(', ';'])
+                                .next()
+                                .unwrap_or("")
+                                .trim();
+                            if is_valid_command_ident(name)
+                                && seen.insert(name.to_ascii_lowercase())
+                            {
+                                entries.push(Entry::new(
+                                    name,
+                                    name,
+                                    EntryKind::Func,
+                                    format!("Nushell command ({source_clean})"),
+                                ));
+                            }
+                        }
+                    }
+                }
                 ShellDialect::PowerShell => {}
                 ShellDialect::Posix => {
                     if let Some(mut rest) = strip_command_keyword(line, "alias") {
@@ -508,6 +588,36 @@ end
                 ("co", EntryKind::Alias, "Abbr -> checkout"),
                 ("my-d-func", EntryKind::Func, "Fish function (config.fish)"),
                 ("grep_it", EntryKind::Func, "Find text"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_nushell_aliases_and_custom_commands() {
+        let nu_files = vec![(
+            "config.nu".to_string(),
+            r#"
+# comment
+alias gs = git status
+export alias ll = ls -la # inline comment
+def deploy [env: string] { print $env }
+export def --env mkcd [dir: path] { mkdir $dir; cd $dir }
+def --wrapped _private [args] { echo skip }
+"#
+            .to_string(),
+        )];
+        let nu_defs = parse_posix_fish_definitions(ShellDialect::Nushell, &nu_files);
+        let summary: Vec<(&str, EntryKind, &str)> = nu_defs
+            .iter()
+            .map(|e| (e.text.as_str(), e.kind, e.desc.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("gs", EntryKind::Alias, "Alias -> git status"),
+                ("ll", EntryKind::Alias, "Alias -> ls -la"),
+                ("deploy", EntryKind::Func, "Nushell command (config.nu)"),
+                ("mkcd", EntryKind::Func, "Nushell command (config.nu)"),
             ]
         );
     }

@@ -10,7 +10,7 @@ use crate::sanitize::{has_disallowed_control, is_disallowed_control, strip_disal
 use crate::shell::{
     format_custom_value_token, is_safe_unquoted_char, is_safe_unquoted_token,
     is_valid_single_quoted, quote_literal_for_dialect, sanitize_initial_buffer,
-    sanitize_literal_value_text, split_pipeline_prefix_for_dialect,
+    sanitize_literal_value_text, split_buffer_at_cursor, split_pipeline_prefix_for_dialect,
     tokenize_shell_words_for_dialect,
 };
 pub use crate::shell::{split_pipeline_prefix, tokenize_shell_words};
@@ -281,6 +281,7 @@ fn select_best_matching(pane: &mut PaneList, token: &str) -> bool {
 #[derive(Debug, Default, Clone)]
 struct CommandLine {
     pipeline_prefix: Option<String>,
+    trailing_suffix: Option<String>,
     tokens: Vec<String>,
     tokens_rev: u64,
     subcmd_chain: Vec<String>,
@@ -300,8 +301,26 @@ impl CommandLine {
         pane1: &mut PaneList,
         dialect: ShellDialect,
     ) -> (Self, Pane) {
+        Self::from_initial_buffer_with_cursor(initial_buffer, None, pane1, dialect)
+    }
+
+    fn from_initial_buffer_with_cursor(
+        initial_buffer: &str,
+        cursor_offset: Option<usize>,
+        pane1: &mut PaneList,
+        dialect: ShellDialect,
+    ) -> (Self, Pane) {
         let mut active_pane = Pane::First;
-        let sanitized = sanitize_initial_buffer(initial_buffer, dialect);
+        let (raw_prefix, trailing_suffix) = if let Some(offset) = cursor_offset {
+            let (prefix, suffix) = split_buffer_at_cursor(initial_buffer, offset);
+            let sanitized_suffix = (!suffix.is_empty())
+                .then(|| sanitize_initial_buffer(suffix, dialect).into_owned())
+                .filter(|s| !s.is_empty());
+            (prefix, sanitized_suffix)
+        } else {
+            (initial_buffer, None)
+        };
+        let sanitized = sanitize_initial_buffer(raw_prefix, dialect);
         let (pipeline_prefix, active_segment) =
             split_pipeline_prefix_for_dialect(sanitized.as_ref(), dialect);
         let tokens = tokenize_shell_words_for_dialect(active_segment, dialect);
@@ -338,6 +357,7 @@ impl CommandLine {
         (
             Self {
                 pipeline_prefix,
+                trailing_suffix,
                 tokens,
                 tokens_rev: 0,
                 subcmd_chain: Vec::new(),
@@ -496,7 +516,7 @@ impl CommandLine {
         }
     }
 
-    fn assemble(
+    fn assemble_active(
         &self,
         active_pane: Pane,
         p1: Option<&Entry>,
@@ -577,6 +597,22 @@ impl CommandLine {
         }
 
         join_command_tokens_cow(self.pipeline_prefix.as_deref(), &out)
+    }
+
+    fn assemble(
+        &self,
+        active_pane: Pane,
+        p1: Option<&Entry>,
+        p2: Option<&Entry>,
+        p3: Option<&Entry>,
+        pane3_filter: &str,
+        dialect: ShellDialect,
+    ) -> String {
+        let mut active = self.assemble_active(active_pane, p1, p2, p3, pane3_filter, dialect);
+        if let Some(ref suffix) = self.trailing_suffix {
+            active.push_str(suffix);
+        }
+        active
     }
 }
 
@@ -1084,6 +1120,7 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     cached_cwd_dirs: Vec<Entry>,
     cached_git_branches: Vec<Entry>,
     initial_buffer: String,
+    cursor_offset: Option<usize>,
     active_pane: Pane,
     cmd: CommandLine,
     active_param_set_label: Option<String>,
@@ -1130,6 +1167,7 @@ impl<I: Introspect> MillerSession<I> {
             cached_cwd_dirs: Vec::new(),
             cached_git_branches: Vec::new(),
             initial_buffer: initial_buffer.to_string(),
+            cursor_offset: None,
             active_pane,
             cmd,
             active_param_set_label: None,
@@ -1173,6 +1211,36 @@ impl<I: Introspect> MillerSession<I> {
         self.cached_cwd_dirs = cwd_dirs;
     }
 
+    fn reseed_initial_buffer(&mut self) {
+        if !self.initial_buffer.is_empty() {
+            self.panes[0].clear_filter();
+            self.panes[0].reset_cursor();
+            self.panes[1].clear_filter();
+            self.panes[2].clear_filter();
+            let (cmd, active_pane) = CommandLine::from_initial_buffer_with_cursor(
+                &self.initial_buffer,
+                self.cursor_offset,
+                &mut self.panes[0],
+                self.dialect,
+            );
+            self.cmd = cmd;
+            self.active_pane = active_pane;
+        }
+        self.pane2_cache_state = None;
+        self.pane3_cache_state = None;
+        self.last_p1_identity = None;
+        self.last_p2_text = None;
+        self.sync_panes();
+    }
+
+    /// Splits the seeded initial buffer at `cursor_offset` (0-based character offset) so only
+    /// the prefix up to the cursor is edited while any trailing suffix is preserved verbatim.
+    pub fn with_cursor_offset(mut self, cursor_offset: usize) -> Self {
+        self.cursor_offset = Some(cursor_offset);
+        self.reseed_initial_buffer();
+        self
+    }
+
     /// Attaches dynamic runtime context (Git branch, CWD files, shell history)
     /// used to enrich Pane 2 and Pane 3 completions.
     pub fn with_runtime_context(mut self, runtime_ctx: RuntimeContext) -> Self {
@@ -1198,24 +1266,7 @@ impl<I: Introspect> MillerSession<I> {
             }
         }
 
-        if !self.initial_buffer.is_empty() {
-            self.panes[0].clear_filter();
-            self.panes[0].reset_cursor();
-            self.panes[1].clear_filter();
-            self.panes[2].clear_filter();
-            let (cmd, active_pane) = CommandLine::from_initial_buffer(
-                &self.initial_buffer,
-                &mut self.panes[0],
-                self.dialect,
-            );
-            self.cmd = cmd;
-            self.active_pane = active_pane;
-        }
-        self.pane2_cache_state = None;
-        self.pane3_cache_state = None;
-        self.last_p1_identity = None;
-        self.last_p2_text = None;
-        self.sync_panes();
+        self.reseed_initial_buffer();
         self
     }
 
@@ -1907,7 +1958,14 @@ impl<I: Introspect> MillerSession<I> {
         if self.cmd.tokens().is_empty() {
             return;
         }
-        let assembled = self.command_line();
+        let assembled = self.cmd.assemble_active(
+            self.active_pane,
+            self.selected_entry(Pane::First),
+            self.selected_entry(Pane::Second),
+            self.selected_entry(Pane::Third),
+            self.panes[2].filter(),
+            self.dialect,
+        );
         let trimmed = assembled.trim();
         if trimmed.is_empty() || (trimmed.ends_with('|') && !trimmed.ends_with("||")) {
             return;
@@ -1943,12 +2001,14 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn restore_pipeline_stage(&mut self, stage_buffer: &str) {
+        let saved_suffix = self.cmd.trailing_suffix.take();
         self.panes[0].clear_filter();
         self.panes[0].reset_cursor();
         self.panes[1].clear_filter();
         self.panes[2].clear_filter();
         let (mut cmd, active_pane) =
             CommandLine::from_initial_buffer(stage_buffer, &mut self.panes[0], self.dialect);
+        cmd.trailing_suffix = saved_suffix;
         if cmd.tokens.len() == 1 && active_pane == Pane::Second {
             cmd.suppress_pane2_preview = true;
         } else if cmd.tokens.len() >= 2 && active_pane == Pane::Second {
@@ -2855,21 +2915,14 @@ mod tests {
 
     #[test]
     fn test_variable_scopes_across_all_three_dialects() {
-        for (dialect, expected_user_tok, expected_special_var) in [
-            (ShellDialect::PowerShell, "$env:USER", "$_"),
-            (ShellDialect::Posix, "$USER", "$?"),
-            (ShellDialect::Fish, "$USER", "$status"),
+        for (dialect, scope_root_tok, expected_user_tok, expected_special_var) in [
+            (ShellDialect::PowerShell, "$env:", "$env:USER", "$_"),
+            (ShellDialect::Posix, "$", "$USER", "$?"),
+            (ShellDialect::Fish, "$", "$USER", "$status"),
+            (ShellDialect::Nushell, "$env.", "$env.USER", "$in"),
         ] {
-            let mut env_root = Entry::scope_root(
-                if dialect.is_powershell() {
-                    "$env:"
-                } else {
-                    "$"
-                },
-                "$ENV",
-                EntryKind::Env,
-                "Env vars",
-            );
+            let mut env_root =
+                Entry::scope_root(scope_root_tok, "$ENV", EntryKind::Env, "Env vars");
             let mut user_entry = Entry::new(expected_user_tok, "USER", EntryKind::Env, "alice");
             user_entry.children = vec![
                 Entry::new(
@@ -3987,6 +4040,7 @@ mod tests {
             ShellDialect::PowerShell,
             ShellDialect::Posix,
             ShellDialect::Fish,
+            ShellDialect::Nushell,
         ];
 
         for dialect in dialects {
@@ -4009,6 +4063,7 @@ mod tests {
                         ShellDialect::PowerShell => "echo --msg '''; evil; '''",
                         ShellDialect::Posix => r"echo --msg ''\''; evil; '\'''",
                         ShellDialect::Fish => r"echo --msg '\'; evil; \''",
+                        ShellDialect::Nushell => r#"echo --msg "'; evil; '""#,
                     },
                 ),
                 (r#""$(evil)""#, r#"echo --msg '"$(evil)"'"#),
@@ -4122,11 +4177,12 @@ mod tests {
             ShellDialect::PowerShell,
             ShellDialect::Posix,
             ShellDialect::Fish,
+            ShellDialect::Nushell,
         ] {
-            let safe_env_name = if dialect == ShellDialect::PowerShell {
-                "$env:USER"
-            } else {
-                "$USER"
+            let safe_env_name = match dialect {
+                ShellDialect::PowerShell => "$env:USER",
+                ShellDialect::Nushell => "$env.USER",
+                ShellDialect::Posix | ShellDialect::Fish => "$USER",
             };
             let mut env_root =
                 Entry::scope_root("$env:", "Environment variables", EntryKind::Env, "");
@@ -4208,6 +4264,7 @@ mod tests {
                         ShellDialect::PowerShell => "'''; evil; '''",
                         ShellDialect::Posix => r"''\''; evil; '\'''",
                         ShellDialect::Fish => r"'\'; evil; \''",
+                        ShellDialect::Nushell => r#""'; evil; '""#,
                     },
                     r#"'"$(evil)"'"#,
                     "'./-rf; $(id)'",
@@ -4245,6 +4302,7 @@ mod tests {
                         ShellDialect::PowerShell => "'''; evil; '''",
                         ShellDialect::Posix => r"''\''; evil; '\'''",
                         ShellDialect::Fish => r"'\'; evil; \''",
+                        ShellDialect::Nushell => r#""'; evil; '""#,
                     },
                     "main",
                 ]
@@ -5260,6 +5318,119 @@ confirm = "ctrl+y"
         assert!(
             !frame_set_b.contains("[req]"),
             "Target is optional in SetB so [req] must disappear: {frame_set_b}"
+        );
+    }
+
+    #[test]
+    fn test_cursor_aware_editing_preserves_trailing_suffix_across_edits_and_pipelines() {
+        let mut status = Entry::new("status", "status", EntryKind::Subcmd, "Working tree status");
+        status.children = vec![
+            Entry::new("--short", "--short", EntryKind::Flag, "Short output"),
+            Entry::new("--branch", "--branch", EntryKind::Flag, "Show branch"),
+        ];
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git VCS");
+        git.children = vec![status];
+        let rg = Entry::new("rg", "rg", EntryKind::Cli, "Ripgrep");
+
+        // 1. Editing "git status && cargo test" at cursor 10 edits `git status` and preserves ` && cargo test` verbatim.
+        let mut session = MillerSession::new(
+            vec![git.clone(), rg.clone()],
+            FakeIntrospector::empty(),
+            "git status && cargo test",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_cursor_offset(10)
+        .with_runtime_context(RuntimeContext::default());
+
+        assert_eq!(session.view().active_pane, Pane::Third);
+        assert_eq!(session.command_line(), "git status --short && cargo test");
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(
+            session.apply(UserAction::Confirm),
+            SessionOutcome::Confirmed("git status --short && cargo test".to_string())
+        );
+
+        // 2. Cursor at offset 11 (after space before `&&`) keeps spacing intact.
+        let mut space_session = MillerSession::new(
+            vec![git.clone(), rg.clone()],
+            FakeIntrospector::empty(),
+            "git status && cargo test",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_runtime_context(RuntimeContext::default())
+        .with_cursor_offset(11);
+        assert_eq!(
+            space_session.apply(UserAction::Confirm),
+            SessionOutcome::Confirmed("git status --short && cargo test".to_string())
+        );
+
+        // 3. Pipeline chaining inserts `|` inside the edited prefix while keeping trailing suffix verbatim.
+        let mut pipe_session = MillerSession::new(
+            vec![git.clone(), rg.clone()],
+            FakeIntrospector::empty(),
+            "git status && cargo test",
+            Viewport::new(120, 30),
+            ShellDialect::Nushell,
+        )
+        .with_cursor_offset(10);
+        pipe_session.apply(UserAction::AcceptToken); // commits --short
+        pipe_session.apply(UserAction::ChainPipeline);
+        pipe_session.apply(UserAction::MoveDown); // selects rg
+        assert_eq!(
+            pipe_session.command_line(),
+            "git status --short | rg && cargo test"
+        );
+        assert_eq!(
+            pipe_session.apply(UserAction::Confirm),
+            SessionOutcome::Confirmed("git status --short | rg && cargo test".to_string())
+        );
+
+        // 4. Out-of-bounds cursor, cursor 0, empty input, and Unicode boundaries never panic.
+        let oob = MillerSession::new(
+            vec![git.clone()],
+            FakeIntrospector::empty(),
+            "git status",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_cursor_offset(9999);
+        assert_eq!(oob.command_line(), "git status --short");
+
+        let zero = MillerSession::new(
+            vec![rg.clone()],
+            FakeIntrospector::empty(),
+            " && cargo test",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_cursor_offset(0);
+        assert_eq!(zero.command_line(), "rg && cargo test");
+
+        let empty = MillerSession::new(
+            vec![rg.clone()],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_cursor_offset(5);
+        assert_eq!(empty.command_line(), "rg");
+
+        let echo = Entry::new("echo", "echo", EntryKind::Cli, "Echo");
+        let mut unicode = MillerSession::new(
+            vec![echo],
+            FakeIntrospector::empty(),
+            "echo 🦀 && ls\x1b[31m\u{202e}",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        )
+        .with_cursor_offset(6);
+        let unicode_cmd = unicode.apply(UserAction::Confirm);
+        assert_eq!(
+            unicode_cmd,
+            SessionOutcome::Confirmed("echo 🦀 && ls[31m".to_string())
         );
     }
 }

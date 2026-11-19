@@ -8,21 +8,30 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$script = (& $ZpaneBinary init pwsh | Out-String)
-if ($LASTEXITCODE -ne 0) {
-    throw "'zpane init pwsh' exited with code $LASTEXITCODE"
-}
-if ([string]::IsNullOrWhiteSpace($script)) {
-    throw "'zpane init pwsh' produced no output"
-}
+$variants = @(
+    @('init', 'pwsh'),
+    @('init', 'pwsh', '--no-bind'),
+    @('init', 'pwsh', '--bind', 'Ctrl+g')
+)
 
-$tokens = $null
-$parseErrors = $null
-[void][System.Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$parseErrors)
-if ($parseErrors.Count -gt 0) {
-    foreach ($e in $parseErrors) {
-        Write-Error ("{0} (line {1}, column {2})" -f $e.Message, $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber) -ErrorAction Continue
+foreach ($variantArgs in $variants) {
+    $label = "zpane $($variantArgs -join ' ')"
+    $script = (& $ZpaneBinary @variantArgs | Out-String)
+    if ($LASTEXITCODE -ne 0) {
+        throw "'$label' exited with code $LASTEXITCODE"
     }
-    exit 1
+    if ([string]::IsNullOrWhiteSpace($script)) {
+        throw "'$label' produced no output"
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($script, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) {
+        foreach ($e in $parseErrors) {
+            Write-Error ("{0} (line {1}, column {2})" -f $e.Message, $e.Extent.StartLineNumber, $e.Extent.StartColumnNumber) -ErrorAction Continue
+        }
+        exit 1
+    }
 }
-Write-Host 'ok: zpane init pwsh parses cleanly'
+Write-Host 'ok: zpane init pwsh (default, --no-bind, --bind) parses cleanly'

@@ -1920,6 +1920,22 @@ mod tests {
         }));
         assert!(posix_frame.contains("[Ctrl+R] Reload"));
         assert!(!posix_frame.contains("Sync PS"));
+
+        let nu_frame = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(150, 14),
+            active_pane: Pane::First,
+            panes: [&empty, &empty, &empty],
+            command_line: String::new(),
+            active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
+            dialect: ShellDialect::Nushell,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        assert!(nu_frame.contains("[Ctrl+R] Reload"));
+        assert!(!nu_frame.contains("Sync PS"));
     }
 
     #[test]

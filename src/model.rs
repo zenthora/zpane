@@ -220,6 +220,34 @@ pub fn sanitize_variable_token(token: &str, dialect: ShellDialect) -> Option<Str
             (!rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
                 .then(|| token.to_string())
         }
+        ShellDialect::Nushell => {
+            if token == "$in" {
+                return Some(token.to_string());
+            }
+            if let Some(rest) = token
+                .strip_prefix("$env.")
+                .or_else(|| token.strip_prefix("$nu."))
+            {
+                let valid_cell_path = !rest.is_empty()
+                    && rest.split('.').all(|seg| {
+                        !seg.is_empty()
+                            && seg
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                    });
+                return valid_cell_path.then(|| token.to_string());
+            }
+            let rest = &token[1..];
+            let valid_ident = !rest.is_empty()
+                && rest
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+            valid_ident.then(|| token.to_string())
+        }
     }
 }
 
@@ -1083,6 +1111,7 @@ mod tests {
             ShellDialect::PowerShell,
             ShellDialect::Posix,
             ShellDialect::Fish,
+            ShellDialect::Nushell,
         ] {
             assert!(!is_safe_variable_token("$env:x; evil", dialect));
             assert!(!is_safe_variable_token("$x; evil", dialect));
@@ -1106,6 +1135,20 @@ mod tests {
         assert!(is_safe_variable_token("$?", ShellDialect::Posix));
         assert!(!is_safe_variable_token("$?", ShellDialect::Fish));
         assert!(is_safe_variable_token("$status", ShellDialect::Fish));
+        assert!(is_safe_variable_token("$env.PATH", ShellDialect::Nushell));
+        assert!(is_safe_variable_token(
+            "$nu.config-path",
+            ShellDialect::Nushell
+        ));
+        assert!(is_safe_variable_token("$in", ShellDialect::Nushell));
+        assert!(is_safe_variable_token("$my_var", ShellDialect::Nushell));
+        assert!(!is_safe_variable_token("$env:PATH", ShellDialect::Nushell));
+        assert!(!is_safe_variable_token("$?", ShellDialect::Nushell));
+        assert!(!is_safe_variable_token("$env.", ShellDialect::Nushell));
+        assert!(!is_safe_variable_token(
+            "$env.PATH;id",
+            ShellDialect::Nushell
+        ));
 
         let mut cmd = Entry::new("Get-Item", "Get-Item", EntryKind::Cmdlet, "");
         cmd.children = vec![

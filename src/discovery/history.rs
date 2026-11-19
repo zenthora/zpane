@@ -59,13 +59,17 @@ fn has_odd_trailing_escape(s: &str, escape_char: char) -> bool {
 }
 
 /// Parses recent command history lines (newest first, deduplicated case-insensitively)
-/// for Bash, Zsh extended history, Fish YAML history, or PowerShell PSReadLine history.
+/// for Bash, Zsh extended history, Fish YAML history, PowerShell PSReadLine history,
+/// or Nushell plaintext `history.txt` (skipping SQLite binary history cleanly).
 pub fn parse_shell_history_from_str(
     dialect: ShellDialect,
     raw: &str,
     max_items: usize,
 ) -> Vec<String> {
     if max_items == 0 {
+        return Vec::new();
+    }
+    if dialect == ShellDialect::Nushell && raw.starts_with("SQLite format 3") {
         return Vec::new();
     }
     let max_items = max_items.min(MAX_HISTORY_ITEMS);
@@ -91,6 +95,16 @@ pub fn parse_shell_history_from_str(
         let trimmed_end = raw_line.trim_end();
         let trimmed = trimmed_end.trim_start();
         match dialect {
+            ShellDialect::Nushell => {
+                if trimmed.is_empty() || trimmed.starts_with('#') {
+                    continue;
+                }
+                if trimmed.contains("<newline>") {
+                    extracted.push((Cow::Owned(trimmed.replace("<newline>", " ")), false));
+                } else {
+                    extracted.push((Cow::Borrowed(trimmed), false));
+                }
+            }
             ShellDialect::Fish => {
                 if trimmed.is_empty() {
                     continue;
@@ -111,7 +125,7 @@ pub fn parse_shell_history_from_str(
                 let escape_char = match dialect {
                     ShellDialect::Posix => '\\',
                     ShellDialect::PowerShell => '`',
-                    ShellDialect::Fish => unreachable!(),
+                    ShellDialect::Fish | ShellDialect::Nushell => unreachable!(),
                 };
                 if let Some(mut buf) = pending.take() {
                     if has_odd_trailing_escape(trimmed, escape_char) {
@@ -239,6 +253,27 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
                 );
             }
         }
+        ShellDialect::Nushell => {
+            if let Some(xdg) = non_empty_abs_env_path("XDG_CONFIG_HOME") {
+                candidates.push(xdg.join("nushell").join("history.txt"));
+            }
+            if cfg!(windows) {
+                if let Some(appdata) = non_empty_abs_env_path("APPDATA") {
+                    candidates.push(appdata.join("nushell").join("history.txt"));
+                }
+            }
+            if let Some(home) = home_dir() {
+                candidates.push(home.join(".config").join("nushell").join("history.txt"));
+                if cfg!(target_os = "macos") {
+                    candidates.push(
+                        home.join("Library")
+                            .join("Application Support")
+                            .join("nushell")
+                            .join("history.txt"),
+                    );
+                }
+            }
+        }
         ShellDialect::Posix => {
             if let Some(home) = home_dir() {
                 let prefers_zsh = env::var("SHELL")
@@ -331,6 +366,27 @@ docker compose up -d
         assert_eq!(
             parse_shell_history_from_str(ShellDialect::PowerShell, ps_raw, 10),
             vec!["Get-ChildItem -Path src"]
+        );
+    }
+
+    #[test]
+    fn test_parse_shell_history_nushell_plaintext_multiline_and_sqlite_header() {
+        let nu_raw = "\u{feff}\
+# comment
+git status
+ls | where size > 1kb
+echo a<newline>echo b
+git status
+";
+        assert_eq!(
+            parse_shell_history_from_str(ShellDialect::Nushell, nu_raw, 10),
+            vec!["git status", "echo a echo b", "ls | where size > 1kb"]
+        );
+
+        let sqlite_header = "SQLite format 3\0binary payload\ngit status\n";
+        assert!(
+            parse_shell_history_from_str(ShellDialect::Nushell, sqlite_header, 10).is_empty(),
+            "Nushell SQLite binary history must be skipped cleanly without garbage"
         );
     }
 }

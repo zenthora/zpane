@@ -71,22 +71,26 @@ pub enum ShellDialect {
     Posix,
     /// Fish shell (`fish`): `$X`, `$status`, `$last_pid`, `$fish_pid`, PATH executables.
     Fish,
+    /// Nushell (`nu`): `$env.X`, `$nu.*`, `$in`, PATH executables & `config.nu` definitions.
+    Nushell,
 }
 
 impl ShellDialect {
     /// Detects the active shell dialect from environment variables without process-global state:
-    /// `ZPANE_SHELL=pwsh|posix|fish` overrides; otherwise Windows is always PowerShell,
-    /// `PSModulePath` selects PowerShell on Unix, `FISH_VERSION` or `SHELL=*/fish` selects Fish,
-    /// and all other Unix environments default to Posix.
+    /// `ZPANE_SHELL=pwsh|posix|fish|nu` overrides; otherwise `NU_VERSION` selects Nushell,
+    /// Windows or `PSModulePath` selects PowerShell, `FISH_VERSION` or `SHELL=*/fish` selects Fish,
+    /// `SHELL=*/nu` selects Nushell, and all other Unix environments default to Posix.
     pub fn detect() -> Self {
         let zpane_shell = env::var("ZPANE_SHELL").ok();
         let ps_module_path = env::var_os("PSModulePath");
         let fish_version = env::var_os("FISH_VERSION");
+        let nu_version = env::var_os("NU_VERSION");
         let shell = env::var("SHELL").ok();
         Self::from_env(
             zpane_shell.as_deref(),
             ps_module_path.is_some(),
             fish_version.is_some(),
+            nu_version.is_some(),
             shell.as_deref(),
             cfg!(windows),
         )
@@ -96,12 +100,16 @@ impl ShellDialect {
         zpane_shell: Option<&str>,
         has_ps_module_path: bool,
         has_fish_version: bool,
+        has_nu_version: bool,
         shell: Option<&str>,
         is_windows: bool,
     ) -> Self {
         if let Some(zs) = zpane_shell.map(str::trim).filter(|s| !s.is_empty()) {
             if zs.eq_ignore_ascii_case("pwsh") || zs.eq_ignore_ascii_case("powershell") {
                 return ShellDialect::PowerShell;
+            }
+            if zs.eq_ignore_ascii_case("nu") || zs.eq_ignore_ascii_case("nushell") {
+                return ShellDialect::Nushell;
             }
             if zs.eq_ignore_ascii_case("fish") {
                 return ShellDialect::Fish;
@@ -118,7 +126,9 @@ impl ShellDialect {
                 return ShellDialect::Posix;
             }
         }
-        if is_windows || has_ps_module_path {
+        if has_nu_version {
+            ShellDialect::Nushell
+        } else if is_windows || has_ps_module_path {
             ShellDialect::PowerShell
         } else if has_fish_version
             || shell
@@ -127,6 +137,12 @@ impl ShellDialect {
                 .unwrap_or(false)
         {
             ShellDialect::Fish
+        } else if shell
+            .map(str::trim)
+            .map(|s| s == "nu" || s.ends_with("/nu"))
+            .unwrap_or(false)
+        {
+            ShellDialect::Nushell
         } else {
             ShellDialect::Posix
         }
@@ -140,10 +156,10 @@ impl ShellDialect {
     /// Formats an environment variable reference in this dialect's syntax.
     fn env_token(self, name: &str) -> String {
         let mut out = String::with_capacity(name.len() + 5);
-        if self.is_powershell() {
-            out.push_str("$env:");
-        } else {
-            out.push('$');
+        match self {
+            ShellDialect::PowerShell => out.push_str("$env:"),
+            ShellDialect::Nushell => out.push_str("$env."),
+            ShellDialect::Posix | ShellDialect::Fish => out.push('$'),
         }
         out.push_str(name);
         out
@@ -151,21 +167,33 @@ impl ShellDialect {
 
     /// Returns the path-list separator for this dialect.
     const fn path_sep(self) -> char {
-        if self.is_powershell() {
-            ';'
-        } else {
-            ':'
+        match self {
+            ShellDialect::PowerShell => ';',
+            ShellDialect::Nushell => {
+                if cfg!(windows) {
+                    ';'
+                } else {
+                    ':'
+                }
+            }
+            ShellDialect::Posix | ShellDialect::Fish => ':',
         }
     }
 
     /// Whether an environment variable holds a list of paths that should be split into entries.
     fn is_path_list(self, name: &str, value: &str) -> bool {
-        if self.is_powershell() {
-            value.contains(';')
-        } else {
-            value.contains(':')
-                && (contains_ignore_ascii_case(name, "PATH")
-                    || ends_with_ignore_ascii_case(name, "DIRS"))
+        match self {
+            ShellDialect::PowerShell => value.contains(';'),
+            ShellDialect::Nushell => {
+                value.contains(self.path_sep())
+                    && (contains_ignore_ascii_case(name, "PATH")
+                        || ends_with_ignore_ascii_case(name, "DIRS"))
+            }
+            ShellDialect::Posix | ShellDialect::Fish => {
+                value.contains(':')
+                    && (contains_ignore_ascii_case(name, "PATH")
+                        || ends_with_ignore_ascii_case(name, "DIRS"))
+            }
         }
     }
 
@@ -292,6 +320,71 @@ impl ShellDialect {
                     ]);
                 }
                 vars
+            }
+            ShellDialect::Nushell => {
+                let home = sanitize_single_line(
+                    &env::var("HOME")
+                        .or_else(|_| env::var("USERPROFILE"))
+                        .unwrap_or_default(),
+                )
+                .into_owned();
+                let temp =
+                    sanitize_single_line(&env::temp_dir().display().to_string()).into_owned();
+                let config_path = if cfg!(windows) {
+                    non_empty_abs_env_path("APPDATA")
+                        .map(|p| p.join("nushell").join("config.nu"))
+                        .unwrap_or_else(|| {
+                            PathBuf::from(format!("{home}\\AppData\\Roaming\\nushell\\config.nu"))
+                        })
+                        .display()
+                        .to_string()
+                } else {
+                    non_empty_abs_env_path("XDG_CONFIG_HOME")
+                        .map(|p| p.join("nushell").join("config.nu"))
+                        .unwrap_or_else(|| {
+                            PathBuf::from(format!("{home}/.config/nushell/config.nu"))
+                        })
+                        .display()
+                        .to_string()
+                };
+                let config_path = sanitize_single_line(&config_path).into_owned();
+                vec![
+                    Entry::new("$env.PWD", "$env.PWD (Current Dir)", EntryKind::Var, pwd)
+                        .with_literal(true),
+                    Entry::new(
+                        "$nu.home-path",
+                        "$nu.home-path (User Home)",
+                        EntryKind::Var,
+                        home,
+                    )
+                    .with_literal(true),
+                    Entry::new(
+                        "$nu.temp-path",
+                        "$nu.temp-path (Temp Dir)",
+                        EntryKind::Var,
+                        temp,
+                    )
+                    .with_literal(true),
+                    Entry::new(
+                        "$nu.config-path",
+                        "$nu.config-path (Nushell Config)",
+                        EntryKind::Var,
+                        config_path,
+                    )
+                    .with_literal(true),
+                    Entry::new(
+                        "$env.LAST_EXIT_CODE",
+                        "$env.LAST_EXIT_CODE (Last Exit Code)",
+                        EntryKind::Var,
+                        "Exit code of last external command",
+                    ),
+                    Entry::new(
+                        "$in",
+                        "$in (Pipeline Input)",
+                        EntryKind::Var,
+                        "Current value streamed into pipeline expression",
+                    ),
+                ]
             }
         }
     }
@@ -794,10 +887,10 @@ where
         children.push(entry);
     }
 
-    let (text, label) = if dialect.is_powershell() {
-        ("$env:", "$env:Variables")
-    } else {
-        ("$", "$ENV Variables")
+    let (text, label) = match dialect {
+        ShellDialect::PowerShell => ("$env:", "$env:Variables"),
+        ShellDialect::Nushell => ("$env.", "$env.Variables"),
+        ShellDialect::Posix | ShellDialect::Fish => ("$", "$ENV Variables"),
     };
     let mut root = Entry::scope_root(
         text,
@@ -830,6 +923,10 @@ fn build_var_scope_entry(dialect: ShellDialect, ctx: &RuntimeContext) -> Entry {
         ShellDialect::Fish => (
             "$fish Variables",
             "Browse and insert Fish shell & special variables ($PWD, $status, $last_pid, ...)",
+        ),
+        ShellDialect::Nushell => (
+            "$nu Variables",
+            "Browse and insert Nushell built-in & special variables ($env.PWD, $nu.config-path, $in, ...)",
         ),
     };
     let mut root = Entry::scope_root("$", label, EntryKind::Var, desc);
@@ -1290,15 +1387,17 @@ mod tests {
 
     #[test]
     fn test_shell_dialects_side_by_side_in_same_process() {
-        // 1. Variable tokens across all three dialects in the same test run
+        // 1. Variable tokens across all four dialects in the same test run
         assert_eq!(ShellDialect::PowerShell.env_token("PATH"), "$env:PATH");
         assert_eq!(ShellDialect::Posix.env_token("PATH"), "$PATH");
         assert_eq!(ShellDialect::Fish.env_token("PATH"), "$PATH");
+        assert_eq!(ShellDialect::Nushell.env_token("PATH"), "$env.PATH");
 
-        // 2. Built-in common variable entries across all three dialects in the same test run
+        // 2. Built-in common variable entries across all four dialects in the same test run
         let ps_vars = ShellDialect::PowerShell.common_var_entries();
         let posix_vars = ShellDialect::Posix.common_var_entries();
         let fish_vars = ShellDialect::Fish.common_var_entries();
+        let nu_vars = ShellDialect::Nushell.common_var_entries();
 
         let ps_texts: Vec<&str> = ps_vars.iter().map(|i| i.text.as_str()).collect();
         assert!(ps_texts.contains(&"$PWD"));
@@ -1324,6 +1423,15 @@ mod tests {
         assert!(fish_texts.contains(&"$fish_pid"));
         assert!(!fish_texts.contains(&"$?"));
         assert!(!fish_texts.contains(&"$PROFILE"));
+
+        let nu_texts: Vec<&str> = nu_vars.iter().map(|i| i.text.as_str()).collect();
+        assert!(nu_texts.contains(&"$env.PWD"));
+        assert!(nu_texts.contains(&"$nu.home-path"));
+        assert!(nu_texts.contains(&"$nu.config-path"));
+        assert!(nu_texts.contains(&"$env.LAST_EXIT_CODE"));
+        assert!(nu_texts.contains(&"$in"));
+        assert!(!nu_texts.contains(&"$?"));
+        assert!(!nu_texts.contains(&"$status"));
 
         // 3. Path-list splitting and env scope construction across dialects
         let sample_vars = vec![
@@ -1378,7 +1486,7 @@ mod tests {
             .collect();
         assert_eq!(posix_xdg_entries, vec!["/usr/share", "/var/lib"]);
 
-        let fish_scope = build_env_scope_entry_from_vars(ShellDialect::Fish, sample_vars);
+        let fish_scope = build_env_scope_entry_from_vars(ShellDialect::Fish, sample_vars.clone());
         assert!(fish_scope.is_scope_root());
         assert_eq!(fish_scope.text, "$");
         assert_eq!(fish_scope.label, "$ENV Variables");
@@ -1392,25 +1500,66 @@ mod tests {
             fish_xdg.children.iter().map(|c| c.label.as_str()).collect();
         assert_eq!(fish_xdg_entries, vec!["/usr/share", "/var/lib"]);
 
+        let nu_scope = build_env_scope_entry_from_vars(ShellDialect::Nushell, sample_vars);
+        assert!(nu_scope.is_scope_root());
+        assert_eq!(nu_scope.text, "$env.");
+        assert_eq!(nu_scope.label, "$env.Variables");
+        let nu_path = nu_scope
+            .children
+            .iter()
+            .find(|c| c.label == "PATH")
+            .expect("PATH in Nushell scope");
+        assert_eq!(nu_path.text, "$env.PATH");
+        assert_eq!(nu_path.children.len(), 2);
+        let nu_editor = nu_scope
+            .children
+            .iter()
+            .find(|c| c.label == "EDITOR")
+            .expect("EDITOR in Nushell scope");
+        assert_eq!(nu_editor.text, "$env.EDITOR");
+
         // 4. ShellDialect::from_env detection rules
         assert_eq!(
-            ShellDialect::from_env(Some("fish"), true, false, None, true),
+            ShellDialect::from_env(Some("fish"), true, false, false, None, true),
             ShellDialect::Fish
         );
         assert_eq!(
-            ShellDialect::from_env(Some("posix"), true, false, None, true),
+            ShellDialect::from_env(Some("posix"), true, false, false, None, true),
             ShellDialect::Posix
         );
         assert_eq!(
-            ShellDialect::from_env(Some("pwsh"), false, true, Some("/usr/bin/fish"), false),
+            ShellDialect::from_env(Some("nu"), true, false, false, None, true),
+            ShellDialect::Nushell
+        );
+        assert_eq!(
+            ShellDialect::from_env(Some("nushell"), false, true, false, None, false),
+            ShellDialect::Nushell
+        );
+        assert_eq!(
+            ShellDialect::from_env(
+                Some("pwsh"),
+                false,
+                true,
+                true,
+                Some("/usr/bin/fish"),
+                false
+            ),
             ShellDialect::PowerShell
         );
         assert_eq!(
-            ShellDialect::from_env(None, false, false, Some("/usr/bin/fish"), false),
+            ShellDialect::from_env(None, true, false, true, None, true),
+            ShellDialect::Nushell
+        );
+        assert_eq!(
+            ShellDialect::from_env(None, false, false, false, Some("/usr/bin/nu"), false),
+            ShellDialect::Nushell
+        );
+        assert_eq!(
+            ShellDialect::from_env(None, false, false, false, Some("/usr/bin/fish"), false),
             ShellDialect::Fish
         );
         assert_eq!(
-            ShellDialect::from_env(None, false, false, Some("/bin/bash"), false),
+            ShellDialect::from_env(None, false, false, false, Some("/bin/bash"), false),
             ShellDialect::Posix
         );
     }
@@ -1673,16 +1822,20 @@ commands:
     #[test]
     fn test_shell_dialect_and_config_toml_edge_cases() {
         assert_eq!(
-            ShellDialect::from_env(Some("  dash  "), false, false, None, false),
+            ShellDialect::from_env(Some("  dash  "), false, false, false, None, false),
             ShellDialect::Posix
         );
         assert_eq!(
-            ShellDialect::from_env(Some("ksh"), false, false, None, false),
+            ShellDialect::from_env(Some("ksh"), false, false, false, None, false),
             ShellDialect::Posix
         );
         assert_eq!(
-            ShellDialect::from_env(None, false, false, Some("fish"), false),
+            ShellDialect::from_env(None, false, false, false, Some("fish"), false),
             ShellDialect::Fish
+        );
+        assert_eq!(
+            ShellDialect::from_env(None, false, false, false, Some("nu"), false),
+            ShellDialect::Nushell
         );
 
         let cfg = parse_user_config_toml(
@@ -1746,12 +1899,20 @@ commands:
             "'a'\\''b\\c$(id)`id`'"
         );
 
-        let fish_root = build_env_scope_entry_from_vars(ShellDialect::Fish, hostile_vars);
+        let fish_root = build_env_scope_entry_from_vars(ShellDialect::Fish, hostile_vars.clone());
         assert_eq!(fish_root.children.len(), 1);
         assert_eq!(fish_root.children[0].text, "$SAFE_TOKEN");
         assert_eq!(
             fish_root.children[0].children[1].text,
             "'a\\'b\\\\c$(id)`id`'"
+        );
+
+        let nu_root = build_env_scope_entry_from_vars(ShellDialect::Nushell, hostile_vars);
+        assert_eq!(nu_root.children.len(), 1);
+        assert_eq!(nu_root.children[0].text, "$env.SAFE_TOKEN");
+        assert_eq!(
+            nu_root.children[0].children[1].text,
+            "\"a'b\\\\c$(id)`id`\""
         );
     }
 

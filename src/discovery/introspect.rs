@@ -151,6 +151,7 @@ fn dialect_cache_tag(dialect: ShellDialect) -> &'static str {
         ShellDialect::PowerShell => "pwsh",
         ShellDialect::Posix => "posix",
         ShellDialect::Fish => "fish",
+        ShellDialect::Nushell => "nu",
     }
 }
 
@@ -457,6 +458,7 @@ pub fn clear_disk_cache() -> anyhow::Result<usize> {
         cli_cache_path_for(ShellDialect::PowerShell),
         cli_cache_path_for(ShellDialect::Posix),
         cli_cache_path_for(ShellDialect::Fish),
+        cli_cache_path_for(ShellDialect::Nushell),
         legacy_cli_cache_path(),
         ps_metadata_path(),
     ] {

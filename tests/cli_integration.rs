@@ -77,6 +77,7 @@ fn isolated_cmd(ws: &TempWorkspace) -> Command {
         .env_remove("ZDOTDIR")
         .env_remove("PSModulePath")
         .env_remove("FISH_VERSION")
+        .env_remove("NU_VERSION")
         .env_remove("SHELL");
     cmd
 }
@@ -151,7 +152,10 @@ fn cli_help_prints_usage_and_env_vars_with_clean_stderr() {
         );
         let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
         assert!(stdout.contains("Usage: zpane"), "missing usage: {stdout}");
-        assert!(stdout.contains("zpane init <pwsh|zsh|bash|fish>"));
+        assert!(stdout.contains("zpane init <pwsh|zsh|bash|fish|nu>"));
+        assert!(stdout.contains("--cursor <OFFSET>"));
+        assert!(stdout.contains("--bind <CHORD>"));
+        assert!(stdout.contains("--no-bind"));
         assert!(stdout.contains("zpane inspect [--json] <CMD>..."));
         assert!(stdout.contains("ZPANE_SHELL"));
         assert!(stdout.contains("ZPANE_CONFIG"));
@@ -167,7 +171,10 @@ fn cli_init_emits_shell_hooks_with_clean_stderr_and_rejects_unknown_shell() {
         (&["init", "zsh"][..], "_zpane_widget"),
         (&["init", "bash"][..], "_zpane_readline"),
         (&["init", "fish"][..], "function _zpane_fish"),
+        (&["init", "nu"][..], "commandline edit --replace"),
+        (&["init", "nushell"][..], "$env.config.keybindings"),
         (&["--init=bash"][..], "bind -x"),
+        (&["--init=nu", "--bind", "Ctrl+g"][..], "keycode: char_g"),
     ] {
         let out = run_isolated(&ws, args);
         assert!(out.status.success(), "{args:?} failed: {out:?}");
@@ -178,12 +185,48 @@ fn cli_init_emits_shell_hooks_with_clean_stderr_and_rejects_unknown_shell() {
         );
         let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
         assert!(
-            stdout.contains(needle) && stdout.contains("--out-file"),
+            stdout.contains(needle) && stdout.contains("--cursor") && stdout.contains("--out-file"),
             "unexpected init script for {args:?}: {stdout}"
         );
     }
 
-    let bad = run_isolated(&ws, &["init", "nushell"]);
+    // `--no-bind` defines widgets without registering default bindings across all shells.
+    for (args, def_needle, forbidden_bind) in [
+        (
+            &["init", "pwsh", "--no-bind"][..],
+            "function Invoke-ZpaneWidget",
+            "Set-PSReadLineKeyHandler",
+        ),
+        (
+            &["init", "zsh", "--no-bind"][..],
+            "zle -N _zpane_widget",
+            "bindkey ",
+        ),
+        (
+            &["init", "bash", "--no-bind"][..],
+            "_zpane_readline()",
+            "bind -x",
+        ),
+        (
+            &["init", "fish", "--no-bind"][..],
+            "function _zpane_fish",
+            "\nbind ",
+        ),
+        (
+            &["init", "nu", "--no-bind"][..],
+            "def _zpane_widget []",
+            "$env.config.keybindings",
+        ),
+    ] {
+        let out = run_isolated(&ws, args);
+        assert!(out.status.success(), "{args:?} failed: {out:?}");
+        assert!(out.stderr.is_empty());
+        let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
+        assert!(stdout.contains(def_needle), "{args:?}: {stdout}");
+        assert!(!stdout.contains(forbidden_bind), "{args:?}: {stdout}");
+    }
+
+    let bad = run_isolated(&ws, &["init", "tcsh"]);
     assert!(!bad.status.success(), "unknown shell must fail");
     assert!(
         bad.stdout.is_empty(),
@@ -195,6 +238,17 @@ fn cli_init_emits_shell_hooks_with_clean_stderr_and_rejects_unknown_shell() {
         stderr.contains("Unknown shell target"),
         "unexpected stderr: {stderr}"
     );
+
+    // Conflicting `--bind` + `--no-bind` and malicious bind injection must fail cleanly.
+    for bad_init in [
+        &["init", "zsh", "--bind", "Ctrl+g", "--no-bind"][..],
+        &["--init=pwsh", "--bind=Alt+m'; rm -rf /"][..],
+    ] {
+        let out = run_isolated(&ws, bad_init);
+        assert!(!out.status.success(), "{bad_init:?} must fail");
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.is_empty());
+    }
 }
 
 #[test]
@@ -261,8 +315,9 @@ fn cli_clear_cache_json_and_human_remove_files_with_expected_streams() {
     fs::create_dir_all(&cache).expect("create cache dir");
     let f1 = cache.join("cli_cache_posix.json");
     let f2 = cache.join("cli_cache_pwsh.json");
-    let f3 = cache.join("ps_metadata.json");
-    for f in [&f1, &f2, &f3] {
+    let f3 = cache.join("cli_cache_nu.json");
+    let f4 = cache.join("ps_metadata.json");
+    for f in [&f1, &f2, &f3, &f4] {
         fs::write(f, b"{}").expect("seed cache file");
     }
 
@@ -274,8 +329,8 @@ fn cli_clear_cache_json_and_human_remove_files_with_expected_streams() {
         String::from_utf8_lossy(&first.stderr)
     );
     let json: Value = serde_json::from_slice(&first.stdout).expect("valid clear-cache json");
-    assert_eq!(json, serde_json::json!({ "cleared": 3 }));
-    assert!(!f1.exists() && !f2.exists() && !f3.exists());
+    assert_eq!(json, serde_json::json!({ "cleared": 4 }));
+    assert!(!f1.exists() && !f2.exists() && !f3.exists() && !f4.exists());
 
     let second = run_isolated(&ws, &["--clear-cache", "--json"]);
     assert!(second.status.success());
@@ -424,7 +479,13 @@ fn cli_env_overrides_zpane_shell_and_zpane_config_control_behavior() {
     write_demo_spec(&ws, "zpanedemo");
 
     // 1. ZPANE_SHELL overrides detected dialect across all supported values.
-    for (env_val, expected_tag) in [("pwsh", "pwsh"), ("posix", "posix"), ("fish", "fish")] {
+    for (env_val, expected_tag) in [
+        ("pwsh", "pwsh"),
+        ("posix", "posix"),
+        ("fish", "fish"),
+        ("nu", "nu"),
+        ("nushell", "nu"),
+    ] {
         let out = isolated_cmd(&ws)
             .env("ZPANE_SHELL", env_val)
             .args(["inspect", "--json", "zpanedemo"])
@@ -436,6 +497,17 @@ fn cli_env_overrides_zpane_shell_and_zpane_config_control_behavior() {
         assert_eq!(json["dialect"], expected_tag);
         assert_eq!(json["command"]["text"], "zpanedemo");
     }
+
+    // 1b. NU_VERSION auto-detects Nushell when ZPANE_SHELL is unset.
+    let nu_auto = isolated_cmd(&ws)
+        .env("NU_VERSION", "0.100.0")
+        .args(["inspect", "--json", "zpanedemo"])
+        .output()
+        .expect("run inspect with NU_VERSION");
+    assert!(nu_auto.status.success());
+    assert!(nu_auto.stderr.is_empty());
+    let nu_json: Value = serde_json::from_slice(&nu_auto.stdout).expect("valid nu json");
+    assert_eq!(nu_json["dialect"], "nu");
 
     // 2. ZPANE_CONFIG pointing to a config with disabled_tools hides the spec entry.
     let disabled_cfg = ws.path().join("custom_disabled.toml");
@@ -478,4 +550,56 @@ fn cli_env_overrides_zpane_shell_and_zpane_config_control_behavior() {
     assert!(enabled_json["entries"]
         .as_array()
         .is_some_and(|arr| arr.iter().any(|e| e["text"] == "remote")));
+}
+
+#[test]
+fn cli_cursor_validation_and_session_suffix_preservation() {
+    use zpane::discovery::{Introspect, PollResult, ShellDialect};
+    use zpane::model::{Entry, EntryKind};
+    use zpane::session::{MillerSession, SessionOutcome, UserAction};
+    use zpane::ui::Viewport;
+
+    let ws = TempWorkspace::new("cursor");
+    for bad in [
+        &["--cursor", "-5"][..],
+        &["--cursor=notanint"][..],
+        &["--cursor"][..],
+    ] {
+        let out = run_isolated(&ws, bad);
+        assert!(!out.status.success(), "{bad:?} must fail");
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.is_empty());
+    }
+
+    struct EmptyIntrospector;
+    impl Introspect for EmptyIntrospector {
+        fn query(&mut self, _chain: &[&str]) -> Vec<Entry> {
+            Vec::new()
+        }
+        fn poll_updates(&mut self) -> PollResult {
+            PollResult::default()
+        }
+        fn flush(&mut self) -> bool {
+            false
+        }
+    }
+
+    let mut status = Entry::new("status", "status", EntryKind::Subcmd, "Status");
+    status.children = vec![Entry::new("--short", "--short", EntryKind::Flag, "Short")];
+    let mut git = Entry::new("git", "git", EntryKind::Cli, "Git");
+    git.children = vec![status];
+
+    let mut session = MillerSession::new(
+        vec![git],
+        EmptyIntrospector,
+        "git status && cargo test",
+        Viewport::new(120, 30),
+        ShellDialect::Nushell,
+    )
+    .with_cursor_offset(10);
+    session.apply(UserAction::AcceptToken);
+    assert_eq!(
+        session.apply(UserAction::Confirm),
+        SessionOutcome::Confirmed("git status --short && cargo test".to_string())
+    );
 }

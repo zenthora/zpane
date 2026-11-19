@@ -169,11 +169,12 @@ const HELP_TEXT: &str = "\
 zpane - 3-pane Miller column command, parameter & variable explorer
 
 Usage: zpane [OPTIONS] [--] [INITIAL_TOKENS]...
-       zpane init <pwsh|zsh|bash|fish>
+       zpane init <pwsh|zsh|bash|fish|nu> [--bind <CHORD> | --no-bind]
        zpane inspect [--json] <CMD>...
 
 Options:
       --initial <TEXT>       Seed the command builder with an existing command buffer
+      --cursor <OFFSET>      Cursor character offset in --initial (preserves trailing suffix verbatim)
       --out-file <PATH>      Write the accepted command to <PATH> instead of stdout
       --width <COLS>         Fallback terminal width (default: 120)
       --height <ROWS>        Fallback terminal height (default: 30)
@@ -181,7 +182,9 @@ Options:
       --context-file <PATH>  Read dynamic runtime context JSON payload from <PATH>
       --git-branch <NAME>    Override current Git branch name for runtime context
       --history <CMD>        Add a recent command to the top of Pane 1 (repeatable)
-      --init <SHELL>         Print shell integration snippet (`pwsh`, `zsh`, `bash`, `fish`) and exit
+      --init <SHELL>         Print shell integration snippet (`pwsh`, `zsh`, `bash`, `fish`, `nu`) and exit
+      --bind <CHORD>         Keybinding chord for `init`/`--init` (e.g. `Alt+m`, `Ctrl+g`, `Ctrl+Space`, `F2`)
+      --no-bind              Define the shell init widget/helper without registering a keybinding
       --inspect <CMD>        Inspect a command or subcommand chain non-interactively and exit
       --json                 Emit machine-readable JSON for non-interactive commands
       --sync-ps              Sync PowerShell cmdlet & parameter metadata (pwsh or powershell.exe) and exit
@@ -191,7 +194,7 @@ Options:
   -V, --version              Print version
 
 Environment:
-  ZPANE_SHELL                Force token dialect: `pwsh` ($env:X, cmdlets), `posix` ($X), or `fish` ($status)
+  ZPANE_SHELL                Force token dialect: `pwsh` ($env:X), `posix` ($X), `fish` ($status), or `nu` ($env.X)
   ZPANE_CONFIG               Override user config path (`config.toml`)
 ";
 
@@ -201,6 +204,7 @@ enum ShellInitTarget {
     Zsh,
     Bash,
     Fish,
+    Nushell,
 }
 
 impl ShellInitTarget {
@@ -210,22 +214,368 @@ impl ShellInitTarget {
             "zsh" => Ok(ShellInitTarget::Zsh),
             "bash" => Ok(ShellInitTarget::Bash),
             "fish" => Ok(ShellInitTarget::Fish),
+            "nu" | "nushell" => Ok(ShellInitTarget::Nushell),
             other => anyhow::bail!(
-                "Unknown shell target '{}' (expected one of: pwsh, zsh, bash, fish)",
+                "Unknown shell target '{}' (expected one of: pwsh, zsh, bash, fish, nu)",
                 sanitize_error_arg(other)
             ),
         }
     }
 }
 
-fn render_shell_init(target: ShellInitTarget) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitKey {
+    Letter(char),
+    Digit(char),
+    Space,
+    Tab,
+    F(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InitKeyChord {
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    key: InitKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitBindMode {
+    Bind(InitKeyChord),
+    Disabled,
+}
+
+impl Default for InitBindMode {
+    fn default() -> Self {
+        Self::Bind(InitKeyChord::default_alt_m())
+    }
+}
+
+impl InitKeyChord {
+    const fn default_alt_m() -> Self {
+        Self {
+            ctrl: false,
+            alt: true,
+            shift: false,
+            key: InitKey::Letter('m'),
+        }
+    }
+
+    fn parse(raw: &str) -> anyhow::Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || !trimmed.is_ascii()
+            || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f)
+        {
+            anyhow::bail!(
+                "Invalid keybinding chord '{}' (expected e.g. Alt+m, Ctrl+g, Ctrl+Space, Shift+Tab, F2)",
+                sanitize_error_arg(raw)
+            );
+        }
+
+        let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
+        if parts.iter().any(|p| p.is_empty()) {
+            anyhow::bail!(
+                "Invalid keybinding chord '{}' (empty modifier or key segment)",
+                sanitize_error_arg(raw)
+            );
+        }
+
+        let mut ctrl = false;
+        let mut alt = false;
+        let mut shift = false;
+        for modifier in &parts[..parts.len() - 1] {
+            match modifier.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => {
+                    if ctrl {
+                        anyhow::bail!(
+                            "Duplicate modifier in keybinding chord '{}'",
+                            sanitize_error_arg(raw)
+                        );
+                    }
+                    ctrl = true;
+                }
+                "alt" | "meta" => {
+                    if alt {
+                        anyhow::bail!(
+                            "Duplicate modifier in keybinding chord '{}'",
+                            sanitize_error_arg(raw)
+                        );
+                    }
+                    alt = true;
+                }
+                "shift" => {
+                    if shift {
+                        anyhow::bail!(
+                            "Duplicate modifier in keybinding chord '{}'",
+                            sanitize_error_arg(raw)
+                        );
+                    }
+                    shift = true;
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unknown modifier '{}' in keybinding chord '{}'",
+                        sanitize_error_arg(modifier),
+                        sanitize_error_arg(raw)
+                    );
+                }
+            }
+        }
+
+        let key_part = parts[parts.len() - 1];
+        let key_lower = key_part.to_ascii_lowercase();
+        let key = match key_lower.as_str() {
+            "space" | "spacebar" => InitKey::Space,
+            "tab" => InitKey::Tab,
+            "backtab" => {
+                shift = true;
+                InitKey::Tab
+            }
+            _ if key_lower.starts_with('f') && key_lower.len() >= 2 => {
+                let Ok(num) = key_lower[1..].parse::<u8>() else {
+                    anyhow::bail!(
+                        "Invalid key '{}' in keybinding chord '{}'",
+                        sanitize_error_arg(key_part),
+                        sanitize_error_arg(raw)
+                    );
+                };
+                if !(1..=12).contains(&num) {
+                    anyhow::bail!(
+                        "Function key in '{}' must be between F1 and F12",
+                        sanitize_error_arg(raw)
+                    );
+                }
+                InitKey::F(num)
+            }
+            _ => {
+                let mut chars = key_lower.chars();
+                let Some(ch) = chars.next() else {
+                    anyhow::bail!(
+                        "Missing key in keybinding chord '{}'",
+                        sanitize_error_arg(raw)
+                    );
+                };
+                if chars.next().is_some() {
+                    anyhow::bail!(
+                        "Unsupported key '{}' in keybinding chord '{}'",
+                        sanitize_error_arg(key_part),
+                        sanitize_error_arg(raw)
+                    );
+                }
+                if ch.is_ascii_lowercase() {
+                    InitKey::Letter(ch)
+                } else if ch.is_ascii_digit() {
+                    InitKey::Digit(ch)
+                } else {
+                    anyhow::bail!(
+                        "Unsupported key '{}' in keybinding chord '{}'",
+                        sanitize_error_arg(key_part),
+                        sanitize_error_arg(raw)
+                    );
+                }
+            }
+        };
+
+        let valid_combo = match key {
+            InitKey::Letter(_) => (ctrl || alt) && !(ctrl && shift),
+            InitKey::Digit(_) => alt && !ctrl && !shift,
+            InitKey::Space => (ctrl ^ alt) && !shift,
+            InitKey::Tab => !ctrl && !(alt && shift),
+            InitKey::F(_) => !ctrl && !alt && !shift,
+        };
+        if !valid_combo {
+            anyhow::bail!(
+                "Unsupported modifier/key combination '{}' (use e.g. Alt+m, Ctrl+g, Ctrl+Alt+m, Alt+Shift+m, Ctrl+Space, Tab, Shift+Tab, F1-F12)",
+                sanitize_error_arg(raw)
+            );
+        }
+
+        Ok(Self {
+            ctrl,
+            alt,
+            shift,
+            key,
+        })
+    }
+
+    fn to_pwsh_chord(self) -> String {
+        let mut out = String::new();
+        if self.ctrl {
+            out.push_str("Ctrl+");
+        }
+        if self.alt {
+            out.push_str("Alt+");
+        }
+        if self.shift {
+            out.push_str("Shift+");
+        }
+        match self.key {
+            InitKey::Letter(c) | InitKey::Digit(c) => out.push(c),
+            InitKey::Space => out.push_str("Spacebar"),
+            InitKey::Tab => out.push_str("Tab"),
+            InitKey::F(n) => out.push_str(&format!("F{n}")),
+        }
+        out
+    }
+
+    fn to_zsh_bindkey(self) -> String {
+        match self.key {
+            InitKey::Letter(c) => match (self.ctrl, self.alt, self.shift) {
+                (true, true, _) => format!("^[^{}", c.to_ascii_uppercase()),
+                (true, false, _) => format!("^{}", c.to_ascii_uppercase()),
+                (false, true, true) => format!("^[{}", c.to_ascii_uppercase()),
+                (false, true, false) => format!("^[{c}"),
+                _ => unreachable!(),
+            },
+            InitKey::Digit(d) => format!("^[{d}"),
+            InitKey::Space => {
+                if self.ctrl {
+                    "^@".to_string()
+                } else {
+                    "^[ ".to_string()
+                }
+            }
+            InitKey::Tab => {
+                if self.shift {
+                    "^[[Z".to_string()
+                } else if self.alt {
+                    "^[^I".to_string()
+                } else {
+                    "^I".to_string()
+                }
+            }
+            InitKey::F(n) => match n {
+                1 => "^[OP",
+                2 => "^[OQ",
+                3 => "^[OR",
+                4 => "^[OS",
+                5 => "^[[15~",
+                6 => "^[[17~",
+                7 => "^[[18~",
+                8 => "^[[19~",
+                9 => "^[[20~",
+                10 => "^[[21~",
+                11 => "^[[23~",
+                12 => "^[[24~",
+                _ => unreachable!(),
+            }
+            .to_string(),
+        }
+    }
+
+    fn to_bash_readline(self) -> String {
+        match self.key {
+            InitKey::Letter(c) => match (self.ctrl, self.alt, self.shift) {
+                (true, true, _) => format!("\\e\\C-{c}"),
+                (true, false, _) => format!("\\C-{c}"),
+                (false, true, true) => format!("\\e{}", c.to_ascii_uppercase()),
+                (false, true, false) => format!("\\e{c}"),
+                _ => unreachable!(),
+            },
+            InitKey::Digit(d) => format!("\\e{d}"),
+            InitKey::Space => {
+                if self.ctrl {
+                    "\\C-@".to_string()
+                } else {
+                    "\\e ".to_string()
+                }
+            }
+            InitKey::Tab => {
+                if self.shift {
+                    "\\e[Z".to_string()
+                } else if self.alt {
+                    "\\e\\t".to_string()
+                } else {
+                    "\\t".to_string()
+                }
+            }
+            InitKey::F(n) => match n {
+                1 => "\\eOP",
+                2 => "\\eOQ",
+                3 => "\\eOR",
+                4 => "\\eOS",
+                5 => "\\e[15~",
+                6 => "\\e[17~",
+                7 => "\\e[18~",
+                8 => "\\e[19~",
+                9 => "\\e[20~",
+                10 => "\\e[21~",
+                11 => "\\e[23~",
+                12 => "\\e[24~",
+                _ => unreachable!(),
+            }
+            .to_string(),
+        }
+    }
+
+    fn to_fish_bind(self) -> String {
+        match self.key {
+            InitKey::Letter(c) => match (self.ctrl, self.alt, self.shift) {
+                (true, true, _) => format!("\\e\\c{c}"),
+                (true, false, _) => format!("\\c{c}"),
+                (false, true, true) => format!("\\e{}", c.to_ascii_uppercase()),
+                (false, true, false) => format!("\\e{c}"),
+                _ => unreachable!(),
+            },
+            InitKey::Digit(d) => format!("\\e{d}"),
+            InitKey::Space => {
+                if self.ctrl {
+                    "\\c@".to_string()
+                } else {
+                    "\\e' '".to_string()
+                }
+            }
+            InitKey::Tab => {
+                if self.shift {
+                    "-k btab".to_string()
+                } else if self.alt {
+                    "\\e\\t".to_string()
+                } else {
+                    "\\t".to_string()
+                }
+            }
+            InitKey::F(n) => format!("-k f{n}"),
+        }
+    }
+
+    fn to_nu_binding(self) -> (&'static str, String) {
+        let modifier = match (self.ctrl, self.alt, self.shift) {
+            (true, true, false) => "control_alt",
+            (true, false, false) => "control",
+            (false, true, true) => "alt_shift",
+            (false, true, false) => "alt",
+            (false, false, true) => "shift",
+            (false, false, false) => "none",
+            _ => unreachable!(),
+        };
+        let keycode = match self.key {
+            InitKey::Letter(c) | InitKey::Digit(c) => format!("char_{c}"),
+            InitKey::Space => "space".to_string(),
+            InitKey::Tab => {
+                if self.shift {
+                    "backtab".to_string()
+                } else {
+                    "tab".to_string()
+                }
+            }
+            InitKey::F(n) => format!("f{n}"),
+        };
+        (modifier, keycode)
+    }
+}
+
+fn render_shell_init(target: ShellInitTarget, bind_mode: InitBindMode) -> String {
     match target {
         ShellInitTarget::Pwsh => {
-            r#"Set-PSReadLineKeyHandler -Chord 'Alt+m' -ScriptBlock {
+            let mut out = String::from(
+                r#"function Invoke-ZpaneWidget {
     $line = $null
     $cursor = $null
     [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
     if ($null -eq $line) { $line = '' }
+    if ($null -eq $cursor -or $cursor -lt 0) { $cursor = $line.Length }
 
     $tmp = $null
     $ctxFile = $null
@@ -272,7 +622,7 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
             } else {
                 $line
             }
-            zpane --initial "$initVal" --context-file "$ctxFile" --out-file "$tmp"
+            zpane --initial "$initVal" --cursor "$cursor" --context-file "$ctxFile" --out-file "$tmp"
         } else {
             zpane --context-file "$ctxFile" --out-file "$tmp"
         }
@@ -290,15 +640,30 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
         if ($ctxFile) { Remove-Item -LiteralPath $ctxFile -Force -ErrorAction SilentlyContinue }
     }
 }
-"#
+"#,
+            );
+            if let InitBindMode::Bind(chord) = bind_mode {
+                let chord_str = chord.to_pwsh_chord();
+                out.push_str(&format!(
+                    "Set-PSReadLineKeyHandler -Chord '{chord_str}' -ScriptBlock {{ Invoke-ZpaneWidget }}\n"
+                ));
+            }
+            out
         }
         ShellInitTarget::Zsh => {
-            r#"_zpane_widget() {
+            let mut out = String::from(
+                r#"_zpane_widget() {
     setopt localoptions localtraps
-    local tmp
+    local tmp line
+    local -a hist_args
     tmp="$(umask 077 && mktemp)" || return
     trap 'rm -f -- "$tmp"' EXIT INT TERM
-    if zpane --initial "$BUFFER" --out-file "$tmp" && [[ -s "$tmp" ]]; then
+    hist_args=()
+    while IFS= read -r line; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -n "$line" ]] && hist_args=(--history "$line" "${hist_args[@]}")
+    done < <(fc -ln -15 2>/dev/null || true)
+    if zpane --initial "$BUFFER" --cursor "$CURSOR" "${hist_args[@]}" --out-file "$tmp" && [[ -s "$tmp" ]]; then
         BUFFER="$(<"$tmp")"
         CURSOR=${#BUFFER}
     fi
@@ -306,26 +671,44 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
     zle redisplay
 }
 zle -N _zpane_widget
-bindkey '^[m' _zpane_widget
-"#
+"#,
+            );
+            if let InitBindMode::Bind(chord) = bind_mode {
+                let seq = chord.to_zsh_bindkey();
+                out.push_str(&format!("bindkey '{seq}' _zpane_widget\n"));
+            }
+            out
         }
         ShellInitTarget::Bash => {
-            r#"_zpane_readline() {
-    local tmp
+            let mut out = String::from(
+                r#"_zpane_readline() {
+    local tmp line
+    local -a hist_args=()
     tmp="$(umask 077 && mktemp)" || return
     trap 'rm -f -- "$tmp"' RETURN INT TERM
-    if zpane --initial "$READLINE_LINE" --out-file "$tmp" && [[ -s "$tmp" ]]; then
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^[[:space:]]*[0-9]+\*?[[:space:]]+(.+)$ ]]; then
+            hist_args=(--history "${BASH_REMATCH[1]}" ${hist_args[@]+"${hist_args[@]}"})
+        fi
+    done < <(HISTTIMEFORMAT='' history 15 2>/dev/null || true)
+    if zpane --initial "$READLINE_LINE" --cursor "$READLINE_POINT" ${hist_args[@]+"${hist_args[@]}"} --out-file "$tmp" && [[ -s "$tmp" ]]; then
         READLINE_LINE="$(<"$tmp")"
         READLINE_POINT=${#READLINE_LINE}
     fi
     rm -f -- "$tmp"
     trap - RETURN INT TERM
 }
-bind -x '"\em": _zpane_readline'
-"#
+"#,
+            );
+            if let InitBindMode::Bind(chord) = bind_mode {
+                let seq = chord.to_bash_readline();
+                out.push_str(&format!("bind -x '\"{seq}\": _zpane_readline'\n"));
+            }
+            out
         }
         ShellInitTarget::Fish => {
-            r#"function _zpane_fish
+            let mut out = String::from(
+                r#"function _zpane_fish
     set -l old_umask (umask)
     umask 077
     set -l tmp (mktemp)
@@ -334,10 +717,18 @@ bind -x '"\em": _zpane_readline'
     test $mk_status -eq 0; or return
 
     set -l buf (commandline -b | string join \n)
+    set -l cursor (commandline -C)
+    set -l hist_args
+    for h in (history --max 15 2>/dev/null)
+        set -l trimmed (string trim -- "$h")
+        if test -n "$trimmed"
+            set -a hist_args --history "$trimmed"
+        end
+    end
     if test (count $buf) -gt 0
-        zpane --initial "$buf" --out-file "$tmp"
+        zpane --initial "$buf" --cursor "$cursor" $hist_args --out-file "$tmp"
     else
-        zpane --initial "" --out-file "$tmp"
+        zpane --initial "" --cursor 0 $hist_args --out-file "$tmp"
     end
     if test $status -eq 0 -a -s "$tmp"
         set -l accepted (string trim -- (string collect < "$tmp"))
@@ -349,8 +740,64 @@ bind -x '"\em": _zpane_readline'
     rm -f -- "$tmp"
     commandline -f repaint
 end
-bind \em _zpane_fish
+"#,
+            );
+            if let InitBindMode::Bind(chord) = bind_mode {
+                let seq = chord.to_fish_bind();
+                out.push_str(&format!("bind {seq} _zpane_fish\n"));
+            }
+            out
+        }
+        ShellInitTarget::Nushell => {
+            let mut out = String::from(
+                r#"def _zpane_widget [] {
+    let line = (commandline)
+    let cursor = (commandline get-cursor)
+    let tmp = (mktemp -t zpane.XXXXXX)
+    let hist_args = (
+        try {
+            history
+            | last 15
+            | get command
+            | reverse
+            | where {|c| ($c | str trim | is-not-empty) }
+            | each {|c| ["--history", ($c | str trim)] }
+            | flatten
+        } catch { [] }
+    )
+    try {
+        ^zpane --initial $line --cursor ($cursor | into string) ...$hist_args --out-file $tmp
+        if $env.LAST_EXIT_CODE == 0 and ($tmp | path exists) {
+            let accepted = (open --raw $tmp | str trim)
+            if ($accepted | is-not-empty) {
+                commandline edit --replace $accepted
+                commandline set-cursor ($accepted | str length)
+            }
+        }
+    } catch { }
+    if ($tmp | path exists) {
+        rm -f $tmp
+    }
+}
+"#,
+            );
+            if let InitBindMode::Bind(chord) = bind_mode {
+                let (modifier, keycode) = chord.to_nu_binding();
+                out.push_str(&format!(
+                    r#"$env.config.keybindings = (
+    ($env.config.keybindings? | default [])
+    | append {{
+        name: zpane_widget
+        modifier: {modifier}
+        keycode: {keycode}
+        mode: [emacs, vi_normal, vi_insert]
+        event: {{ send: executehostcommand, cmd: "_zpane_widget" }}
+    }}
+)
 "#
+                ));
+            }
+            out
         }
     }
 }
@@ -358,6 +805,7 @@ bind \em _zpane_fish
 #[derive(Debug, PartialEq, Eq)]
 struct CliOptions {
     initial_buffer: String,
+    cursor_offset: Option<usize>,
     out_file: Option<PathBuf>,
     fallback_width: usize,
     fallback_height: usize,
@@ -377,7 +825,10 @@ enum PendingMode {
 enum CliCommand {
     Version,
     Help,
-    Init(ShellInitTarget),
+    Init {
+        target: ShellInitTarget,
+        bind_mode: InitBindMode,
+    },
     ClearCache {
         json: bool,
     },
@@ -598,28 +1049,93 @@ fn build_runtime_context(
     Ok(runtime_context)
 }
 
-fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
-    if args.first().map(String::as_str) == Some("init") {
-        let Some(target) = args.get(1) else {
-            anyhow::bail!("Missing shell target for `init` (expected: pwsh, zsh, bash, fish)");
-        };
-        if target == "-h" || target == "--help" {
+fn resolve_init_bind_mode(
+    bind_chord: Option<InitKeyChord>,
+    no_bind: bool,
+) -> anyhow::Result<InitBindMode> {
+    if bind_chord.is_some() && no_bind {
+        anyhow::bail!("Conflicting options: --bind and --no-bind cannot be used together");
+    }
+    if no_bind {
+        Ok(InitBindMode::Disabled)
+    } else if let Some(chord) = bind_chord {
+        Ok(InitBindMode::Bind(chord))
+    } else {
+        Ok(InitBindMode::default())
+    }
+}
+
+fn parse_cursor_offset(raw: &str) -> anyhow::Result<usize> {
+    raw.parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("Invalid integer for --cursor: {}", sanitize_error_arg(raw)))
+}
+
+fn parse_init_subcommand(args: &[String]) -> anyhow::Result<CliCommand> {
+    let mut target: Option<ShellInitTarget> = None;
+    let mut bind_chord: Option<InitKeyChord> = None;
+    let mut no_bind = false;
+    let mut i = 1;
+
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "-h" || arg == "--help" {
             return Ok(CliCommand::Help);
         }
-        let parsed = ShellInitTarget::parse(target)?;
-        if args.iter().skip(2).any(|a| a == "-h" || a == "--help") {
-            return Ok(CliCommand::Help);
-        }
-        if let Some(extra) = args.get(2) {
+        if arg.starts_with('-') {
+            let (flag, inline_val) = if arg.starts_with("--") {
+                match arg.split_once('=') {
+                    Some((f, v)) => (f, Some(v)),
+                    None => (arg, None),
+                }
+            } else {
+                (arg, None)
+            };
+            match flag {
+                "-h" | "--help" => {
+                    ensure_no_inline_value(flag, inline_val)?;
+                    return Ok(CliCommand::Help);
+                }
+                "--bind" => {
+                    let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                    bind_chord = Some(InitKeyChord::parse(val)?);
+                }
+                "--no-bind" => {
+                    ensure_no_inline_value(flag, inline_val)?;
+                    no_bind = true;
+                    i += 1;
+                }
+                _ => {
+                    anyhow::bail!(
+                        "Unexpected argument '{}' for `init`",
+                        sanitize_error_arg(arg)
+                    );
+                }
+            }
+        } else if target.is_none() {
+            target = Some(ShellInitTarget::parse(arg)?);
+            i += 1;
+        } else {
             anyhow::bail!(
                 "Unexpected argument '{}' for `init`",
-                sanitize_error_arg(extra)
+                sanitize_error_arg(arg)
             );
         }
-        return Ok(CliCommand::Init(parsed));
+    }
+
+    let Some(target) = target else {
+        anyhow::bail!("Missing shell target for `init` (expected: pwsh, zsh, bash, fish, nu)");
+    };
+    let bind_mode = resolve_init_bind_mode(bind_chord, no_bind)?;
+    Ok(CliCommand::Init { target, bind_mode })
+}
+
+fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
+    if args.first().map(String::as_str) == Some("init") {
+        return parse_init_subcommand(args);
     }
 
     let mut initial_buffer = String::new();
+    let mut cursor_offset: Option<usize> = None;
     let mut out_file: Option<PathBuf> = None;
     let mut fallback_width: usize = 120;
     let mut fallback_height: usize = 30;
@@ -629,6 +1145,8 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     let mut mode_cmd: Option<PendingMode> = None;
     let mut inspect_tokens: Vec<String> = Vec::new();
     let mut json = false;
+    let mut init_bind_chord: Option<InitKeyChord> = None;
+    let mut init_no_bind = false;
 
     let mut saw_double_dash = false;
     let mut has_positional = false;
@@ -660,7 +1178,8 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
             }
             if mode_cmd.is_some() {
                 anyhow::bail!(
-                    "Unexpected positional argument '{arg}' with standalone command flag"
+                    "Unexpected positional argument '{}' with standalone command flag",
+                    sanitize_error_arg(arg)
                 );
             }
             has_positional = true;
@@ -710,6 +1229,15 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                 let target = take_flag_value(flag, inline_val, args, &mut i)?;
                 mode_cmd = Some(PendingMode::Init(ShellInitTarget::parse(target)?));
             }
+            "--bind" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                init_bind_chord = Some(InitKeyChord::parse(val)?);
+            }
+            "--no-bind" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                init_no_bind = true;
+                i += 1;
+            }
             "--inspect" => {
                 if mode_cmd.is_some() {
                     anyhow::bail!("Conflicting command mode option {flag}");
@@ -737,6 +1265,10 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
             "--initial" => {
                 let val = take_flag_value(flag, inline_val, args, &mut i)?;
                 initial_buffer = val.to_string();
+            }
+            "--cursor" => {
+                let val = take_flag_value(flag, inline_val, args, &mut i)?;
+                cursor_offset = Some(parse_cursor_offset(val)?);
             }
             "--out-file" => {
                 let val = take_flag_value(flag, inline_val, args, &mut i)?;
@@ -784,6 +1316,12 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         }
     }
 
+    if !matches!(mode_cmd, Some(PendingMode::Init(_)))
+        && (init_bind_chord.is_some() || init_no_bind)
+    {
+        anyhow::bail!("Options --bind and --no-bind can only be used with `init` or `--init`");
+    }
+
     match mode_cmd {
         Some(PendingMode::ClearCache) => return Ok(CliCommand::ClearCache { json }),
         Some(PendingMode::SyncPs { warm }) => return Ok(CliCommand::SyncPs { warm, json }),
@@ -793,7 +1331,8 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                     "Option --json requires a non-interactive command (--inspect, --clear-cache, --sync-ps, or --warm)"
                 );
             }
-            return Ok(CliCommand::Init(target));
+            let bind_mode = resolve_init_bind_mode(init_bind_chord, init_no_bind)?;
+            return Ok(CliCommand::Init { target, bind_mode });
         }
         Some(PendingMode::InspectFlag(raw)) => {
             let runtime_context =
@@ -832,6 +1371,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
 
     Ok(CliCommand::Interactive(CliOptions {
         initial_buffer,
+        cursor_offset,
         out_file,
         fallback_width,
         fallback_height,
@@ -917,13 +1457,14 @@ fn build_interactive_session<I: zpane::discovery::Introspect>(
     pane1_entries: Vec<zpane::model::Entry>,
     introspector: I,
     initial_buffer: &str,
+    cursor_offset: Option<usize>,
     viewport: ui::Viewport,
     dialect: ShellDialect,
     runtime_ctx: RuntimeContext,
     user_config: UserConfig,
     ui_style: UiStyle,
 ) -> MillerSession<I> {
-    MillerSession::new(
+    let session = MillerSession::new(
         pane1_entries,
         introspector,
         initial_buffer,
@@ -932,7 +1473,12 @@ fn build_interactive_session<I: zpane::discovery::Introspect>(
     )
     .with_runtime_context(runtime_ctx)
     .with_ui_style(ui_style)
-    .with_keybindings(user_config.keybindings)
+    .with_keybindings(user_config.keybindings);
+    if let Some(offset) = cursor_offset {
+        session.with_cursor_offset(offset)
+    } else {
+        session
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -948,8 +1494,8 @@ fn main() -> anyhow::Result<()> {
             print!("{HELP_TEXT}");
             return Ok(());
         }
-        CliCommand::Init(target) => {
-            print!("{}", render_shell_init(target));
+        CliCommand::Init { target, bind_mode } => {
+            print!("{}", render_shell_init(target, bind_mode));
             return Ok(());
         }
         CliCommand::ClearCache { json } => {
@@ -1051,6 +1597,7 @@ fn main() -> anyhow::Result<()> {
         pane1_entries,
         introspector,
         &opts.initial_buffer,
+        opts.cursor_offset,
         viewport,
         dialect,
         runtime_ctx,
@@ -1177,9 +1724,41 @@ mod tests {
             interactive,
             CliCommand::Interactive(CliOptions {
                 initial_buffer: "git commit".to_string(),
+                cursor_offset: None,
                 out_file: Some(PathBuf::from("/tmp/out")),
                 fallback_width: 80,
                 fallback_height: 24,
+                runtime_context: RuntimeContext::default(),
+            })
+        );
+
+        let with_cursor = parse_cli_args(&s(&[
+            "--initial",
+            "git status && cargo test",
+            "--cursor",
+            "10",
+        ]))
+        .unwrap();
+        assert_eq!(
+            with_cursor,
+            CliCommand::Interactive(CliOptions {
+                initial_buffer: "git status && cargo test".to_string(),
+                cursor_offset: Some(10),
+                out_file: None,
+                fallback_width: 120,
+                fallback_height: 30,
+                runtime_context: RuntimeContext::default(),
+            })
+        );
+        let with_cursor_eq = parse_cli_args(&s(&["--cursor=0", "--initial=git"])).unwrap();
+        assert_eq!(
+            with_cursor_eq,
+            CliCommand::Interactive(CliOptions {
+                initial_buffer: "git".to_string(),
+                cursor_offset: Some(0),
+                out_file: None,
+                fallback_width: 120,
+                fallback_height: 30,
                 runtime_context: RuntimeContext::default(),
             })
         );
@@ -1189,6 +1768,11 @@ mod tests {
 
         let err_bad_h = parse_cli_args(&s(&["--height", "abc"])).unwrap_err();
         assert!(err_bad_h.to_string().contains("Invalid integer"));
+
+        let err_bad_cursor = parse_cli_args(&s(&["--cursor", "-1"])).unwrap_err();
+        assert!(err_bad_cursor.to_string().contains("Invalid integer"));
+        let err_missing_cursor = parse_cli_args(&s(&["--cursor"])).unwrap_err();
+        assert!(err_missing_cursor.to_string().contains("Missing value"));
 
         let err_missing = parse_cli_args(&s(&["--initial"])).unwrap_err();
         assert!(err_missing.to_string().contains("Missing value"));
@@ -1222,6 +1806,7 @@ mod tests {
             parsed,
             CliCommand::Interactive(CliOptions {
                 initial_buffer: String::new(),
+                cursor_offset: None,
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
@@ -1251,6 +1836,7 @@ mod tests {
     #[test]
     fn test_parse_cli_args_init_shells_and_clear_cache() {
         let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+        let default_bind = InitBindMode::default();
 
         assert_eq!(
             parse_cli_args(&s(&["--clear-cache"])).unwrap(),
@@ -1258,23 +1844,52 @@ mod tests {
         );
         assert_eq!(
             parse_cli_args(&s(&["init", "pwsh"])).unwrap(),
-            CliCommand::Init(ShellInitTarget::Pwsh)
+            CliCommand::Init {
+                target: ShellInitTarget::Pwsh,
+                bind_mode: default_bind,
+            }
         );
         assert_eq!(
             parse_cli_args(&s(&["--init", "powershell"])).unwrap(),
-            CliCommand::Init(ShellInitTarget::Pwsh)
+            CliCommand::Init {
+                target: ShellInitTarget::Pwsh,
+                bind_mode: default_bind,
+            }
         );
         assert_eq!(
             parse_cli_args(&s(&["init", "zsh"])).unwrap(),
-            CliCommand::Init(ShellInitTarget::Zsh)
+            CliCommand::Init {
+                target: ShellInitTarget::Zsh,
+                bind_mode: default_bind,
+            }
         );
         assert_eq!(
             parse_cli_args(&s(&["init", "bash"])).unwrap(),
-            CliCommand::Init(ShellInitTarget::Bash)
+            CliCommand::Init {
+                target: ShellInitTarget::Bash,
+                bind_mode: default_bind,
+            }
         );
         assert_eq!(
             parse_cli_args(&s(&["init", "fish"])).unwrap(),
-            CliCommand::Init(ShellInitTarget::Fish)
+            CliCommand::Init {
+                target: ShellInitTarget::Fish,
+                bind_mode: default_bind,
+            }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["init", "nu"])).unwrap(),
+            CliCommand::Init {
+                target: ShellInitTarget::Nushell,
+                bind_mode: default_bind,
+            }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--init=nushell"])).unwrap(),
+            CliCommand::Init {
+                target: ShellInitTarget::Nushell,
+                bind_mode: default_bind,
+            }
         );
 
         for target in [
@@ -1282,16 +1897,18 @@ mod tests {
             ShellInitTarget::Zsh,
             ShellInitTarget::Bash,
             ShellInitTarget::Fish,
+            ShellInitTarget::Nushell,
         ] {
-            let script = render_shell_init(target);
+            let script = render_shell_init(target, default_bind);
             assert!(script.contains("zpane --initial"));
+            assert!(script.contains("--cursor"));
             assert!(script.contains("--out-file"));
         }
 
         let err_missing = parse_cli_args(&s(&["init"])).unwrap_err();
         assert!(err_missing.to_string().contains("Missing shell target"));
 
-        let err_unknown = parse_cli_args(&s(&["init", "nushell"])).unwrap_err();
+        let err_unknown = parse_cli_args(&s(&["init", "tcsh"])).unwrap_err();
         assert!(err_unknown.to_string().contains("Unknown shell target"));
 
         let err_extra = parse_cli_args(&s(&["init", "pwsh", "extra"])).unwrap_err();
@@ -1303,34 +1920,207 @@ mod tests {
         );
         assert_eq!(
             parse_cli_args(&s(&["--init=fish"])).unwrap(),
-            CliCommand::Init(ShellInitTarget::Fish)
+            CliCommand::Init {
+                target: ShellInitTarget::Fish,
+                bind_mode: default_bind,
+            }
         );
 
-        let pwsh = render_shell_init(ShellInitTarget::Pwsh);
+        let pwsh = render_shell_init(ShellInitTarget::Pwsh, default_bind);
+        assert!(pwsh.contains("function Invoke-ZpaneWidget"));
+        assert!(pwsh.contains("Set-PSReadLineKeyHandler -Chord 'Alt+m'"));
+        assert!(pwsh.contains("--cursor \"$cursor\""));
         assert!(pwsh.contains("@(Get-Content -LiteralPath $histPath"));
         assert!(pwsh.contains("ReadAllText($tmp"));
         assert!(pwsh.contains("if (-not [string]::IsNullOrEmpty($line))"));
         assert!(pwsh.contains("$LASTEXITCODE -eq 0"));
         assert!(!pwsh.contains("Invoke-Expression"));
 
-        let fish = render_shell_init(ShellInitTarget::Fish);
+        let fish = render_shell_init(ShellInitTarget::Fish, default_bind);
         assert!(fish.contains("umask 077"));
         assert!(fish.contains("umask $old_umask"));
+        assert!(fish.contains("commandline -C"));
+        assert!(fish.contains("history --max 15 2>/dev/null"));
         assert!(fish.contains("if test (count $buf) -gt 0"));
-        assert!(fish.contains("zpane --initial \"\" --out-file"));
+        assert!(fish.contains("zpane --initial \"\" --cursor 0 $hist_args --out-file"));
         assert!(fish.contains("rm -f -- \"$tmp\""));
+        assert!(fish.contains("bind \\em _zpane_fish"));
         assert!(!fish.contains("eval "));
 
-        let zsh = render_shell_init(ShellInitTarget::Zsh);
+        let zsh = render_shell_init(ShellInitTarget::Zsh, default_bind);
         assert!(zsh.contains("tmp=\"$(umask 077 && mktemp)\" || return"));
         assert!(zsh.contains("setopt localoptions localtraps"));
         assert!(zsh.contains("trap 'rm -f -- \"$tmp\"' EXIT INT TERM"));
+        assert!(zsh.contains("fc -ln -15 2>/dev/null || true"));
+        assert!(zsh.contains("--initial \"$BUFFER\" --cursor \"$CURSOR\""));
+        assert!(zsh.contains("bindkey '^[m' _zpane_widget"));
         assert!(!zsh.contains("eval "));
 
-        let bash = render_shell_init(ShellInitTarget::Bash);
+        let bash = render_shell_init(ShellInitTarget::Bash, default_bind);
         assert!(bash.contains("tmp=\"$(umask 077 && mktemp)\" || return"));
         assert!(bash.contains("trap 'rm -f -- \"$tmp\"' RETURN INT TERM"));
+        assert!(bash.contains("history 15 2>/dev/null || true"));
+        assert!(bash.contains("--initial \"$READLINE_LINE\" --cursor \"$READLINE_POINT\""));
+        assert!(bash.contains("bind -x '\"\\em\": _zpane_readline'"));
         assert!(!bash.contains("eval "));
+
+        let nu = render_shell_init(ShellInitTarget::Nushell, default_bind);
+        assert!(nu.contains("def _zpane_widget []"));
+        assert!(nu.contains("commandline get-cursor"));
+        assert!(nu.contains("commandline edit --replace $accepted"));
+        assert!(nu.contains("$env.config.keybindings"));
+        assert!(nu.contains("modifier: alt"));
+        assert!(nu.contains("keycode: char_m"));
+        assert!(!nu.contains("eval "));
+    }
+
+    #[test]
+    fn test_init_bind_and_no_bind_options_and_security_validation() {
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+
+        // 1. `--no-bind` omits keybinding registration while still defining widget/helper across all 5 shells
+        for (shell_arg, expected_def, forbidden_bind) in [
+            (
+                "pwsh",
+                "function Invoke-ZpaneWidget",
+                "Set-PSReadLineKeyHandler",
+            ),
+            ("zsh", "zle -N _zpane_widget", "bindkey "),
+            ("bash", "_zpane_readline()", "bind -x"),
+            ("fish", "function _zpane_fish", "\nbind "),
+            ("nu", "def _zpane_widget []", "$env.config.keybindings"),
+        ] {
+            for argv in [
+                vec!["init", shell_arg, "--no-bind"],
+                vec!["--init", shell_arg, "--no-bind"],
+                vec!["--no-bind", "--init", shell_arg],
+            ] {
+                let cmd = parse_cli_args(&s(&argv))
+                    .unwrap_or_else(|e| panic!("parse {argv:?} failed: {e}"));
+                match cmd {
+                    CliCommand::Init { target, bind_mode } => {
+                        assert_eq!(bind_mode, InitBindMode::Disabled);
+                        let script = render_shell_init(target, bind_mode);
+                        assert!(script.contains(expected_def), "{shell_arg} missing def");
+                        assert!(
+                            !script.contains(forbidden_bind),
+                            "{shell_arg} --no-bind emitted binding: {script}"
+                        );
+                    }
+                    other => panic!("expected Init, got {other:?}"),
+                }
+            }
+        }
+
+        // 2. `--bind <CHORD>` and `--bind=<CHORD>` translate cleanly for every shell
+        let ctrl_g = InitKeyChord::parse("Ctrl+g").unwrap();
+        assert_eq!(
+            parse_cli_args(&s(&["init", "pwsh", "--bind", "Ctrl+g"])).unwrap(),
+            CliCommand::Init {
+                target: ShellInitTarget::Pwsh,
+                bind_mode: InitBindMode::Bind(ctrl_g),
+            }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--init=zsh", "--bind=Ctrl+g"])).unwrap(),
+            CliCommand::Init {
+                target: ShellInitTarget::Zsh,
+                bind_mode: InitBindMode::Bind(ctrl_g),
+            }
+        );
+
+        assert!(
+            render_shell_init(ShellInitTarget::Pwsh, InitBindMode::Bind(ctrl_g))
+                .contains("Set-PSReadLineKeyHandler -Chord 'Ctrl+g'")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Zsh, InitBindMode::Bind(ctrl_g))
+                .contains("bindkey '^G' _zpane_widget")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Bash, InitBindMode::Bind(ctrl_g))
+                .contains("bind -x '\"\\C-g\": _zpane_readline'")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Fish, InitBindMode::Bind(ctrl_g))
+                .contains("bind \\cg _zpane_fish")
+        );
+        let nu_ctrl_g = render_shell_init(ShellInitTarget::Nushell, InitBindMode::Bind(ctrl_g));
+        assert!(nu_ctrl_g.contains("modifier: control"));
+        assert!(nu_ctrl_g.contains("keycode: char_g"));
+
+        let ctrl_space = InitKeyChord::parse("Ctrl+Space").unwrap();
+        assert!(
+            render_shell_init(ShellInitTarget::Pwsh, InitBindMode::Bind(ctrl_space))
+                .contains("-Chord 'Ctrl+Spacebar'")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Zsh, InitBindMode::Bind(ctrl_space))
+                .contains("bindkey '^@' _zpane_widget")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Bash, InitBindMode::Bind(ctrl_space))
+                .contains("bind -x '\"\\C-@\": _zpane_readline'")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Fish, InitBindMode::Bind(ctrl_space))
+                .contains("bind \\c@ _zpane_fish")
+        );
+        let nu_ctrl_space =
+            render_shell_init(ShellInitTarget::Nushell, InitBindMode::Bind(ctrl_space));
+        assert!(
+            nu_ctrl_space.contains("modifier: control") && nu_ctrl_space.contains("keycode: space")
+        );
+
+        let f2 = InitKeyChord::parse("F2").unwrap();
+        assert!(
+            render_shell_init(ShellInitTarget::Pwsh, InitBindMode::Bind(f2))
+                .contains("-Chord 'F2'")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Zsh, InitBindMode::Bind(f2))
+                .contains("bindkey '^[OQ' _zpane_widget")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Bash, InitBindMode::Bind(f2))
+                .contains("bind -x '\"\\eOQ\": _zpane_readline'")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Fish, InitBindMode::Bind(f2))
+                .contains("bind -k f2 _zpane_fish")
+        );
+        assert!(
+            render_shell_init(ShellInitTarget::Nushell, InitBindMode::Bind(f2))
+                .contains("keycode: f2")
+        );
+
+        // 3. Conflicts, misuse outside `init`, and shell-injection chords must fail cleanly
+        for bad_args in [
+            vec!["init", "pwsh", "--bind", "Alt+m", "--no-bind"],
+            vec!["--init", "zsh", "--bind=Ctrl+g", "--no-bind"],
+            vec!["--bind", "Alt+m"],
+            vec!["--no-bind"],
+            vec!["--clear-cache", "--no-bind"],
+            vec!["init", "bash", "--no-bind=1"],
+            vec!["init", "bash", "--bind"],
+            vec!["init", "bash", "--bind", ""],
+            vec!["init", "bash", "--bind", "m"],
+            vec!["init", "bash", "--bind", "Ctrl+1"],
+            vec!["init", "bash", "--bind", "Alt+m'; rm -rf /"],
+            vec!["init", "pwsh", "--bind", "Alt+$(id)"],
+            vec!["init", "zsh", "--bind", "Alt+m\nwhoami"],
+            vec!["init", "nu", "--bind", "Alt+\x1b[31mm"],
+        ] {
+            let err = match parse_cli_args(&s(&bad_args)) {
+                Ok(cmd) => panic!("expected error for {bad_args:?}, got {cmd:?}"),
+                Err(err) => err,
+            };
+            let msg = err.to_string();
+            assert!(
+                !msg.contains('\x1b') && !msg.contains('\n'),
+                "unsanitized err: {msg:?}"
+            );
+        }
     }
 
     #[test]
@@ -1426,6 +2216,7 @@ mod tests {
             parse_cli_args(&s(&["--initial", "--help", "--history", "--warm"])).unwrap(),
             CliCommand::Interactive(CliOptions {
                 initial_buffer: "--help".to_string(),
+                cursor_offset: None,
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
@@ -1449,6 +2240,7 @@ mod tests {
             .unwrap(),
             CliCommand::Interactive(CliOptions {
                 initial_buffer: "-Id --help".to_string(),
+                cursor_offset: None,
                 out_file: Some(PathBuf::from("/tmp/zpane_out")),
                 fallback_width: 80,
                 fallback_height: 24,
@@ -1461,6 +2253,7 @@ mod tests {
             parse_cli_args(&s(&["git", "commit", "--amend", "--help"])).unwrap(),
             CliCommand::Interactive(CliOptions {
                 initial_buffer: "git commit --amend --help".to_string(),
+                cursor_offset: None,
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
@@ -1929,6 +2722,7 @@ borders = "plain"
             vec![Entry::new("git", "git", EntryKind::Cli, "Git VCS")],
             NullIntrospector,
             "",
+            None,
             Viewport::new(80, 14),
             ShellDialect::Posix,
             RuntimeContext::default(),
@@ -1944,7 +2738,7 @@ borders = "plain"
 
     #[test]
     fn test_pwsh_shell_init_and_context_merge_include_session_vars_and_funcs() {
-        let init = render_shell_init(ShellInitTarget::Pwsh);
+        let init = render_shell_init(ShellInitTarget::Pwsh, InitBindMode::default());
         assert!(init.contains("session_vars"));
         assert!(init.contains("session_funcs"));
         assert!(init.contains("--context-file"));

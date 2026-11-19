@@ -31,12 +31,16 @@ impl QuoteState {
         }
         let ps_mode = dialect.is_some_and(ShellDialect::is_powershell);
         let fish_mode = dialect == Some(ShellDialect::Fish);
+        let nu_mode = dialect == Some(ShellDialect::Nushell);
         match ch {
             '`' if ps_mode && !self.in_single => {
                 self.escaped = true;
                 QuoteStep::EscapePrefix
             }
-            '\\' if !ps_mode && !self.in_single && (self.in_double || dialect.is_some()) => {
+            '\\' if !ps_mode
+                && !self.in_single
+                && (self.in_double || (dialect.is_some() && !nu_mode)) =>
+            {
                 self.escaped = true;
                 QuoteStep::EscapePrefix
             }
@@ -77,7 +81,10 @@ fn split_pipeline_prefix_impl(
     dialect: Option<ShellDialect>,
 ) -> (Option<String>, &str) {
     let bytes = input.as_bytes();
-    let ps_mode = dialect.is_some_and(ShellDialect::is_powershell);
+    let no_pipe_amp = matches!(
+        dialect,
+        Some(ShellDialect::PowerShell | ShellDialect::Nushell)
+    );
     let mut state = QuoteState::default();
     let mut paren_depth = 0usize;
     let mut brace_depth = 0usize;
@@ -94,7 +101,7 @@ fn split_pipeline_prefix_impl(
                 '}' => brace_depth = brace_depth.saturating_sub(1),
                 '|' if paren_depth == 0 && brace_depth == 0 => {
                     if bytes.get(i + 1) == Some(&b'|')
-                        || (!ps_mode && bytes.get(i + 1) == Some(&b'&'))
+                        || (!no_pipe_amp && bytes.get(i + 1) == Some(&b'&'))
                     {
                         last_sep_end = Some(i + 2);
                         i += 2;
@@ -254,6 +261,26 @@ pub fn quote_single_for_dialect(raw: &str, dialect: Option<ShellDialect>) -> Str
                     '\'' => out.push_str("\\'"),
                     _ => out.push(ch),
                 }
+            }
+        }
+        Some(ShellDialect::Nushell) => {
+            if !raw.contains('\'') {
+                out.push_str(raw);
+            } else {
+                // Nushell single quotes are raw and cannot embed `'`; double quotes do not
+                // interpolate `$` or backticks (only `$"..."` interpolates), so escaping `\` and `"`
+                // yields a safe literal string across all Nushell versions.
+                out.clear();
+                out.push('"');
+                for ch in raw.chars() {
+                    match ch {
+                        '\\' => out.push_str("\\\\"),
+                        '"' => out.push_str("\\\""),
+                        _ => out.push(ch),
+                    }
+                }
+                out.push('"');
+                return out;
             }
         }
         Some(ShellDialect::Posix) | None => {
@@ -418,7 +445,26 @@ pub(crate) fn is_valid_single_quoted(token: &str, dialect: ShellDialect) -> bool
             }
             true
         }
+        ShellDialect::Nushell => !inner.contains('\''),
     }
+}
+
+/// Safely splits a prompt buffer at a 0-based character cursor offset, clamping out-of-bounds
+/// offsets to the end of `input` without ever panicking on UTF-8 char boundaries.
+/// When a non-empty trailing suffix exists, any trailing whitespace immediately preceding the
+/// cursor is shifted onto the suffix so re-joining an edited prefix with the verbatim suffix
+/// preserves the separator spacing.
+pub fn split_buffer_at_cursor(input: &str, cursor_chars: usize) -> (&str, &str) {
+    let byte_idx = input
+        .char_indices()
+        .nth(cursor_chars)
+        .map_or(input.len(), |(idx, _)| idx);
+    if byte_idx == input.len() {
+        return (input, "");
+    }
+    let prefix = &input[..byte_idx];
+    let trimmed_prefix_len = prefix.trim_end().len();
+    (&input[..trimmed_prefix_len], &input[trimmed_prefix_len..])
 }
 
 #[cfg(test)]
@@ -534,9 +580,57 @@ mod tests {
             format_custom_value_token("a'b", ShellDialect::Fish),
             r"'a\'b'"
         );
+        assert_eq!(
+            format_custom_value_token("a'b", ShellDialect::Nushell),
+            "\"a'b\""
+        );
+        assert_eq!(
+            format_custom_value_token("$(id)", ShellDialect::Nushell),
+            "'$(id)'"
+        );
         assert!(is_valid_single_quoted("'a''b'", ShellDialect::PowerShell));
         assert!(!is_valid_single_quoted("'a'b'", ShellDialect::PowerShell));
         assert!(is_valid_single_quoted(r"'a'\''b'", ShellDialect::Posix));
         assert!(is_valid_single_quoted(r"'a\'b'", ShellDialect::Fish));
+        assert!(is_valid_single_quoted(r"'C:\temp'", ShellDialect::Nushell));
+        assert!(!is_valid_single_quoted("'a'b'", ShellDialect::Nushell));
+    }
+
+    #[test]
+    fn test_split_buffer_at_cursor_handles_ascii_spacing_unicode_and_bounds() {
+        assert_eq!(
+            split_buffer_at_cursor("git status && cargo test", 10),
+            ("git status", " && cargo test")
+        );
+        assert_eq!(
+            split_buffer_at_cursor("git status && cargo test", 11),
+            ("git status", " && cargo test")
+        );
+        assert_eq!(
+            split_buffer_at_cursor("git status|rg foo", 10),
+            ("git status", "|rg foo")
+        );
+        assert_eq!(
+            split_buffer_at_cursor("git status && cargo test", 0),
+            ("", "git status && cargo test")
+        );
+        assert_eq!(
+            split_buffer_at_cursor("git status && cargo test", 999),
+            ("git status && cargo test", "")
+        );
+        assert_eq!(split_buffer_at_cursor("", 0), ("", ""));
+        assert_eq!(split_buffer_at_cursor("", 42), ("", ""));
+        assert_eq!(
+            split_buffer_at_cursor("echo 🦀 && ls", 6),
+            ("echo 🦀", " && ls")
+        );
+        assert_eq!(
+            split_buffer_at_cursor("echo café && ls", 9),
+            ("echo café", " && ls")
+        );
+        assert_eq!(
+            split_buffer_at_cursor("git status ", 11),
+            ("git status ", "")
+        );
     }
 }
