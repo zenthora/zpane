@@ -1,4 +1,5 @@
 use crate::discovery::ShellDialect;
+pub use crate::discovery::{BorderStyle, IconMode, ThemePreset, UiConfig, UiStyle};
 use crate::fuzzy::PaneList;
 use crate::model::{Entry, EntryKind, Pane};
 use crate::sanitize::{
@@ -8,32 +9,253 @@ use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 use unicode_width::UnicodeWidthChar;
 
-const C_BORDER_DIM: &str = "\x1b[38;5;240m";
-const C_HEADER_ACT: &str = "\x1b[38;5;75;1m";
-const C_HEADER_DIM: &str = "\x1b[38;5;246m";
-const C_SEL_ACT_BG: &str = "\x1b[48;5;236;38;5;255;1m";
-const C_SEL_INACT_BG: &str = "\x1b[48;5;234;38;5;250m";
-const C_MATCH_HL: &str = "\x1b[38;5;226;1m";
-const C_TEXT: &str = "\x1b[38;5;252m";
-const C_DIM: &str = "\x1b[38;5;244m";
-const C_CMD_BAR: &str = "\x1b[38;5;114;1m";
-const C_FILTER: &str = "\x1b[38;5;223;1m";
-const RST: &str = "\x1b[0m";
+#[derive(Debug, Clone, Copy)]
+struct ThemePalette {
+    border_dim: &'static str,
+    header_act: &'static str,
+    header_dim: &'static str,
+    sel_act_bg: &'static str,
+    sel_inact_bg: &'static str,
+    match_hl: &'static str,
+    text: &'static str,
+    dim: &'static str,
+    cmd_bar: &'static str,
+    filter: &'static str,
+    rst: &'static str,
+}
 
-fn kind_color(kind: EntryKind) -> &'static str {
-    match kind {
-        EntryKind::History => "\x1b[38;5;221m", // Warm gold
-        EntryKind::Path => "\x1b[38;5;116m",    // Soft teal
-        EntryKind::Env | EntryKind::Var => "\x1b[38;5;216m", // Peach
-        EntryKind::Cli => "\x1b[38;5;114m",     // Green
-        EntryKind::Func | EntryKind::Alias => "\x1b[38;5;81m", // Cyan
-        EntryKind::Cmdlet => "\x1b[38;5;75m",   // Blue
-        EntryKind::Subcmd => "\x1b[38;5;141m",  // Purple
-        EntryKind::Flag => "\x1b[38;5;183m",    // Lavender
-        EntryKind::Param => "\x1b[38;5;223m",   // Soft yellow
-        EntryKind::Enum | EntryKind::Value => "\x1b[38;5;150m", // Mint green
-        EntryKind::Arg => "\x1b[38;5;250m",     // Light gray
-        EntryKind::Loading => "\x1b[38;5;244m", // Dim gray
+const DARK_PALETTE: ThemePalette = ThemePalette {
+    border_dim: "\x1b[38;5;240m",
+    header_act: "\x1b[38;5;75;1m",
+    header_dim: "\x1b[38;5;246m",
+    sel_act_bg: "\x1b[48;5;236;38;5;255;1m",
+    sel_inact_bg: "\x1b[48;5;234;38;5;250m",
+    match_hl: "\x1b[38;5;226;1m",
+    text: "\x1b[38;5;252m",
+    dim: "\x1b[38;5;244m",
+    cmd_bar: "\x1b[38;5;114;1m",
+    filter: "\x1b[38;5;223;1m",
+    rst: "\x1b[0m",
+};
+
+const LIGHT_PALETTE: ThemePalette = ThemePalette {
+    border_dim: "\x1b[38;5;245m",
+    header_act: "\x1b[38;5;25;1m",
+    header_dim: "\x1b[38;5;242m",
+    sel_act_bg: "\x1b[48;5;253;38;5;16;1m",
+    sel_inact_bg: "\x1b[48;5;254;38;5;237m",
+    match_hl: "\x1b[38;5;130;1m",
+    text: "\x1b[38;5;235m",
+    dim: "\x1b[38;5;243m",
+    cmd_bar: "\x1b[38;5;28;1m",
+    filter: "\x1b[38;5;94;1m",
+    rst: "\x1b[0m",
+};
+
+const ANSI16_PALETTE: ThemePalette = ThemePalette {
+    border_dim: "\x1b[90m",
+    header_act: "\x1b[94;1m",
+    header_dim: "\x1b[37m",
+    sel_act_bg: "\x1b[44;97;1m",
+    sel_inact_bg: "\x1b[100;97m",
+    match_hl: "\x1b[93;1m",
+    text: "\x1b[0m",
+    dim: "\x1b[90m",
+    cmd_bar: "\x1b[32;1m",
+    filter: "\x1b[33;1m",
+    rst: "\x1b[0m",
+};
+
+// Zero foreground/background color codes (`3x`/`4x`/`9x`/`10x`); uses bold + reverse video only.
+const NONE_PALETTE: ThemePalette = ThemePalette {
+    border_dim: "",
+    header_act: "\x1b[1m",
+    header_dim: "",
+    sel_act_bg: "\x1b[0;7;1m",
+    sel_inact_bg: "\x1b[0;7m",
+    match_hl: "\x1b[1m",
+    text: "",
+    dim: "",
+    cmd_bar: "\x1b[1m",
+    filter: "\x1b[1m",
+    rst: "\x1b[0m",
+};
+
+fn palette_for(theme: ThemePreset) -> &'static ThemePalette {
+    match theme {
+        ThemePreset::Dark => &DARK_PALETTE,
+        ThemePreset::Light => &LIGHT_PALETTE,
+        ThemePreset::Ansi16 => &ANSI16_PALETTE,
+        ThemePreset::None => &NONE_PALETTE,
+    }
+}
+
+fn kind_color(theme: ThemePreset, kind: EntryKind) -> &'static str {
+    match theme {
+        ThemePreset::Dark => match kind {
+            EntryKind::History => "\x1b[38;5;221m",
+            EntryKind::Path => "\x1b[38;5;116m",
+            EntryKind::Env | EntryKind::Var => "\x1b[38;5;216m",
+            EntryKind::Cli => "\x1b[38;5;114m",
+            EntryKind::Func | EntryKind::Alias => "\x1b[38;5;81m",
+            EntryKind::Cmdlet => "\x1b[38;5;75m",
+            EntryKind::Subcmd => "\x1b[38;5;141m",
+            EntryKind::Flag => "\x1b[38;5;183m",
+            EntryKind::Param => "\x1b[38;5;223m",
+            EntryKind::Enum | EntryKind::Value => "\x1b[38;5;150m",
+            EntryKind::Arg => "\x1b[38;5;250m",
+            EntryKind::Loading => "\x1b[38;5;244m",
+        },
+        ThemePreset::Light => match kind {
+            EntryKind::History => "\x1b[38;5;136m",
+            EntryKind::Path => "\x1b[38;5;30m",
+            EntryKind::Env | EntryKind::Var => "\x1b[38;5;166m",
+            EntryKind::Cli => "\x1b[38;5;28m",
+            EntryKind::Func | EntryKind::Alias => "\x1b[38;5;31m",
+            EntryKind::Cmdlet => "\x1b[38;5;25m",
+            EntryKind::Subcmd => "\x1b[38;5;91m",
+            EntryKind::Flag => "\x1b[38;5;98m",
+            EntryKind::Param => "\x1b[38;5;94m",
+            EntryKind::Enum | EntryKind::Value => "\x1b[38;5;29m",
+            EntryKind::Arg => "\x1b[38;5;238m",
+            EntryKind::Loading => "\x1b[38;5;243m",
+        },
+        ThemePreset::Ansi16 => match kind {
+            EntryKind::History => "\x1b[33m",
+            EntryKind::Path => "\x1b[36m",
+            EntryKind::Env | EntryKind::Var => "\x1b[93m",
+            EntryKind::Cli => "\x1b[32m",
+            EntryKind::Func | EntryKind::Alias => "\x1b[96m",
+            EntryKind::Cmdlet => "\x1b[34m",
+            EntryKind::Subcmd => "\x1b[35m",
+            EntryKind::Flag => "\x1b[95m",
+            EntryKind::Param => "\x1b[33m",
+            EntryKind::Enum | EntryKind::Value => "\x1b[92m",
+            EntryKind::Arg => "\x1b[37m",
+            EntryKind::Loading => "\x1b[90m",
+        },
+        ThemePreset::None => "",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BorderChars {
+    top_left: char,
+    top_right: char,
+    bottom_left: char,
+    bottom_right: char,
+    vertical: char,
+    t_down: char,
+    t_up: char,
+    t_right: char,
+    t_left: char,
+    is_ascii: bool,
+}
+
+fn border_chars_for(style: BorderStyle) -> BorderChars {
+    match style {
+        BorderStyle::Rounded => BorderChars {
+            top_left: '╭',
+            top_right: '╮',
+            bottom_left: '╰',
+            bottom_right: '╯',
+            vertical: '│',
+            t_down: '┬',
+            t_up: '┴',
+            t_right: '├',
+            t_left: '┤',
+            is_ascii: false,
+        },
+        BorderStyle::Plain => BorderChars {
+            top_left: '┌',
+            top_right: '┐',
+            bottom_left: '└',
+            bottom_right: '┘',
+            vertical: '│',
+            t_down: '┬',
+            t_up: '┴',
+            t_right: '├',
+            t_left: '┤',
+            is_ascii: false,
+        },
+        BorderStyle::Ascii => BorderChars {
+            top_left: '+',
+            top_right: '+',
+            bottom_left: '+',
+            bottom_right: '+',
+            vertical: '|',
+            t_down: '+',
+            t_up: '+',
+            t_right: '+',
+            t_left: '+',
+            is_ascii: true,
+        },
+    }
+}
+
+#[inline]
+fn ascii_icon_equiv(ch: char) -> Option<&'static str> {
+    match ch {
+        '❯' => Some(">"),
+        'ℹ' => Some("i"),
+        '✏' => Some("*"),
+        '🔀' => Some("<>"),
+        '⎇' => Some("@"),
+        '⟳' => Some("~"),
+        '📁' => Some("[]"),
+        '…' => Some("~"),
+        '█' => Some("_"),
+        '↑' => Some("^"),
+        '↓' => Some("v"),
+        '←' => Some("<"),
+        '→' => Some(">"),
+        '—' => Some("-"),
+        _ => None,
+    }
+}
+
+#[inline]
+fn icon_pointer(icons: IconMode, is_selected: bool) -> &'static str {
+    if !is_selected {
+        "  "
+    } else if icons == IconMode::Ascii {
+        "> "
+    } else {
+        "❯ "
+    }
+}
+
+#[inline]
+fn icon_ellipsis(icons: IconMode) -> char {
+    if icons == IconMode::Ascii {
+        '~'
+    } else {
+        '…'
+    }
+}
+
+#[inline]
+fn icon_cursor(icons: IconMode) -> char {
+    if icons == IconMode::Ascii {
+        '_'
+    } else {
+        '█'
+    }
+}
+
+#[inline]
+fn icon_info(icons: IconMode) -> &'static str {
+    if icons == IconMode::Ascii {
+        "i"
+    } else {
+        "ℹ"
+    }
+}
+
+#[inline]
+fn push_styled_end(out: &mut String, style: &str, rst: &str) {
+    if !style.is_empty() {
+        out.push_str(rst);
     }
 }
 
@@ -129,40 +351,62 @@ fn push_repeated_space(out: &mut String, mut count: usize) {
 }
 
 const BAR_LINE: &str = "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────";
+const ASCII_BAR_LINE: &str = "--------------------------------------------------------------------------------------------------------------------------------";
 const BAR_LINE_CHARS: usize = 128;
 
 #[inline]
-fn push_repeated_bar(out: &mut String, mut count: usize) {
-    while count > 0 {
-        let chunk = count.min(BAR_LINE_CHARS);
-        out.push_str(&BAR_LINE[..chunk * 3]);
-        count -= chunk;
+fn push_repeated_bar_for(out: &mut String, mut count: usize, ascii: bool) {
+    if ascii {
+        while count > 0 {
+            let chunk = count.min(BAR_LINE_CHARS);
+            out.push_str(&ASCII_BAR_LINE[..chunk]);
+            count -= chunk;
+        }
+    } else {
+        while count > 0 {
+            let chunk = count.min(BAR_LINE_CHARS);
+            out.push_str(&BAR_LINE[..chunk * 3]);
+            count -= chunk;
+        }
     }
 }
 
 #[inline]
-fn bar_cow(width: usize) -> Cow<'static, str> {
+fn bar_cow_for(width: usize, ascii: bool) -> Cow<'static, str> {
     if width <= BAR_LINE_CHARS {
-        Cow::Borrowed(&BAR_LINE[..width * 3])
+        if ascii {
+            Cow::Borrowed(&ASCII_BAR_LINE[..width])
+        } else {
+            Cow::Borrowed(&BAR_LINE[..width * 3])
+        }
     } else {
-        let mut s = String::with_capacity(width * 3);
-        push_repeated_bar(&mut s, width);
+        let mut s = String::with_capacity(if ascii { width } else { width * 3 });
+        push_repeated_bar_for(&mut s, width, ascii);
         Cow::Owned(s)
     }
 }
 
+#[cfg(test)]
+#[inline]
+fn bar_cow(width: usize) -> Cow<'static, str> {
+    bar_cow_for(width, false)
+}
+
 /// Appends sanitized text truncated to at most `max_width` display columns, optionally
 /// highlighting `match_positions` on top of `base_style`, and returns the written width.
-fn push_sanitized_truncated(
+fn push_sanitized_truncated_styled(
     out: &mut String,
     text: &str,
     max_width: usize,
     match_positions: &[usize],
     base_style: Option<&str>,
+    palette: &ThemePalette,
+    icons: IconMode,
 ) -> usize {
     if max_width == 0 {
         return 0;
     }
+    let ellipsis = icon_ellipsis(icons);
     if is_printable_ascii(text) {
         let truncated = text.len() > max_width;
         let keep = if !truncated {
@@ -174,6 +418,7 @@ fn push_sanitized_truncated(
         };
         let slice = &text[..keep];
         if let Some(base) = base_style.filter(|_| !match_positions.is_empty()) {
+            let restore = if base.is_empty() { palette.rst } else { base };
             let mut cursor = 0usize;
             let mut in_hl = false;
             for (idx, ch_byte) in slice.bytes().enumerate() {
@@ -184,23 +429,23 @@ fn push_sanitized_truncated(
                 if is_match {
                     cursor += 1;
                     if !in_hl {
-                        out.push_str(C_MATCH_HL);
+                        out.push_str(palette.match_hl);
                         in_hl = true;
                     }
                 } else if in_hl {
-                    out.push_str(base);
+                    out.push_str(restore);
                     in_hl = false;
                 }
                 out.push(ch_byte as char);
             }
             if in_hl {
-                out.push_str(base);
+                out.push_str(restore);
             }
         } else {
             out.push_str(slice);
         }
         if truncated && max_width > 1 {
-            out.push('…');
+            out.push(ellipsis);
             return max_width;
         }
         return keep;
@@ -233,7 +478,14 @@ fn push_sanitized_truncated(
         let Some(ch) = sanitize_display_char(raw_ch) else {
             continue;
         };
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let ascii_rep = if icons == IconMode::Ascii {
+            ascii_icon_equiv(ch)
+        } else {
+            None
+        };
+        let w = ascii_rep
+            .map(str::len)
+            .unwrap_or_else(|| UnicodeWidthChar::width(ch).unwrap_or(0));
         if w == 0 && cur_w == 0 {
             continue;
         }
@@ -247,11 +499,11 @@ fn push_sanitized_truncated(
                 if cur_w < max_width {
                     if in_hl {
                         if let Some(base) = base_style {
-                            out.push_str(base);
+                            out.push_str(if base.is_empty() { palette.rst } else { base });
                         }
                         in_hl = false;
                     }
-                    out.push('…');
+                    out.push(ellipsis);
                     cur_w += 1;
                 }
             }
@@ -263,23 +515,34 @@ fn push_sanitized_truncated(
             last_non_zero_in_hl = in_hl;
         }
         if let Some(base) = base_style {
+            let restore = if base.is_empty() { palette.rst } else { base };
             while match_cursor < match_positions.len() && match_positions[match_cursor] < idx {
                 match_cursor += 1;
             }
             if match_cursor < match_positions.len() && match_positions[match_cursor] == idx {
                 if !in_hl {
-                    out.push_str(C_MATCH_HL);
+                    out.push_str(palette.match_hl);
                     in_hl = true;
                 }
-                out.push(ch);
+                if let Some(rep) = ascii_rep {
+                    out.push_str(rep);
+                } else {
+                    out.push(ch);
+                }
                 match_cursor += 1;
             } else {
                 if in_hl {
-                    out.push_str(base);
+                    out.push_str(restore);
                     in_hl = false;
                 }
-                out.push(ch);
+                if let Some(rep) = ascii_rep {
+                    out.push_str(rep);
+                } else {
+                    out.push(ch);
+                }
             }
+        } else if let Some(rep) = ascii_rep {
+            out.push_str(rep);
         } else {
             out.push(ch);
         }
@@ -288,7 +551,7 @@ fn push_sanitized_truncated(
 
     if in_hl {
         if let Some(base) = base_style {
-            out.push_str(base);
+            out.push_str(if base.is_empty() { palette.rst } else { base });
         }
     }
 
@@ -296,34 +559,41 @@ fn push_sanitized_truncated(
 }
 
 /// Appends plain text truncated to at most `max_width` display columns, returning the written width.
-fn push_truncated_text(out: &mut String, text: &str, max_width: usize) -> usize {
-    push_sanitized_truncated(out, text, max_width, &[], None)
+fn push_truncated_text(out: &mut String, text: &str, max_width: usize, icons: IconMode) -> usize {
+    push_sanitized_truncated_styled(out, text, max_width, &[], None, &DARK_PALETTE, icons)
 }
 
 /// Appends plain text truncated or space-padded to exact terminal display columns (`max_width`).
-fn push_padded_text(out: &mut String, text: &str, max_width: usize) {
-    let cur_w = push_truncated_text(out, text, max_width);
+fn push_padded_text_with(out: &mut String, text: &str, max_width: usize, icons: IconMode) {
+    let cur_w = push_truncated_text(out, text, max_width, icons);
     if max_width > cur_w {
         push_repeated_space(out, max_width - cur_w);
     }
 }
 
-/// Appends `prefix` + `body` padded to `max_width`, tail-scrolling `body` with a leading `'…'`
+#[cfg(test)]
+fn push_padded_text(out: &mut String, text: &str, max_width: usize) {
+    push_padded_text_with(out, text, max_width, IconMode::Unicode);
+}
+
+/// Appends `prefix` + `body` padded to `max_width`, tail-scrolling `body` with a leading `'…'`/`'~'`
 /// when it overflows so the active tail remains visible.
 fn push_tail_truncated_padded(
     out: &mut String,
     prefix: &str,
     body: &str,
     max_width: usize,
+    icons: IconMode,
     scratch: &mut String,
 ) {
     let prefix_w = display_width_sanitized(prefix);
+    let ellipsis = icon_ellipsis(icons);
     if is_printable_ascii(body) {
         let body_w = body.len();
         if prefix_w + body_w <= max_width || max_width <= prefix_w + 1 {
-            let written = push_truncated_text(out, prefix, max_width);
+            let written = push_truncated_text(out, prefix, max_width, icons);
             let rem = max_width.saturating_sub(written);
-            let body_written = push_truncated_text(out, body, rem);
+            let body_written = push_truncated_text(out, body, rem, icons);
             let total = written + body_written;
             if max_width > total {
                 push_repeated_space(out, max_width - total);
@@ -332,15 +602,16 @@ fn push_tail_truncated_padded(
         }
         let target_w = max_width - prefix_w - 1;
         let suffix_start = body_w - target_w;
-        let mut written = push_truncated_text(out, prefix, max_width);
+        let mut written = push_truncated_text(out, prefix, max_width, icons);
         if written < max_width {
-            out.push('…');
+            out.push(ellipsis);
             written += 1;
         }
         written += push_truncated_text(
             out,
             &body[suffix_start..],
             max_width.saturating_sub(written),
+            icons,
         );
         if max_width > written {
             push_repeated_space(out, max_width - written);
@@ -352,9 +623,9 @@ fn push_tail_truncated_padded(
     let body_w = display_width_sanitized(scratch);
 
     if prefix_w + body_w <= max_width || max_width <= prefix_w + 1 {
-        let written = push_truncated_text(out, prefix, max_width);
+        let written = push_truncated_text(out, prefix, max_width, icons);
         let rem = max_width.saturating_sub(written);
-        let body_written = push_truncated_text(out, scratch, rem);
+        let body_written = push_truncated_text(out, scratch, rem, icons);
         let total = written + body_written;
         if max_width > total {
             push_repeated_space(out, max_width - total);
@@ -374,57 +645,71 @@ fn push_tail_truncated_padded(
         w_so_far += w;
     }
 
-    let mut written = push_truncated_text(out, prefix, max_width);
+    let mut written = push_truncated_text(out, prefix, max_width, icons);
     if written < max_width {
-        out.push('…');
+        out.push(ellipsis);
         written += 1;
     }
     written += push_truncated_text(
         out,
         &scratch[suffix_start..],
         max_width.saturating_sub(written),
+        icons,
     );
     if max_width > written {
         push_repeated_space(out, max_width - written);
     }
 }
 
-/// Appends a pane header title bounded to `col_width`, filling remaining width with `'─'`.
-fn push_pane_header(out: &mut String, color: &str, title: &str, col_width: usize) {
+/// Appends a pane header title bounded to `col_width`, filling remaining width with border bar chars.
+fn push_pane_header(
+    out: &mut String,
+    color: &str,
+    title: &str,
+    col_width: usize,
+    palette: &ThemePalette,
+    icons: IconMode,
+    ascii_borders: bool,
+) {
     out.push_str(color);
-    let written = push_truncated_text(out, title, col_width);
-    out.push_str(C_BORDER_DIM);
+    let written = push_truncated_text(out, title, col_width, icons);
+    push_styled_end(out, color, palette.rst);
+    out.push_str(palette.border_dim);
     if col_width > written {
-        push_repeated_bar(out, col_width - written);
+        push_repeated_bar_for(out, col_width - written, ascii_borders);
     }
 }
 
 /// Renders a Miller cell directly into `out` strictly bounded to `col_width` display columns,
 /// with fuzzy-match highlighting, selection styling, and right-aligned `[Kind]` badge when space permits.
-fn push_miller_cell(
+fn push_miller_cell_styled(
     out: &mut String,
     entry: &Entry,
     match_positions: &[usize],
     col_width: usize,
     is_selected: bool,
     is_active_pane: bool,
+    style: UiStyle,
 ) {
     if col_width == 0 {
         return;
     }
+    let theme = style.theme;
+    let icons = style.icons;
+    let palette = palette_for(theme);
     let badge = entry.kind.badge();
     let badge_w = badge.len();
-    let ptr = if is_selected { "❯ " } else { "  " };
+    let ptr = icon_pointer(icons, is_selected);
     let ptr_w = if col_width >= 2 { 2 } else { 0 };
 
     let base_style = if is_selected {
         if is_active_pane {
-            C_SEL_ACT_BG
+            palette.sel_act_bg
         } else {
-            C_SEL_INACT_BG
+            palette.sel_inact_bg
         }
     } else {
-        C_TEXT
+        palette.text
     };
 
     out.push_str(base_style);
@@ -436,12 +721,14 @@ fn push_miller_cell(
     let show_badge = rem >= badge_w + 3;
     let avail_label_w = if show_badge { rem - badge_w - 1 } else { rem };
 
-    let cur_w = push_sanitized_truncated(
+    let cur_w = push_sanitized_truncated_styled(
         out,
         &entry.label,
         avail_label_w,
         match_positions,
         Some(base_style),
+        palette,
+        icons,
     );
 
     if avail_label_w > cur_w {
@@ -451,11 +738,36 @@ fn push_miller_cell(
     if show_badge {
         out.push(' ');
         if !is_selected {
-            out.push_str(kind_color(entry.kind));
+            out.push_str(kind_color(theme, entry.kind));
         }
         out.push_str(badge);
     }
-    out.push_str(RST);
+    if !base_style.is_empty()
+        || (!is_selected && show_badge && !kind_color(theme, entry.kind).is_empty())
+        || (!match_positions.is_empty() && !palette.match_hl.is_empty())
+    {
+        out.push_str(palette.rst);
+    }
+}
+
+#[cfg(test)]
+fn push_miller_cell(
+    out: &mut String,
+    entry: &Entry,
+    match_positions: &[usize],
+    col_width: usize,
+    is_selected: bool,
+    is_active_pane: bool,
+) {
+    push_miller_cell_styled(
+        out,
+        entry,
+        match_positions,
+        col_width,
+        is_selected,
+        is_active_pane,
+        UiStyle::default(),
+    );
 }
 
 fn push_pane_cell(
@@ -464,16 +776,18 @@ fn push_pane_cell(
     row_offset: usize,
     col_width: usize,
     is_active_pane: bool,
+    style: UiStyle,
 ) {
     let idx = pane.scroll_idx() + row_offset;
     if let Some((entry, match_positions)) = pane.row_at(idx) {
-        push_miller_cell(
+        push_miller_cell_styled(
             out,
             entry,
             match_positions,
             col_width,
             idx == pane.sel_idx(),
             is_active_pane,
+            style,
         );
     } else {
         push_repeated_space(out, col_width);
@@ -489,6 +803,7 @@ pub struct RenderState<'a> {
     pub active_param_set: Option<&'a str>,
     pub dialect: ShellDialect,
     pub inspector_expanded: bool,
+    pub style: UiStyle,
 }
 
 /// Resolves the currently inspected entry from the active pane, falling back to parent panes
@@ -509,9 +824,10 @@ fn selected_info_entry<'a>(st: &RenderState<'a>) -> Option<&'a Entry> {
 #[cfg(test)]
 fn inspector_header(st: &RenderState<'_>) -> (String, String) {
     let info_entry = selected_info_entry(st);
+    let info_glyph = icon_info(st.style.icons);
     let info_title = info_entry
-        .map(|it| format!(" ℹ {} {}", it.label, it.kind.badge()))
-        .unwrap_or_else(|| " ℹ No selection".to_string());
+        .map(|it| format!(" {info_glyph} {} {}", it.label, it.kind.badge()))
+        .unwrap_or_else(|| format!(" {info_glyph} No selection"));
     let info_desc = info_entry
         .map(|it| format!("   {}", it.desc))
         .unwrap_or_default();
@@ -674,32 +990,36 @@ fn push_inspector_field(
     }
 }
 
-fn build_expanded_inspector_rows(
+fn build_expanded_inspector_rows_styled(
     entry: Option<&Entry>,
     w3: usize,
     max_rows: usize,
+    style: UiStyle,
 ) -> Vec<(&'static str, Cow<'static, str>)> {
     let mut rows = Vec::new();
     if max_rows == 0 {
         return rows;
     }
+    let palette = palette_for(style.theme);
+    let info_glyph = icon_info(style.icons);
+    let ascii_borders = style.borders == BorderStyle::Ascii;
     let Some(it) = entry else {
         let msg = if w3 >= 26 {
-            " ℹ No selection [F1 Close]"
+            format!(" {info_glyph} No selection [F1 Close]")
         } else {
-            " ℹ No selection"
+            format!(" {info_glyph} No selection")
         };
-        rows.push((C_HEADER_ACT, Cow::Borrowed(msg)));
+        rows.push((palette.header_act, Cow::Owned(msg)));
         return rows;
     };
 
-    let full_hdr = format!(" ℹ {} {} [F1 Close]", it.label, it.kind.badge());
+    let full_hdr = format!(" {info_glyph} {} {} [F1 Close]", it.label, it.kind.badge());
     let hdr = if display_width_sanitized(&full_hdr) <= w3 {
         full_hdr
     } else {
-        format!(" ℹ {} {}", it.label, it.kind.badge())
+        format!(" {info_glyph} {} {}", it.label, it.kind.badge())
     };
-    rows.push((C_HEADER_ACT, Cow::Owned(hdr)));
+    rows.push((palette.header_act, Cow::Owned(hdr)));
 
     let wrap_w = w3.saturating_sub(2).max(1);
     let tok_val = if it.text.is_empty() {
@@ -710,7 +1030,7 @@ fn build_expanded_inspector_rows(
     if it.aliases.is_empty() {
         push_inspector_field(
             &mut rows,
-            C_FILTER,
+            palette.filter,
             &format!("Token: {tok_val}"),
             w3,
             wrap_w,
@@ -721,12 +1041,12 @@ fn build_expanded_inspector_rows(
         let single_raw = format!("Token: {tok_val}  Aliases: {aliases}");
         if display_width_sanitized(&single_raw) < w3 {
             if rows.len() < max_rows {
-                rows.push((C_FILTER, Cow::Owned(format!(" {single_raw}"))));
+                rows.push((palette.filter, Cow::Owned(format!(" {single_raw}"))));
             }
         } else {
             push_inspector_field(
                 &mut rows,
-                C_FILTER,
+                palette.filter,
                 &format!("Token: {tok_val}"),
                 w3,
                 wrap_w,
@@ -734,7 +1054,7 @@ fn build_expanded_inspector_rows(
             );
             push_inspector_field(
                 &mut rows,
-                C_FILTER,
+                palette.filter,
                 &format!("Aliases: {aliases}"),
                 w3,
                 wrap_w,
@@ -748,15 +1068,15 @@ fn build_expanded_inspector_rows(
     } else {
         format!("Kind : {}", it.kind.badge())
     };
-    push_inspector_field(&mut rows, C_DIM, &sets_raw, w3, wrap_w, max_rows);
+    push_inspector_field(&mut rows, palette.dim, &sets_raw, w3, wrap_w, max_rows);
     if rows.len() < max_rows {
-        rows.push((C_BORDER_DIM, bar_cow(w3)));
+        rows.push((palette.border_dim, bar_cow_for(w3, ascii_borders)));
     }
 
     if rows.len() < max_rows {
         let rem = max_rows - rows.len();
         for line in wrap_display_lines_bounded(&it.desc, wrap_w, rem) {
-            rows.push((C_TEXT, Cow::Owned(format!(" {line}"))));
+            rows.push((palette.text, Cow::Owned(format!(" {line}"))));
         }
     }
 
@@ -772,7 +1092,7 @@ fn build_expanded_inspector_rows(
             }
         }
         if total_children > 0 {
-            rows.push((C_BORDER_DIM, bar_cow(w3)));
+            rows.push((palette.border_dim, bar_cow_for(w3, ascii_borders)));
             if rows.len() < max_rows {
                 let shown_count = total_children.min(8);
                 let mut summary = String::from("Children: ");
@@ -783,17 +1103,31 @@ fn build_expanded_inspector_rows(
                     summary.push_str(child_text);
                 }
                 if total_children > shown_count {
-                    let _ = write!(summary, ", … (+{} more)", total_children - shown_count);
+                    let _ = write!(
+                        summary,
+                        ", {} (+{} more)",
+                        icon_ellipsis(style.icons),
+                        total_children - shown_count
+                    );
                 }
                 let rem = max_rows - rows.len();
                 for line in wrap_display_lines_bounded(&summary, wrap_w, rem) {
-                    rows.push((C_DIM, Cow::Owned(format!(" {line}"))));
+                    rows.push((palette.dim, Cow::Owned(format!(" {line}"))));
                 }
             }
         }
     }
 
     rows
+}
+
+#[cfg(test)]
+fn build_expanded_inspector_rows(
+    entry: Option<&Entry>,
+    w3: usize,
+    max_rows: usize,
+) -> Vec<(&'static str, Cow<'static, str>)> {
+    build_expanded_inspector_rows_styled(entry, w3, max_rows, UiStyle::default())
 }
 
 /// Computes `(w1, w2, w3)` inside `inner_w` summing strictly to `inner_w`.
@@ -808,8 +1142,16 @@ fn split_pane_widths(inner_w: usize) -> (usize, usize, usize) {
 
 const FOOTER_PS: &str = " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Sync PS  [Enter] Accept  [Esc]";
 const FOOTER_RELOAD: &str = " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Enter] Accept  [Esc]";
+const FOOTER_PS_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Sync PS  [Enter] Accept  [Esc]";
+const FOOTER_RELOAD_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Enter] Accept  [Esc]";
 
 pub fn render_frame(st: &RenderState<'_>) -> String {
+    let palette = palette_for(st.style.theme);
+    let borders = border_chars_for(st.style.borders);
+    let icons = st.style.icons;
+    let info_glyph = icon_info(icons);
+    let cursor_ch = icon_cursor(icons);
+
     let win_w = st.viewport.width.max(Viewport::MIN_WIDTH.saturating_sub(1));
     let list_rows = st.viewport.rows(Pane::First);
     let inner_w = win_w.saturating_sub(4);
@@ -820,7 +1162,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         selected_info_entry(st)
     };
     let expanded_rows = if st.inspector_expanded {
-        build_expanded_inspector_rows(selected_info_entry(st), w3, list_rows)
+        build_expanded_inspector_rows_styled(selected_info_entry(st), w3, list_rows, st.style)
     } else {
         Vec::new()
     };
@@ -833,23 +1175,31 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     let header_color = |pane: Pane| {
         if st.active_pane == pane {
-            C_HEADER_ACT
+            palette.header_act
         } else {
-            C_HEADER_DIM
+            palette.header_dim
         }
     };
 
-    sb.push_str(C_BORDER_DIM);
-    sb.push('╭');
+    sb.push_str(palette.border_dim);
+    sb.push(borders.top_left);
     scratch.clear();
     let _ = write!(
         scratch,
         " 1. Command / Scope ({}) ",
         st.panes[0].visible_len()
     );
-    push_pane_header(&mut sb, header_color(Pane::First), &scratch, w1);
+    push_pane_header(
+        &mut sb,
+        header_color(Pane::First),
+        &scratch,
+        w1,
+        palette,
+        icons,
+        borders.is_ascii,
+    );
 
-    sb.push('┬');
+    sb.push(borders.t_down);
     scratch.clear();
     if let Some(set_name) = st.active_param_set {
         let _ = write!(
@@ -864,15 +1214,26 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             st.panes[1].visible_len()
         );
     }
-    push_pane_header(&mut sb, header_color(Pane::Second), &scratch, w2);
+    push_pane_header(
+        &mut sb,
+        header_color(Pane::Second),
+        &scratch,
+        w2,
+        palette,
+        icons,
+        borders.is_ascii,
+    );
 
-    sb.push('┬');
+    sb.push(borders.t_down);
     if st.inspector_expanded {
         push_pane_header(
             &mut sb,
             header_color(Pane::Third),
             " 3. Inspector [F1 Close] ",
             w3,
+            palette,
+            icons,
+            borders.is_ascii,
         );
     } else {
         scratch.clear();
@@ -881,31 +1242,53 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             " 3. Flags / Values / Info ({}) ",
             st.panes[2].visible_len()
         );
-        push_pane_header(&mut sb, header_color(Pane::Third), &scratch, w3);
+        push_pane_header(
+            &mut sb,
+            header_color(Pane::Third),
+            &scratch,
+            w3,
+            palette,
+            icons,
+            borders.is_ascii,
+        );
     }
-    sb.push('╮');
-    sb.push_str(RST);
+    sb.push(borders.top_right);
+    push_styled_end(&mut sb, palette.border_dim, palette.rst);
     sb.push_str("\x1b[K\r\n");
 
     for r in 0..list_rows {
-        sb.push_str(C_BORDER_DIM);
-        sb.push('│');
-        sb.push_str(RST);
-        push_pane_cell(&mut sb, st.panes[0], r, w1, st.active_pane == Pane::First);
+        sb.push_str(palette.border_dim);
+        sb.push(borders.vertical);
+        push_styled_end(&mut sb, palette.border_dim, palette.rst);
+        push_pane_cell(
+            &mut sb,
+            st.panes[0],
+            r,
+            w1,
+            st.active_pane == Pane::First,
+            st.style,
+        );
 
-        sb.push_str(C_BORDER_DIM);
-        sb.push('│');
-        sb.push_str(RST);
-        push_pane_cell(&mut sb, st.panes[1], r, w2, st.active_pane == Pane::Second);
+        sb.push_str(palette.border_dim);
+        sb.push(borders.vertical);
+        push_styled_end(&mut sb, palette.border_dim, palette.rst);
+        push_pane_cell(
+            &mut sb,
+            st.panes[1],
+            r,
+            w2,
+            st.active_pane == Pane::Second,
+            st.style,
+        );
 
-        sb.push_str(C_BORDER_DIM);
-        sb.push('│');
-        sb.push_str(RST);
+        sb.push_str(palette.border_dim);
+        sb.push(borders.vertical);
+        push_styled_end(&mut sb, palette.border_dim, palette.rst);
         if st.inspector_expanded {
             if let Some((color, text)) = expanded_rows.get(r) {
                 sb.push_str(color);
-                push_padded_text(&mut sb, text, w3);
-                sb.push_str(RST);
+                push_padded_text_with(&mut sb, text, w3, icons);
+                push_styled_end(&mut sb, color, palette.rst);
             } else {
                 push_repeated_space(&mut sb, w3);
             }
@@ -913,32 +1296,34 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             // Pane 3: Top 3 rows = Inspector Header, Rows 3.. = Interactive List
             match r {
                 0 => {
-                    sb.push_str(C_HEADER_ACT);
+                    sb.push_str(palette.header_act);
                     if let Some(it) = info_entry {
                         scratch.clear();
-                        let _ = write!(scratch, " ℹ {} {}", it.label, it.kind.badge());
-                        push_padded_text(&mut sb, &scratch, w3);
+                        let _ = write!(scratch, " {info_glyph} {} {}", it.label, it.kind.badge());
+                        push_padded_text_with(&mut sb, &scratch, w3, icons);
                     } else {
-                        push_padded_text(&mut sb, " ℹ No selection", w3);
+                        scratch.clear();
+                        let _ = write!(scratch, " {info_glyph} No selection");
+                        push_padded_text_with(&mut sb, &scratch, w3, icons);
                     }
-                    sb.push_str(RST);
+                    push_styled_end(&mut sb, palette.header_act, palette.rst);
                 }
                 1 => {
-                    sb.push_str(C_DIM);
+                    sb.push_str(palette.dim);
                     if let Some(it) = info_entry {
                         scratch.clear();
                         scratch.push_str("   ");
                         scratch.push_str(&it.desc);
-                        push_padded_text(&mut sb, &scratch, w3);
+                        push_padded_text_with(&mut sb, &scratch, w3, icons);
                     } else {
                         push_repeated_space(&mut sb, w3);
                     }
-                    sb.push_str(RST);
+                    push_styled_end(&mut sb, palette.dim, palette.rst);
                 }
                 2 => {
-                    sb.push_str(C_BORDER_DIM);
-                    push_repeated_bar(&mut sb, w3);
-                    sb.push_str(RST);
+                    sb.push_str(palette.border_dim);
+                    push_repeated_bar_for(&mut sb, w3, borders.is_ascii);
+                    push_styled_end(&mut sb, palette.border_dim, palette.rst);
                 }
                 _ => push_pane_cell(
                     &mut sb,
@@ -946,26 +1331,27 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
                     r - PANE3_INSPECTOR_ROWS,
                     w3,
                     st.active_pane == Pane::Third,
+                    st.style,
                 ),
             }
         }
 
-        sb.push_str(C_BORDER_DIM);
-        sb.push('│');
-        sb.push_str(RST);
+        sb.push_str(palette.border_dim);
+        sb.push(borders.vertical);
+        push_styled_end(&mut sb, palette.border_dim, palette.rst);
         sb.push_str("\x1b[K\r\n");
     }
 
     // Divider above status bars
-    sb.push_str(C_BORDER_DIM);
-    sb.push('├');
-    push_repeated_bar(&mut sb, w1);
-    sb.push('┴');
-    push_repeated_bar(&mut sb, w2);
-    sb.push('┴');
-    push_repeated_bar(&mut sb, w3);
-    sb.push('┤');
-    sb.push_str(RST);
+    sb.push_str(palette.border_dim);
+    sb.push(borders.t_right);
+    push_repeated_bar_for(&mut sb, w1, borders.is_ascii);
+    sb.push(borders.t_up);
+    push_repeated_bar_for(&mut sb, w2, borders.is_ascii);
+    sb.push(borders.t_up);
+    push_repeated_bar_for(&mut sb, w3, borders.is_ascii);
+    sb.push(borders.t_left);
+    push_styled_end(&mut sb, palette.border_dim, palette.rst);
     sb.push_str("\x1b[K\r\n");
 
     let full_inner = win_w.saturating_sub(2);
@@ -976,11 +1362,11 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         Pane::Second => " Filter (Pane 2): ",
         Pane::Third => " Filter (Pane 3): ",
     };
-    let active_filter_w = display_width_sanitized(active_filter) + 1; // + '█'
+    let active_filter_w = display_width_sanitized(active_filter) + 1; // + cursor_ch
     scratch.clear();
     let _ = write!(
         scratch,
-        "{filter_prefix}{active_filter}█   [P1: '{}' | P2: '{}' | P3: '{}']",
+        "{filter_prefix}{active_filter}{cursor_ch}   [P1: '{}' | P2: '{}' | P3: '{}']",
         st.panes[0].filter(),
         st.panes[1].filter(),
         st.panes[2].filter()
@@ -988,74 +1374,117 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     if display_width_sanitized(&scratch) <= full_inner
         || filter_prefix.len() + active_filter_w <= full_inner
     {
-        push_status_row(&mut sb, C_FILTER, &scratch, full_inner);
+        push_status_row(
+            &mut sb,
+            palette.filter,
+            &scratch,
+            full_inner,
+            palette,
+            borders,
+            icons,
+        );
     } else {
         scratch.clear();
         scratch.push_str(active_filter);
-        scratch.push('█');
+        scratch.push(cursor_ch);
         push_tail_status_row(
             &mut sb,
-            C_FILTER,
+            palette.filter,
             filter_prefix,
             &scratch,
             full_inner,
+            palette,
+            borders,
+            icons,
             &mut sanitize_scratch,
         );
     }
 
     push_tail_status_row(
         &mut sb,
-        C_CMD_BAR,
+        palette.cmd_bar,
         " Command Line  : ",
         &st.command_line,
         full_inner,
+        palette,
+        borders,
+        icons,
         &mut sanitize_scratch,
     );
 
-    let footer = if st.dialect.is_powershell() {
-        FOOTER_PS
-    } else {
-        FOOTER_RELOAD
+    let footer = match (st.dialect.is_powershell(), icons) {
+        (true, IconMode::Unicode) => FOOTER_PS,
+        (false, IconMode::Unicode) => FOOTER_RELOAD,
+        (true, IconMode::Ascii) => FOOTER_PS_ASCII,
+        (false, IconMode::Ascii) => FOOTER_RELOAD_ASCII,
     };
-    push_status_row(&mut sb, C_DIM, footer, full_inner);
+    push_status_row(
+        &mut sb,
+        palette.dim,
+        footer,
+        full_inner,
+        palette,
+        borders,
+        icons,
+    );
 
-    sb.push_str(C_BORDER_DIM);
-    sb.push('╰');
-    push_repeated_bar(&mut sb, full_inner);
-    sb.push('╯');
-    sb.push_str(RST);
+    sb.push_str(palette.border_dim);
+    sb.push(borders.bottom_left);
+    push_repeated_bar_for(&mut sb, full_inner, borders.is_ascii);
+    sb.push(borders.bottom_right);
+    push_styled_end(&mut sb, palette.border_dim, palette.rst);
     sb.push_str("\x1b[K\x1b[J\x1b[?2026l");
 
     sb
 }
 
-fn push_framed_status_row(out: &mut String, color: &str, write_inner: impl FnOnce(&mut String)) {
-    out.push_str(C_BORDER_DIM);
-    out.push('│');
-    out.push_str(RST);
+fn push_framed_status_row(
+    out: &mut String,
+    color: &str,
+    palette: &ThemePalette,
+    borders: BorderChars,
+    write_inner: impl FnOnce(&mut String),
+) {
+    out.push_str(palette.border_dim);
+    out.push(borders.vertical);
+    push_styled_end(out, palette.border_dim, palette.rst);
     out.push_str(color);
     write_inner(out);
-    out.push_str(RST);
-    out.push_str(C_BORDER_DIM);
-    out.push('│');
-    out.push_str(RST);
+    push_styled_end(out, color, palette.rst);
+    out.push_str(palette.border_dim);
+    out.push(borders.vertical);
+    push_styled_end(out, palette.border_dim, palette.rst);
     out.push_str("\x1b[K\r\n");
 }
 
-fn push_status_row(out: &mut String, color: &str, text: &str, inner_width: usize) {
-    push_framed_status_row(out, color, |buf| push_padded_text(buf, text, inner_width));
+fn push_status_row(
+    out: &mut String,
+    color: &str,
+    text: &str,
+    inner_width: usize,
+    palette: &ThemePalette,
+    borders: BorderChars,
+    icons: IconMode,
+) {
+    push_framed_status_row(out, color, palette, borders, |buf| {
+        push_padded_text_with(buf, text, inner_width, icons)
+    });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_tail_status_row(
     out: &mut String,
     color: &str,
     prefix: &str,
     body: &str,
     inner_width: usize,
+    palette: &ThemePalette,
+    borders: BorderChars,
+    icons: IconMode,
     scratch: &mut String,
 ) {
-    push_framed_status_row(out, color, |buf| {
-        push_tail_truncated_padded(buf, prefix, body, inner_width, scratch);
+    push_framed_status_row(out, color, palette, borders, |buf| {
+        push_tail_truncated_padded(buf, prefix, body, inner_width, icons, scratch);
     });
 }
 
@@ -1126,6 +1555,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            style: UiStyle::default(),
         };
 
         assert_eq!(render_frame(&st).lines().count(), 8);
@@ -1156,6 +1586,7 @@ mod tests {
                 active_param_set: None,
                 dialect: ShellDialect::Posix,
                 inspector_expanded: false,
+                style: UiStyle::default(),
             };
             let plain = strip_ansi(&render_frame(&st));
             let lines: Vec<&str> = plain.lines().collect();
@@ -1181,6 +1612,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::PowerShell,
             inspector_expanded: false,
+            style: UiStyle::default(),
         }));
         assert!(ps_frame.contains("[Ctrl+R] Sync PS"));
 
@@ -1192,6 +1624,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            style: UiStyle::default(),
         }));
         assert!(posix_frame.contains("[Ctrl+R] Reload"));
         assert!(!posix_frame.contains("Sync PS"));
@@ -1233,6 +1666,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            style: UiStyle::default(),
         });
 
         assert_eq!(frame.lines().count(), term_h);
@@ -1266,6 +1700,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            style: UiStyle::default(),
         };
         let (title0, desc0) = inspector_header(&st_p1);
         assert_eq!(title0, " ℹ git [CLI]");
@@ -1333,6 +1768,7 @@ mod tests {
             active_param_set: Some("Id"),
             dialect: ShellDialect::PowerShell,
             inspector_expanded: true,
+            style: UiStyle::default(),
         }));
 
         assert_eq!(plain.lines().count(), 18);
@@ -1377,8 +1813,8 @@ mod tests {
         let plain = strip_ansi(&raw);
         assert_eq!(UnicodeWidthStr::width(plain.as_str()), 20);
         assert_eq!(plain, "❯ Get-Proc… [Cmdlet]");
-        assert!(raw.contains(C_MATCH_HL));
-        assert!(raw.ends_with(RST));
+        assert!(raw.contains(DARK_PALETTE.match_hl));
+        assert!(raw.ends_with(DARK_PALETTE.rst));
 
         // Exact-width wide-char label truncation keeps valid ANSI reset and width
         let wide_entry = Entry::new("中文abc", "中文abc", EntryKind::Arg, "");
@@ -1387,7 +1823,7 @@ mod tests {
         let wide_plain = strip_ansi(&raw);
         assert_eq!(UnicodeWidthStr::width(wide_plain.as_str()), 6);
         assert_eq!(wide_plain, "  中… ");
-        assert!(raw.ends_with(RST));
+        assert!(raw.ends_with(DARK_PALETTE.rst));
     }
 
     #[test]
@@ -1432,6 +1868,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::Posix,
             inspector_expanded: true,
+            style: UiStyle::default(),
         });
         assert!(raw.contains("\x1b[K\r\n"));
         assert!(raw.contains("\x1b[K\x1b[J\x1b[?2026l"));
@@ -1498,6 +1935,7 @@ mod tests {
                 active_param_set: Some("\x1b]0;title\x07IdSet\u{202e}"),
                 dialect: ShellDialect::Posix,
                 inspector_expanded: expanded,
+                style: UiStyle::default(),
             });
 
             // Raw rendered frame must contain zero OSC, BEL, NUL, DEL, C1, BiDi, or injected CSI
@@ -1565,6 +2003,7 @@ mod tests {
             active_param_set: None,
             dialect: ShellDialect::Posix,
             inspector_expanded: true,
+            style: UiStyle::default(),
         });
         assert!(!raw.contains("\x1b]"));
         let plain = strip_ansi(&raw);
@@ -1714,6 +2153,7 @@ mod tests {
                     active_param_set: Some("Default\x1b^pm\x1b\\"),
                     dialect: ShellDialect::PowerShell,
                     inspector_expanded: expanded,
+                    style: UiStyle::default(),
                 });
                 assert!(!raw.contains("apc_payload"));
                 assert!(!raw.contains("\x1bPbad"));
@@ -1818,6 +2258,7 @@ mod tests {
                 active_param_set: Some("Name"),
                 dialect: ShellDialect::PowerShell,
                 inspector_expanded: expanded,
+                style: UiStyle::default(),
             };
             for i in 0..count {
                 let frame = render_frame(std::hint::black_box(&st));
@@ -1841,5 +2282,283 @@ mod tests {
             secs < 10.0,
             "render_frame throughput regressed severely: {secs:.2}s for {total_frames} frames"
         );
+    }
+
+    fn has_ansi_color_escape(frame: &str) -> bool {
+        let bytes = frame.as_bytes();
+        let mut i = 0usize;
+        while i + 2 < bytes.len() {
+            if bytes[i] == 0x1b && bytes[i + 1] == b'[' {
+                let start = i + 2;
+                let mut end = start;
+                while end < bytes.len() && !(b'@'..=b'~').contains(&bytes[end]) {
+                    end += 1;
+                }
+                if end < bytes.len() && bytes[end] == b'm' {
+                    let params = &frame[start..end];
+                    for part in params.split(';') {
+                        if let Ok(code) = part.parse::<u16>() {
+                            if (30..=49).contains(&code) || (90..=107).contains(&code) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                i = end + 1;
+                continue;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    #[test]
+    fn test_no_color_and_dumb_term_strip_ansi_colors_while_keeping_reverse_bold_selection() {
+        let mut pane1 = PaneList::new(vec![
+            Entry::new("git", "git", EntryKind::Cli, "Git VCS"),
+            Entry::new("cargo", "cargo", EntryKind::Cli, "Rust Cargo"),
+        ]);
+        pane1.push_filter_char('g');
+        let pane2 = PaneList::new(vec![Entry::new(
+            "commit",
+            "commit",
+            EntryKind::Subcmd,
+            "Commit",
+        )]);
+        let empty = PaneList::default();
+
+        let configured = UiConfig {
+            theme: ThemePreset::Dark,
+            icons: IconMode::Unicode,
+            borders: BorderStyle::Rounded,
+        };
+
+        // Empty NO_COLOR keeps configured Dark theme colors
+        let with_empty_no_color = configured.resolve_env(Some(""), Some("xterm-256color"));
+        let colored_frame = render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "git commit".to_string(),
+            active_param_set: None,
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            style: with_empty_no_color,
+        });
+        assert!(has_ansi_color_escape(&colored_frame));
+
+        for style in [
+            configured.resolve_env(Some("1"), None),
+            configured.resolve_env(None, Some("dumb")),
+            UiStyle {
+                theme: ThemePreset::None,
+                ..UiStyle::default()
+            },
+        ] {
+            for expanded in [false, true] {
+                let raw = render_frame(&RenderState {
+                    viewport: Viewport::new(100, 14),
+                    active_pane: Pane::First,
+                    panes: [&pane1, &pane2, &empty],
+                    command_line: "git commit".to_string(),
+                    active_param_set: None,
+                    dialect: ShellDialect::Posix,
+                    inspector_expanded: expanded,
+                    style,
+                });
+                assert!(
+                    !has_ansi_color_escape(&raw),
+                    "NO_COLOR/TERM=dumb/none emitted color SGR in expanded={expanded}: {raw:?}"
+                );
+                assert!(
+                    !raw.contains("\x1b[3")
+                        && !raw.contains("\x1b[4")
+                        && !raw.contains("\x1b[9")
+                        && !raw.contains("\x1b[10"),
+                    "unexpected color-prefixed CSI in monochrome frame: {raw:?}"
+                );
+                assert!(
+                    raw.contains("\x1b[0;7;1m") && raw.contains("\x1b[1m"),
+                    "active selection must stay visually distinct via reverse/bold: {raw:?}"
+                );
+
+                let plain = strip_ansi(&raw);
+                let lines: Vec<&str> = plain.lines().collect();
+                assert_eq!(lines.len(), 14);
+                for line in lines {
+                    assert_eq!(UnicodeWidthStr::width(line), 100);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_all_theme_presets_and_border_styles_render_exact_frame_dimensions() {
+        let pane1 = PaneList::new(vec![Entry::new("git", "git", EntryKind::Cli, "Git VCS")]);
+        let pane2 = PaneList::new(vec![Entry::new(
+            "branch",
+            "branch",
+            EntryKind::Subcmd,
+            "List branches",
+        )]);
+        let pane3 = PaneList::new(vec![Entry::new(
+            "main",
+            "⎇ main (current branch)",
+            EntryKind::Arg,
+            "Branch",
+        )]);
+
+        let dark_frame = render_frame(&RenderState {
+            viewport: Viewport::new(90, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &pane2, &pane3],
+            command_line: "git branch".to_string(),
+            active_param_set: None,
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            style: UiStyle {
+                theme: ThemePreset::Dark,
+                ..UiStyle::default()
+            },
+        });
+        let light_frame = render_frame(&RenderState {
+            viewport: Viewport::new(90, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &pane2, &pane3],
+            command_line: "git branch".to_string(),
+            active_param_set: None,
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            style: UiStyle {
+                theme: ThemePreset::Light,
+                ..UiStyle::default()
+            },
+        });
+        let ansi16_frame = render_frame(&RenderState {
+            viewport: Viewport::new(90, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &pane2, &pane3],
+            command_line: "git branch".to_string(),
+            active_param_set: None,
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            style: UiStyle {
+                theme: ThemePreset::Ansi16,
+                ..UiStyle::default()
+            },
+        });
+
+        assert_ne!(dark_frame, light_frame);
+        assert_ne!(dark_frame, ansi16_frame);
+        assert_ne!(light_frame, ansi16_frame);
+        assert!(ansi16_frame.contains("\x1b[94;1m"));
+        assert!(!ansi16_frame.contains("\x1b[38;5;"));
+        assert!(!ansi16_frame.contains("\x1b[48;5;"));
+
+        for borders in [BorderStyle::Rounded, BorderStyle::Plain, BorderStyle::Ascii] {
+            for width in [Viewport::MIN_WIDTH, 110] {
+                for expanded in [false, true] {
+                    let raw = render_frame(&RenderState {
+                        viewport: Viewport::new(width, 15),
+                        active_pane: Pane::Third,
+                        panes: [&pane1, &pane2, &pane3],
+                        command_line: "git branch main".to_string(),
+                        active_param_set: Some("Default"),
+                        dialect: ShellDialect::Posix,
+                        inspector_expanded: expanded,
+                        style: UiStyle {
+                            theme: ThemePreset::Light,
+                            icons: IconMode::Unicode,
+                            borders,
+                        },
+                    });
+                    let plain = strip_ansi(&raw);
+                    let lines: Vec<&str> = plain.lines().collect();
+                    assert_eq!(lines.len(), 15);
+                    for line in &lines {
+                        assert_eq!(UnicodeWidthStr::width(*line), width);
+                    }
+                    match borders {
+                        BorderStyle::Rounded => {
+                            assert!(lines[0].starts_with('╭') && lines[0].ends_with('╮'));
+                            assert!(lines[14].starts_with('╰') && lines[14].ends_with('╯'));
+                        }
+                        BorderStyle::Plain => {
+                            assert!(lines[0].starts_with('┌') && lines[0].ends_with('┐'));
+                            assert!(lines[14].starts_with('└') && lines[14].ends_with('┘'));
+                        }
+                        BorderStyle::Ascii => {
+                            assert!(lines[0].starts_with('+') && lines[0].ends_with('+'));
+                            assert!(lines[14].starts_with('+') && lines[14].ends_with('+'));
+                            assert!(lines[1].starts_with('|') && lines[1].ends_with('|'));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ascii_icons_and_borders_replace_all_unicode_glyphs_with_exact_width() {
+        let pane1 = PaneList::new(vec![
+            Entry::new("./", "📁 ./ (Current Dir)", EntryKind::Path, ""),
+            Entry::new("git", "git", EntryKind::Cli, "Git"),
+        ]);
+        let pane2 = PaneList::new(vec![Entry::new(
+            "checkout",
+            "🔀 checkout",
+            EntryKind::Subcmd,
+            "Switch branches",
+        )]);
+        let pane3 = PaneList::new(vec![
+            Entry::new("val", "✏ Use \"main\"", EntryKind::Value, "Custom"),
+            Entry::new("main", "⎇ main", EntryKind::Arg, "Branch"),
+            Entry::placeholder("⟳ Loading git...", EntryKind::Loading, ""),
+        ]);
+
+        for width in [Viewport::MIN_WIDTH, 120] {
+            for expanded in [false, true] {
+                let raw = render_frame(&RenderState {
+                    viewport: Viewport::new(width, 14),
+                    active_pane: Pane::First,
+                    panes: [&pane1, &pane2, &pane3],
+                    command_line: "git checkout very-long-branch-name-that-overflows-narrow-view"
+                        .to_string(),
+                    active_param_set: None,
+                    dialect: ShellDialect::Posix,
+                    inspector_expanded: expanded,
+                    style: UiStyle {
+                        theme: ThemePreset::None,
+                        icons: IconMode::Ascii,
+                        borders: BorderStyle::Ascii,
+                    },
+                });
+                let plain = strip_ansi(&raw);
+                assert!(
+                    plain.chars().all(|c| c == '\n' || c.is_ascii()),
+                    "ASCII icons+borders leaked non-ASCII char in width={width} expanded={expanded}:\n{plain}"
+                );
+                for forbidden in ['❯', '✏', '🔀', '⎇', 'ℹ', '⟳', '📁', '╭', '─', '│', '…', '█']
+                {
+                    assert!(!plain.contains(forbidden), "leaked glyph {forbidden:?}");
+                }
+                let lines: Vec<&str> = plain.lines().collect();
+                assert_eq!(lines.len(), 14);
+                for line in &lines {
+                    assert_eq!(UnicodeWidthStr::width(*line), width);
+                }
+                if width == 120 {
+                    assert!(plain.contains("> [] ./ (Current Dir)"));
+                    assert!(plain.contains("<> checkout"));
+                    assert!(plain.contains("i [] ./ (Current Dir)"));
+                    assert!(plain.contains("[^/v|Ctrl+N/P] Move  [</>] Pane"));
+                    if !expanded {
+                        assert!(plain.contains("* Use \"main\""));
+                        assert!(plain.contains("@ main"));
+                        assert!(plain.contains("~ Loading git..."));
+                    }
+                }
+            }
+        }
     }
 }

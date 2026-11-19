@@ -1473,6 +1473,7 @@ commands:
             priority_tools: vec!["mycli".to_string(), "gs".to_string()],
             disabled_tools: vec!["blocked".to_string()],
             history_limit: Some(25),
+            ..UserConfig::default()
         };
 
         let bin_dir = PathBuf::from("/fake/bin");

@@ -8,8 +8,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zpane::discovery::{
-    clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog, reload_catalog,
-    sync_powershell_metadata, warm_cli_cache, CliIntrospector, InspectReport, ShellDialect,
+    clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog,
+    load_user_config_with_diagnostics, reload_catalog, sync_powershell_metadata, warm_cli_cache,
+    CliIntrospector, InspectReport, ShellDialect, UiStyle, UserConfig,
 };
 use zpane::model::RuntimeContext;
 use zpane::sanitize::strip_escapes_and_controls_into;
@@ -887,6 +888,29 @@ fn format_inspect_human(report: &InspectReport) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_interactive_session<I: zpane::discovery::Introspect>(
+    pane1_entries: Vec<zpane::model::Entry>,
+    introspector: I,
+    initial_buffer: &str,
+    viewport: ui::Viewport,
+    dialect: ShellDialect,
+    runtime_ctx: RuntimeContext,
+    user_config: UserConfig,
+    ui_style: UiStyle,
+) -> MillerSession<I> {
+    MillerSession::new(
+        pane1_entries,
+        introspector,
+        initial_buffer,
+        viewport,
+        dialect,
+    )
+    .with_runtime_context(runtime_ctx)
+    .with_ui_style(ui_style)
+    .with_keybindings(user_config.keybindings)
+}
+
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let dialect = ShellDialect::detect();
@@ -973,6 +997,12 @@ fn main() -> anyhow::Result<()> {
         prepare_out_file(f)?;
     }
 
+    let (user_config, config_diagnostics) = load_user_config_with_diagnostics();
+    for diag in &config_diagnostics {
+        eprintln!("zpane config warning ({diag})");
+    }
+    let ui_style = user_config.ui.resolve_process_env();
+
     let runtime_ctx = detect_runtime_context(opts.runtime_context);
     let pane1_entries = load_catalog(dialect, &runtime_ctx);
     let introspector = CliIntrospector::new(dialect, &runtime_ctx);
@@ -985,14 +1015,16 @@ fn main() -> anyhow::Result<()> {
         ui::Viewport::from_terminal_size(tw, th, opts.fallback_width, opts.fallback_height);
 
     let reload_ctx = runtime_ctx.clone();
-    let mut session = MillerSession::new(
+    let mut session = build_interactive_session(
         pane1_entries,
         introspector,
         &opts.initial_buffer,
         viewport,
         dialect,
+        runtime_ctx,
+        user_config,
+        ui_style,
     )
-    .with_runtime_context(runtime_ctx)
     .with_catalog_loader(move |d| reload_catalog(d, &reload_ctx));
 
     let mut guard = TerminalGuard::enter()?;
@@ -1843,5 +1875,37 @@ mod tests {
             assert!(HELP_TEXT.contains(needle), "HELP_TEXT missing `{needle}`");
             assert!(readme.contains(needle), "README.md missing `{needle}`");
         }
+    }
+
+    #[test]
+    fn test_build_interactive_session_wires_user_config_ui_and_env_overrides() {
+        use zpane::discovery::parse_user_config_toml_with_diagnostics;
+
+        let (user_config, diags) = parse_user_config_toml_with_diagnostics(
+            r#"
+[ui]
+theme = "dark"
+icons = "ascii"
+borders = "plain"
+"#,
+        );
+        assert!(diags.is_empty());
+
+        let ui_style = user_config.ui.resolve_env(Some("1"), None);
+        let mut session = build_interactive_session(
+            vec![Entry::new("git", "git", EntryKind::Cli, "Git VCS")],
+            NullIntrospector,
+            "",
+            Viewport::new(80, 14),
+            ShellDialect::Posix,
+            RuntimeContext::default(),
+            user_config,
+            ui_style,
+        );
+
+        let frame = session.render();
+        assert!(frame.contains("┌"));
+        assert!(frame.contains("> git"));
+        assert!(!frame.contains("\x1b[38;5;"));
     }
 }

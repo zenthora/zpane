@@ -1,4 +1,6 @@
-use crate::discovery::{CliIntrospector, Introspect, ShellDialect};
+use crate::discovery::{
+    BindableAction, CliIntrospector, Introspect, KeybindingsConfig, ShellDialect, UiConfig, UiStyle,
+};
 use crate::fuzzy::PaneList;
 use crate::model::{
     is_safe_variable_token, sanitize_variable_token, Entry, EntryKind, Pane, RuntimeContext,
@@ -92,6 +94,28 @@ impl UserAction {
                 Some(UserAction::InsertChar(ch))
             }
             _ => None,
+        }
+    }
+}
+
+impl From<BindableAction> for UserAction {
+    fn from(action: BindableAction) -> Self {
+        match action {
+            BindableAction::MoveUp => Self::MoveUp,
+            BindableAction::MoveDown => Self::MoveDown,
+            BindableAction::PageUp => Self::PageUp,
+            BindableAction::PageDown => Self::PageDown,
+            BindableAction::MoveHome => Self::MoveHome,
+            BindableAction::MoveEnd => Self::MoveEnd,
+            BindableAction::StepRight => Self::StepRight,
+            BindableAction::StepLeft => Self::StepLeft,
+            BindableAction::AcceptToken => Self::AcceptToken,
+            BindableAction::Backspace => Self::Backspace,
+            BindableAction::ClearFilter => Self::ClearFilter,
+            BindableAction::ReloadCatalog => Self::ReloadCatalog,
+            BindableAction::ToggleInspector => Self::ToggleInspector,
+            BindableAction::Confirm => Self::Confirm,
+            BindableAction::Cancel => Self::Cancel,
         }
     }
 }
@@ -1044,6 +1068,8 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     viewport: Viewport,
     dialect: ShellDialect,
     inspector_expanded: bool,
+    ui_style: UiStyle,
+    keybindings: KeybindingsConfig,
     dirty: bool,
 }
 
@@ -1084,6 +1110,8 @@ impl<I: Introspect> MillerSession<I> {
             viewport,
             dialect,
             inspector_expanded: false,
+            ui_style: UiStyle::default(),
+            keybindings: KeybindingsConfig::default(),
             dirty: true,
         };
         session.sync_panes();
@@ -1173,6 +1201,26 @@ impl<I: Introspect> MillerSession<I> {
         self
     }
 
+    /// Applies user UI preferences (`theme`, `icons`, `borders`) to frame rendering.
+    pub fn with_ui_config(mut self, ui: UiConfig) -> Self {
+        self.ui_style = UiStyle::from(ui);
+        self.dirty = true;
+        self
+    }
+
+    /// Applies a resolved [`UiStyle`] (including `NO_COLOR`/`TERM=dumb` overrides) to frame rendering.
+    pub fn with_ui_style(mut self, style: UiStyle) -> Self {
+        self.ui_style = style;
+        self.dirty = true;
+        self
+    }
+
+    /// Applies custom `[keybindings]` overrides to [`MillerSession::handle_terminal_event`].
+    pub fn with_keybindings(mut self, keybindings: KeybindingsConfig) -> Self {
+        self.keybindings = keybindings;
+        self
+    }
+
     /// Polls asynchronous introspection and background metadata updates, refreshing
     /// affected panes live while preserving user cursor/filter state where possible.
     pub fn poll_discovery(&mut self) -> bool {
@@ -1252,7 +1300,12 @@ impl<I: Introspect> MillerSession<I> {
                 self.apply(UserAction::Resize(next.width, next.height))
             }
             Event::Key(key) => {
-                if let Some(action) = UserAction::from_key_event(key) {
+                let action = self
+                    .keybindings
+                    .resolve(key)
+                    .map(UserAction::from)
+                    .or_else(|| UserAction::from_key_event(key));
+                if let Some(action) = action {
                     self.apply(action)
                 } else {
                     SessionOutcome::Continue
@@ -1709,6 +1762,7 @@ impl<I: Introspect> MillerSession<I> {
             active_param_set: self.active_param_set_label.as_deref(),
             dialect: self.dialect,
             inspector_expanded: self.inspector_expanded,
+            style: self.ui_style,
         }
     }
 
@@ -4458,5 +4512,101 @@ mod tests {
             "catalog reload reset the Pane 2 selection"
         );
         assert_eq!(view.panes[1].sel_idx(), 2);
+    }
+
+    #[test]
+    fn test_session_with_ui_config_and_keybindings_controls_render_and_events() {
+        use crate::discovery::parse_user_config_toml_with_diagnostics;
+        use unicode_width::UnicodeWidthStr;
+
+        let (cfg, diags) = parse_user_config_toml_with_diagnostics(
+            r#"
+[ui]
+theme = "none"
+icons = "ascii"
+borders = "ascii"
+
+[keybindings]
+toggle_inspector = "ctrl+t"
+confirm = "ctrl+y"
+"#,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Distributed VCS");
+        git.children = vec![Entry::new(
+            "status",
+            "status",
+            EntryKind::Subcmd,
+            "Show status",
+        )];
+        let mut session = MillerSession::new(
+            vec![git],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(90, 14),
+            ShellDialect::Posix,
+        )
+        .with_ui_config(cfg.ui)
+        .with_keybindings(cfg.keybindings);
+
+        let frame = session.render();
+        assert!(
+            !frame.contains("\x1b[3")
+                && !frame.contains("\x1b[4")
+                && !frame.contains("\x1b[9")
+                && !frame.contains("\x1b[10"),
+            "theme=none session frame leaked color escapes: {frame:?}"
+        );
+        assert!(frame.contains("\x1b[0;7;1m"));
+        assert!(frame.contains("+---"));
+        assert!(frame.contains("> git"));
+        assert!(frame.contains("i git [CLI]"));
+        for line in frame.lines() {
+            // Strip CSI escapes + CR to assert exact terminal column width
+            let mut plain = String::new();
+            let mut chars = line.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' && chars.peek() == Some(&'[') {
+                    chars.next();
+                    for inner in chars.by_ref() {
+                        if ('@'..='~').contains(&inner) {
+                            break;
+                        }
+                    }
+                } else if c != '\r' {
+                    plain.push(c);
+                }
+            }
+            assert_eq!(UnicodeWidthStr::width(plain.as_str()), 90);
+            assert!(plain.is_ascii());
+        }
+
+        // Custom keybinding `ctrl+t` toggles expanded inspector
+        assert_eq!(
+            session.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('t'),
+                KeyModifiers::CONTROL
+            ))),
+            SessionOutcome::Continue
+        );
+        assert!(session.view().inspector_expanded);
+        let expanded_frame = session.render();
+        assert!(expanded_frame.contains("3. Inspector [F1 Close]"));
+
+        // `with_ui_style` applies resolved NO_COLOR override cleanly
+        let styled = cfg.ui.resolve_env(Some("1"), None);
+        session = session.with_ui_style(styled);
+        assert!(!session.render().contains("\x1b[38;5;"));
+
+        // Step into Pane 2 so `status` is part of the live Command Line, then confirm via `ctrl+y`
+        session.apply(UserAction::StepRight);
+        assert_eq!(
+            session.handle_terminal_event(Event::Key(KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::CONTROL
+            ))),
+            SessionOutcome::Confirmed("git status".to_string())
+        );
     }
 }
