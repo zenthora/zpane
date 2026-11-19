@@ -1,6 +1,9 @@
 use super::introspect::find_executable_in_path;
 use super::specs::{is_spec_filename, parse_spec_str, specs_dir};
 use crate::model::{CwdEntry, Entry, EntryKind, RuntimeContext};
+use crate::sanitize::{
+    contains_ignore_ascii_case, has_disallowed_control, is_disallowed_control, sanitize_single_line,
+};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -357,63 +360,6 @@ pub(super) fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool 
         .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
 }
 
-#[inline]
-pub(super) fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
-    let hb = haystack.as_bytes();
-    let nb = needle.as_bytes();
-    if nb.is_empty() {
-        return true;
-    }
-    if nb.len() > hb.len() {
-        return false;
-    }
-    hb.windows(nb.len()).any(|w| w.eq_ignore_ascii_case(nb))
-}
-
-#[inline]
-const fn is_bidi_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
-}
-
-/// Strips C0/DEL/C1 control characters and Unicode Bidi format controls so tokens and
-/// single-line descriptions cannot inject newlines, NULs, terminal escapes, or spoofed text.
-pub(super) fn sanitize_single_line(raw: &str) -> Cow<'_, str> {
-    if !raw
-        .chars()
-        .any(|c| c.is_control() || is_bidi_format_char(c))
-    {
-        return Cow::Borrowed(raw);
-    }
-    let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
-        if !c.is_control() && !is_bidi_format_char(c) {
-            out.push(c);
-        }
-    }
-    Cow::Owned(out)
-}
-
-/// Sanitizes multi-line descriptions by normalizing `\r\n` to `\n` and stripping `\0`, `\r`,
-/// C0/DEL/C1 controls (except `\n`), and Unicode Bidi format controls.
-pub(super) fn sanitize_multiline_desc(raw: &str) -> Cow<'_, str> {
-    if !raw
-        .chars()
-        .any(|c| (c.is_control() && c != '\n') || is_bidi_format_char(c))
-    {
-        return Cow::Borrowed(raw);
-    }
-    let mut out = String::with_capacity(raw.len());
-    for c in raw.chars() {
-        if c == '\n' || (!c.is_control() && !is_bidi_format_char(c)) {
-            out.push(c);
-        }
-    }
-    Cow::Owned(out)
-}
-
 pub(super) fn is_safe_command_token(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 256
@@ -422,7 +368,7 @@ pub(super) fn is_safe_command_token(name: &str) -> bool {
         && name != ".."
         && !name
             .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || is_bidi_format_char(c))
+            .any(|c| is_disallowed_control(c) || c.is_whitespace())
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -2099,7 +2045,7 @@ fn scan_cwd_entries(dir: &Path) -> Vec<CwdEntry> {
         .filter_map(|e| {
             let os_name = e.file_name();
             let name_str = os_name.to_str()?;
-            if name_str.is_empty() || crate::model::has_disallowed_control(name_str) {
+            if name_str.is_empty() || has_disallowed_control(name_str) {
                 return None;
             }
             let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);

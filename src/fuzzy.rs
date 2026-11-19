@@ -1,4 +1,5 @@
 use crate::model::Entry;
+use crate::sanitize::contains_ignore_ascii_case;
 
 #[derive(Debug, Clone, Copy)]
 struct FilteredEntry {
@@ -68,7 +69,7 @@ impl PaneList {
     }
 
     pub fn push_filter_char(&mut self, ch: char) {
-        if crate::ui::is_disallowed_control(ch) {
+        if crate::sanitize::is_disallowed_control(ch) {
             return;
         }
         self.filter.push(ch);
@@ -410,47 +411,6 @@ fn collect_query_chars(q_lower: &str) -> ([char; 64], Option<Vec<char>>, usize) 
     (buf, None, len)
 }
 
-/// Zero-allocation case-insensitive ASCII substring search.
-#[inline]
-fn contains_ignore_ascii_case(haystack: &str, needle_lower: &[u8]) -> bool {
-    let n_len = needle_lower.len();
-    if n_len == 0 {
-        return true;
-    }
-    let h_bytes = haystack.as_bytes();
-    if h_bytes.len() < n_len {
-        return false;
-    }
-    let first_lower = needle_lower[0];
-    let first_upper = first_lower.to_ascii_uppercase();
-    if n_len == 1 {
-        return if first_lower == first_upper {
-            h_bytes.contains(&first_lower)
-        } else {
-            h_bytes
-                .iter()
-                .any(|&b| b == first_lower || b == first_upper)
-        };
-    }
-    let max_start = h_bytes.len() - n_len;
-    for i in 0..=max_start {
-        let hb = h_bytes[i];
-        if hb == first_lower || hb == first_upper {
-            let mut j = 1usize;
-            while j < n_len {
-                if h_bytes[i + j].to_ascii_lowercase() != needle_lower[j] {
-                    break;
-                }
-                j += 1;
-            }
-            if j == n_len {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 #[inline]
 fn score_boundary(prev_orig: char, cur_orig: char) -> i32 {
     if matches!(prev_orig, '-' | '_' | ':' | '.' | ' ' | '/' | '\\' | '$') {
@@ -597,7 +557,7 @@ fn fuzzy_match_precomputed(
         let mut prev_vis_orig: char = '\0';
         let mut vis_char_len: usize = 0;
 
-        let has_ctrl = crate::ui::has_control_or_bidi(label);
+        let has_ctrl = crate::sanitize::has_disallowed_control(label);
         let mut byte_idx = 0usize;
         let mut raw_char_idx = 0usize;
 
@@ -607,7 +567,7 @@ fn fuzzy_match_precomputed(
             };
             if has_ctrl && (raw_ch == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&raw_ch)) {
                 if let Some((esc_bytes, esc_chars)) =
-                    crate::ui::next_escape_seq_len(&label[byte_idx..])
+                    crate::sanitize::next_escape_seq_len(&label[byte_idx..])
                 {
                     byte_idx += esc_bytes;
                     raw_char_idx += esc_chars;
@@ -620,16 +580,10 @@ fn fuzzy_match_precomputed(
             raw_char_idx += 1;
 
             let cur_orig = if has_ctrl {
-                if matches!(
-                    raw_ch,
-                    '\r' | '\n' | '\t' | '\u{0085}' | '\u{2028}' | '\u{2029}'
-                ) {
-                    ' '
-                } else if crate::ui::is_disallowed_control(raw_ch) {
+                let Some(clean) = crate::sanitize::sanitize_display_char(raw_ch) else {
                     continue;
-                } else {
-                    raw_ch
-                }
+                };
+                clean
             } else {
                 raw_ch
             };
@@ -690,8 +644,8 @@ fn fuzzy_match_precomputed(
     }
 
     // Fallback: case-insensitive substring match on sanitized description.
-    let desc_target = if crate::ui::has_control_or_bidi(desc) {
-        crate::ui::strip_escapes_and_controls_into(desc, desc_scratch);
+    let desc_target = if crate::sanitize::has_disallowed_control(desc) {
+        crate::sanitize::strip_escapes_and_controls_into(desc, desc_scratch);
         desc_scratch.as_str()
     } else {
         desc

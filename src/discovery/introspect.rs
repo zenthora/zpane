@@ -1,11 +1,14 @@
 use super::catalog::{
-    cache_dir, collect_path_dirs_with_prefix, contains_ignore_ascii_case, hide_window,
-    load_catalog, ps_metadata_path, read_bounded_bytes, sanitize_multiline_desc,
-    sanitize_single_line, sync_powershell_metadata, write_secure_file, ShellDialect,
+    cache_dir, collect_path_dirs_with_prefix, hide_window, load_catalog, ps_metadata_path,
+    read_bounded_bytes, sync_powershell_metadata, write_secure_file, ShellDialect,
     PRIORITY_CLI_TOOLS,
 };
 use super::help_parser::parse_cli_help;
 use crate::model::{Entry, EntryKind, RuntimeContext};
+use crate::sanitize::{
+    contains_ignore_ascii_case, is_unsafe_display_char, sanitize_multiline_desc,
+    sanitize_single_line,
+};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -92,17 +95,10 @@ fn dialect_cache_tag(dialect: ShellDialect) -> &'static str {
 
 fn has_shell_metachar_or_control(s: &str) -> bool {
     s.chars().any(|c| {
-        c.is_control()
+        is_unsafe_display_char(c)
             || matches!(
                 c,
-                '\0' | '\u{061c}'
-                    | '\u{200b}'..='\u{200f}'
-                    | '\u{2028}'
-                    | '\u{2029}'
-                    | '\u{202a}'..='\u{202e}'
-                    | '\u{2066}'..='\u{2069}'
-                    | '&'
-                    | '|'
+                '&' | '|'
                     | ';'
                     | '<'
                     | '>'
@@ -1333,23 +1329,6 @@ fn find_catalog_root<'a>(catalog: &'a [Entry], root: &str) -> Option<&'a Entry> 
         })
 }
 
-fn walk_entry_chain<'a>(root: &'a Entry, sub_chain: &[String]) -> Option<&'a Entry> {
-    let mut cur = root;
-    for seg in sub_chain {
-        cur = cur
-            .children
-            .iter()
-            .find(|c| c.text.eq_ignore_ascii_case(seg))
-            .or_else(|| {
-                cur.children.iter().find(|c| {
-                    c.kind == EntryKind::Subcmd
-                        && c.aliases.iter().any(|a| a.eq_ignore_ascii_case(seg))
-                })
-            })?;
-    }
-    Some(cur)
-}
-
 fn has_discovered_cli_entries(chain_len: usize, exe: &str, entries: &[Entry]) -> bool {
     if entries.is_empty() {
         return false;
@@ -1363,7 +1342,7 @@ fn has_discovered_cli_entries(chain_len: usize, exe: &str, entries: &[Entry]) ->
         && entries[1..].iter().all(|e| e.kind == EntryKind::Var))
 }
 
-pub(crate) fn inspect_command_chain_with<F>(
+pub fn inspect_command_chain_with<F>(
     dialect: ShellDialect,
     catalog: &[Entry],
     raw_chain: &[String],
@@ -1402,7 +1381,7 @@ where
         let target = if chain.len() == 1 {
             Some(root_entry)
         } else {
-            walk_entry_chain(root_entry, &chain[1..])
+            root_entry.walk_chain(&chain[1..])
         };
         if let Some(node) = target {
             if !node.children.is_empty() {

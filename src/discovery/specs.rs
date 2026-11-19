@@ -1,8 +1,8 @@
 use super::catalog::{
-    cache_dir, ends_with_ignore_ascii_case, is_safe_command_token, sanitize_multiline_desc,
-    sanitize_single_line, MAX_SPEC_BYTES,
+    cache_dir, ends_with_ignore_ascii_case, is_safe_command_token, MAX_SPEC_BYTES,
 };
 use crate::model::{Entry, EntryKind};
+use crate::sanitize::{is_disallowed_control, sanitize_multiline_desc, sanitize_single_line};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
@@ -26,7 +26,7 @@ pub(super) fn is_spec_filename(name: &str) -> bool {
         || name.starts_with('.')
         || name.contains(['/', '\\', ':', '\0'])
         || name.contains("..")
-        || name.chars().any(char::is_control)
+        || name.chars().any(is_disallowed_control)
     {
         return false;
     }
@@ -42,7 +42,11 @@ fn is_safe_spec_command_name(name: &str) -> bool {
 fn clean_spec_token_cow(raw: &str) -> Option<Cow<'_, str>> {
     let cleaned = sanitize_single_line(raw.trim());
     let valid = |s: &str| {
-        !s.is_empty() && s.len() <= 256 && !s.chars().any(|c| c.is_control() || c.is_whitespace())
+        !s.is_empty()
+            && s.len() <= 256
+            && !s
+                .chars()
+                .any(|c| is_disallowed_control(c) || c.is_whitespace())
     };
     match cleaned {
         Cow::Borrowed(s) => {

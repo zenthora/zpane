@@ -1,4 +1,5 @@
 use crate::discovery::ShellDialect;
+use crate::sanitize::{has_disallowed_control, is_disallowed_control};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -102,38 +103,6 @@ pub struct RuntimeContext {
     /// Recent shell session commands (newest first) surfaced at the top of Pane 1.
     #[serde(default)]
     pub history: Vec<String>,
-}
-
-#[inline]
-pub(crate) fn is_disallowed_control(ch: char) -> bool {
-    ch.is_control()
-        || matches!(
-            ch,
-            '\u{061C}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-        )
-}
-
-#[inline]
-pub(crate) fn has_disallowed_control(s: &str) -> bool {
-    if s.is_ascii() {
-        s.bytes().any(|b| b < 0x20 || b == 0x7f)
-    } else {
-        s.chars().any(is_disallowed_control)
-    }
-}
-
-pub(crate) fn strip_disallowed_controls(s: &str) -> Cow<'_, str> {
-    if !has_disallowed_control(s) {
-        Cow::Borrowed(s)
-    } else {
-        Cow::Owned(s.chars().filter(|&ch| !is_disallowed_control(ch)).collect())
-    }
 }
 
 #[inline]
@@ -537,6 +506,28 @@ impl Entry {
 
     pub fn is_loading(&self) -> bool {
         self.role == EntryRole::Placeholder && self.kind == EntryKind::Loading
+    }
+
+    /// Walks nested `children` along `chain`, matching each segment case-insensitively against a
+    /// child's `text` and falling back to the structured aliases of `Subcmd` children.
+    ///
+    /// Returns `self` for an empty chain and `None` when any segment has no match.
+    pub fn walk_chain<S: AsRef<str>>(&self, chain: &[S]) -> Option<&Entry> {
+        let mut cur = self;
+        for seg in chain {
+            let seg = seg.as_ref();
+            cur = cur
+                .children
+                .iter()
+                .find(|c| c.text.eq_ignore_ascii_case(seg))
+                .or_else(|| {
+                    cur.children.iter().find(|c| {
+                        c.kind == EntryKind::Subcmd
+                            && c.aliases.iter().any(|a| a.eq_ignore_ascii_case(seg))
+                    })
+                })?;
+        }
+        Some(cur)
     }
 
     /// Whether accepting this Pane 2 Entry commits it immediately without requiring a Pane 3 value.
@@ -1030,6 +1021,42 @@ mod tests {
                 "'; | & > <'",
             ]
         );
+    }
+
+    #[test]
+    fn entry_walk_chain_matches_text_and_subcommand_aliases_case_insensitively() {
+        let add = Entry::new("add", "add", EntryKind::Subcmd, "Add a remote")
+            .with_aliases(vec!["new".to_string()]);
+        let mut remote = Entry::new("remote", "remote", EntryKind::Subcmd, "Manage remotes")
+            .with_aliases(vec!["rm".to_string()]);
+        remote.children = vec![
+            add,
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Be verbose")
+                .with_aliases(vec!["-v".to_string()]),
+        ];
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git VCS");
+        git.children = vec![remote];
+
+        let no_segments: [&str; 0] = [];
+        assert_eq!(
+            git.walk_chain(&no_segments).map(|e| e.text.as_str()),
+            Some("git")
+        );
+        assert_eq!(
+            git.walk_chain(&["REMOTE"]).map(|e| e.text.as_str()),
+            Some("remote")
+        );
+        assert_eq!(
+            git.walk_chain(&["rm"]).map(|e| e.text.as_str()),
+            Some("remote")
+        );
+        assert_eq!(
+            git.walk_chain(&["RM".to_string(), "New".to_string()])
+                .map(|e| e.text.as_str()),
+            Some("add")
+        );
+        assert!(git.walk_chain(&["remote", "-v"]).is_none());
+        assert!(git.walk_chain(&["missing"]).is_none());
     }
 
     #[test]

@@ -1,11 +1,11 @@
 use crate::discovery::{CliIntrospector, Introspect, ShellDialect};
 use crate::fuzzy::PaneList;
 use crate::model::{
-    has_disallowed_control, is_benign_double_quotable, is_disallowed_control,
-    is_safe_unquoted_char, is_safe_unquoted_token, is_safe_variable_token,
-    quote_literal_for_dialect, quote_single_for_dialect, sanitize_variable_token,
-    strip_disallowed_controls, Entry, EntryKind, Pane, RuntimeContext,
+    is_benign_double_quotable, is_safe_unquoted_char, is_safe_unquoted_token,
+    is_safe_variable_token, quote_literal_for_dialect, quote_single_for_dialect,
+    sanitize_variable_token, Entry, EntryKind, Pane, RuntimeContext,
 };
+use crate::sanitize::{has_disallowed_control, is_disallowed_control, strip_disallowed_controls};
 use crate::ui::{render_frame, RenderState, Viewport};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::borrow::Cow;
@@ -82,7 +82,7 @@ impl UserAction {
             (KeyCode::Char(ch), mods)
                 if !mods.contains(KeyModifiers::CONTROL)
                     && !mods.contains(KeyModifiers::ALT)
-                    && !ch.is_control() =>
+                    && !is_disallowed_control(ch) =>
             {
                 Some(UserAction::InsertChar(ch))
             }
@@ -880,17 +880,6 @@ fn is_git_branch_target(exe: &str, p2: &Entry) -> bool {
         .any(|kw| t.eq_ignore_ascii_case(kw))
 }
 
-fn walk_entry_chain<'a>(root: &'a Entry, chain: &[String]) -> Option<&'a Entry> {
-    let mut cur = root;
-    for seg in chain {
-        cur = cur
-            .children
-            .iter()
-            .find(|c| c.text.eq_ignore_ascii_case(seg))?;
-    }
-    Some(cur)
-}
-
 fn escape_benign_double_quoted(raw: &str, dialect: ShellDialect) -> String {
     let mut out = String::with_capacity(raw.len() + 4);
     out.push('"');
@@ -974,7 +963,7 @@ fn resolve_pane2_entries<I: Introspect>(
     }
 
     if !subcmd_chain.is_empty() {
-        if let Some(nested) = walk_entry_chain(p1, subcmd_chain) {
+        if let Some(nested) = p1.walk_chain(subcmd_chain) {
             if !nested.children.is_empty() {
                 return (nested.children.clone(), None);
             }
@@ -1283,7 +1272,8 @@ fn subcommand_has_pane2_children<I: Introspect>(
     let Some(p1) = p1_opt else {
         return false;
     };
-    if walk_entry_chain(p1, subcmd_chain)
+    if p1
+        .walk_chain(subcmd_chain)
         .and_then(|parent| {
             parent
                 .children
@@ -3227,6 +3217,86 @@ mod tests {
             .entries()
             .iter()
             .any(|e| e.text == "--locked"));
+    }
+
+    #[test]
+    fn test_interactive_subcommand_sliding_honors_subcommand_aliases() {
+        let mut add = Entry::new("add", "add", EntryKind::Subcmd, "Add a remote")
+            .with_aliases(vec!["new".to_string()]);
+        add.children = vec![Entry::new(
+            "--tags",
+            "--tags",
+            EntryKind::Flag,
+            "Import tags",
+        )];
+        let mut remote = Entry::new("remote", "remote", EntryKind::Subcmd, "Manage remotes")
+            .with_aliases(vec!["rm".to_string()]);
+        remote.children = vec![
+            add,
+            Entry::new("remove", "remove", EntryKind::Subcmd, "Remove a remote"),
+        ];
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git VCS");
+        git.children = vec![remote];
+
+        // Seeding with Subcommand aliases (`rm`, `new`) slides through both nested levels
+        // without falling back to Introspection (FakeIntrospector::empty has no responses).
+        let seeded = MillerSession::new(
+            vec![git.clone()],
+            FakeIntrospector::empty(),
+            "git RM new --tags",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        assert_eq!(seeded.view().active_pane, Pane::Third);
+        assert_eq!(
+            seeded.view().panes[1].selected().map(|e| e.text.as_str()),
+            Some("add")
+        );
+        assert_eq!(
+            seeded.view().panes[2].selected().map(|e| e.text.as_str()),
+            Some("--tags")
+        );
+
+        // Interactive AcceptToken / StepRight sliding starting from an aliased subcommand (`git rm`)
+        // matches `remote` and traverses nested children via `Entry::walk_chain`.
+        let mut interactive = MillerSession::new(
+            vec![git.clone()],
+            FakeIntrospector::empty(),
+            "git rm",
+            Viewport::new(120, 30),
+            ShellDialect::Posix,
+        );
+        assert_eq!(
+            interactive.view().panes[1]
+                .selected()
+                .map(|e| e.text.as_str()),
+            Some("remote")
+        );
+        interactive.apply(UserAction::StepRight);
+        assert_eq!(interactive.view().active_pane, Pane::Third);
+        assert_eq!(
+            interactive.view().panes[1]
+                .selected()
+                .map(|e| e.text.as_str()),
+            Some("add")
+        );
+        assert_eq!(
+            interactive.view().panes[2]
+                .selected()
+                .map(|e| e.text.as_str()),
+            Some("--tags")
+        );
+
+        let inspect = crate::discovery::inspect_command_chain_with(
+            ShellDialect::Posix,
+            &[git],
+            &["git".to_string(), "rm".to_string(), "new".to_string()],
+            None,
+            false,
+            &|_, _| None,
+        )
+        .expect("inspect should resolve subcommand aliases via Entry::walk_chain");
+        assert!(inspect.entries.iter().any(|e| e.text == "--tags"));
     }
 
     #[test]

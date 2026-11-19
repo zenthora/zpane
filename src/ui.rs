@@ -1,6 +1,9 @@
 use crate::discovery::ShellDialect;
 use crate::fuzzy::PaneList;
 use crate::model::{Entry, EntryKind, Pane};
+use crate::sanitize::{
+    is_printable_ascii, next_escape_seq_len, sanitize_display_char, strip_escapes_and_controls_into,
+};
 use std::borrow::Cow;
 use std::fmt::Write as FmtWrite;
 use unicode_width::UnicodeWidthChar;
@@ -91,138 +94,6 @@ impl Viewport {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum EscKind {
-    Csi,
-    Osc,
-    ControlString,
-}
-
-#[inline]
-pub(crate) fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
-    )
-}
-
-#[inline]
-pub(crate) fn is_disallowed_control(c: char) -> bool {
-    c.is_control() || is_bidi_control(c) || matches!(c, '\u{2028}' | '\u{2029}')
-}
-
-#[inline]
-pub(crate) fn has_control_or_bidi(s: &str) -> bool {
-    s.bytes()
-        .any(|b| b < 0x20 || b == 0x7f || matches!(b, 0xc2 | 0xd8 | 0xe2))
-        && (s.is_ascii() || s.chars().any(is_disallowed_control))
-}
-
-#[inline]
-fn is_printable_ascii(s: &str) -> bool {
-    s.bytes().all(|b| (0x20..0x7f).contains(&b))
-}
-
-/// Returns `(byte_len, char_len)` when `rest` begins with a complete ANSI/ECMA-48
-/// multi-character control sequence (CSI, OSC, DCS, SOS, PM, or APC in 7-bit or C1 form).
-pub(crate) fn next_escape_seq_len(rest: &str) -> Option<(usize, usize)> {
-    let bytes = rest.as_bytes();
-    let (prefix_bytes, prefix_chars, kind) = if bytes.starts_with(b"\x1b[") {
-        (2usize, 2usize, EscKind::Csi)
-    } else if bytes.starts_with(b"\x1b]") {
-        (2, 2, EscKind::Osc)
-    } else if bytes.len() >= 2 && bytes[0] == 0x1b && matches!(bytes[1], b'P' | b'X' | b'^' | b'_')
-    {
-        (2, 2, EscKind::ControlString)
-    } else if bytes.len() >= 2 && bytes[0] == 0xc2 {
-        match bytes[1] {
-            0x9b => (2, 1, EscKind::Csi),
-            0x9d => (2, 1, EscKind::Osc),
-            0x90 | 0x98 | 0x9e | 0x9f => (2, 1, EscKind::ControlString),
-            _ => return None,
-        }
-    } else {
-        return None;
-    };
-
-    if kind == EscKind::Csi {
-        let mut i = prefix_bytes;
-        while i < bytes.len() && (0x20..=0x3f).contains(&bytes[i]) {
-            i += 1;
-        }
-        if i < bytes.len() && (0x40..=0x7e).contains(&bytes[i]) {
-            let body_len = i + 1 - prefix_bytes;
-            return Some((i + 1, prefix_chars + body_len));
-        }
-        return None;
-    }
-
-    const MAX_STR_SCAN: usize = 4096;
-    let mut char_count = 0usize;
-    let tail = &rest[prefix_bytes..];
-    for (byte_off, ch) in tail.char_indices() {
-        if byte_off >= MAX_STR_SCAN {
-            return None;
-        }
-        char_count += 1;
-        if kind == EscKind::Osc && ch == '\x07' {
-            return Some((prefix_bytes + byte_off + 1, prefix_chars + char_count));
-        }
-        if ch == '\u{009c}' {
-            return Some((
-                prefix_bytes + byte_off + ch.len_utf8(),
-                prefix_chars + char_count,
-            ));
-        }
-        if ch == '\x1b' {
-            if tail.as_bytes().get(byte_off + 1) == Some(&b'\\') {
-                return Some((prefix_bytes + byte_off + 2, prefix_chars + char_count + 1));
-            }
-            return None;
-        }
-        if matches!(ch, '\r' | '\n' | '\x00') {
-            return None;
-        }
-    }
-    None
-}
-
-#[inline]
-fn sanitize_char(c: char) -> Option<char> {
-    if matches!(c, '\r' | '\n' | '\t' | '\u{0085}' | '\u{2028}' | '\u{2029}') {
-        Some(' ')
-    } else if is_disallowed_control(c) {
-        None
-    } else {
-        Some(c)
-    }
-}
-
-pub(crate) fn strip_escapes_and_controls_into(src: &str, dst: &mut String) {
-    dst.clear();
-    if is_printable_ascii(src) {
-        dst.push_str(src);
-        return;
-    }
-    dst.reserve(src.len());
-    let mut byte_idx = 0usize;
-    while byte_idx < src.len() {
-        let Some(ch) = src[byte_idx..].chars().next() else {
-            break;
-        };
-        if ch == '\x1b' || ('\u{0080}'..='\u{009f}').contains(&ch) {
-            if let Some((esc_bytes, _)) = next_escape_seq_len(&src[byte_idx..]) {
-                byte_idx += esc_bytes;
-                continue;
-            }
-        }
-        byte_idx += ch.len_utf8();
-        if let Some(clean) = sanitize_char(ch) {
-            dst.push(clean);
-        }
-    }
-}
-
 fn display_width_sanitized(s: &str) -> usize {
     if is_printable_ascii(s) {
         return s.len();
@@ -240,7 +111,7 @@ fn display_width_sanitized(s: &str) -> usize {
             }
         }
         byte_idx += ch.len_utf8();
-        if let Some(clean) = sanitize_char(ch) {
+        if let Some(clean) = sanitize_display_char(ch) {
             w += UnicodeWidthChar::width(clean).unwrap_or(0);
         }
     }
@@ -359,7 +230,7 @@ fn push_sanitized_truncated(
         byte_idx += raw_ch.len_utf8();
         char_idx += 1;
 
-        let Some(ch) = sanitize_char(raw_ch) else {
+        let Some(ch) = sanitize_display_char(raw_ch) else {
             continue;
         };
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -1191,6 +1062,7 @@ fn push_tail_status_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sanitize::is_bidi_control;
     use unicode_width::UnicodeWidthStr;
 
     fn strip_ansi(s: &str) -> String {

@@ -1,5 +1,6 @@
-use super::catalog::{contains_ignore_ascii_case, starts_with_ignore_ascii_case};
+use super::catalog::starts_with_ignore_ascii_case;
 use crate::model::{Entry, EntryKind};
+use crate::sanitize::{contains_ignore_ascii_case, strip_help_text_escapes};
 use regex::Regex;
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -30,106 +31,6 @@ fn truncate_utf8_prefix(s: &str, max_bytes: usize) -> &str {
         end -= 1;
     }
     &s[..end]
-}
-
-fn is_unsafe_display_control(c: char) -> bool {
-    (c.is_control() && c != '\n' && c != '\t')
-        || matches!(
-            c,
-            '\u{061c}'
-                | '\u{200b}'..='\u{200f}'
-                | '\u{2028}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
-}
-
-fn strip_ansi_escapes(text: &str) -> Cow<'_, str> {
-    let bytes = text.as_bytes();
-    let mut needs_clean = false;
-    let mut non_ascii_start = None;
-    for (idx, &b) in bytes.iter().enumerate() {
-        if b >= 0x80 {
-            non_ascii_start = Some(idx);
-            break;
-        }
-        if b == 0x1b || b == 0x7f || (b < 0x20 && b != b'\n' && b != b'\t' && b != b'\r') {
-            needs_clean = true;
-            break;
-        }
-        if b == b'\r' && bytes.get(idx + 1) != Some(&b'\n') {
-            needs_clean = true;
-            break;
-        }
-    }
-    if let Some(start) = non_ascii_start {
-        for (rel_idx, ch) in text[start..].char_indices() {
-            let idx = start + rel_idx;
-            if ch == '\x1b'
-                || (ch == '\r' && bytes.get(idx + 1) != Some(&b'\n'))
-                || (ch != '\r' && is_unsafe_display_control(ch))
-            {
-                needs_clean = true;
-                break;
-            }
-        }
-    }
-    if !needs_clean {
-        return Cow::Borrowed(text);
-    }
-
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            match chars.peek().copied() {
-                Some('[') => {
-                    chars.next();
-                    let mut count = 0usize;
-                    while let Some(&next) = chars.peek() {
-                        if next == '\n' || next == '\r' || count >= 64 {
-                            break;
-                        }
-                        chars.next();
-                        count += 1;
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
-                    }
-                }
-                Some(']') => {
-                    chars.next();
-                    let mut count = 0usize;
-                    while let Some(&next) = chars.peek() {
-                        if next == '\n' || next == '\r' || count >= 256 {
-                            break;
-                        }
-                        let Some(c) = chars.next() else {
-                            break;
-                        };
-                        count += 1;
-                        if c == '\x07' {
-                            break;
-                        }
-                        if c == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                Some(next) if next != '\n' && next != '\r' => {
-                    chars.next();
-                }
-                _ => {}
-            }
-        } else if ch == '\r' {
-            if chars.peek() == Some(&'\n') {
-                out.push('\r');
-            }
-        } else if !is_unsafe_display_control(ch) {
-            out.push(ch);
-        }
-    }
-    Cow::Owned(out)
 }
 
 fn leading_ws_count(line: &str) -> usize {
@@ -527,7 +428,7 @@ pub(super) fn parse_cli_help(help_text: &str) -> Vec<Entry> {
     );
 
     let bounded_help = truncate_utf8_prefix(help_text, MAX_HELP_BYTES);
-    let clean_help = strip_ansi_escapes(bounded_help);
+    let clean_help = strip_help_text_escapes(bounded_help);
 
     let est_entries = (clean_help.len() / 96).clamp(8, 256);
     let mut subcmds: Vec<Entry> = Vec::with_capacity(est_entries / 2);

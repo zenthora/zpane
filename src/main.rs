@@ -1,24 +1,20 @@
-mod discovery;
-mod fuzzy;
-mod model;
-mod session;
-mod ui;
-
 use crossterm::{
     event,
     terminal::{disable_raw_mode, enable_raw_mode, size},
 };
-use discovery::{
-    clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog, reload_catalog,
-    sync_powershell_metadata, warm_cli_cache, CliIntrospector, InspectReport, ShellDialect,
-};
-use model::RuntimeContext;
-use session::{MillerSession, SessionOutcome};
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use zpane::discovery::{
+    clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog, reload_catalog,
+    sync_powershell_metadata, warm_cli_cache, CliIntrospector, InspectReport, ShellDialect,
+};
+use zpane::model::RuntimeContext;
+use zpane::sanitize::strip_escapes_and_controls_into;
+use zpane::session::{MillerSession, SessionOutcome};
+use zpane::ui;
 
 /// Windows console output: writes UTF-16 frames straight to `CONOUT$` via `WriteConsoleW`,
 /// so the TUI renders even when stdout is redirected by the shell integration.
@@ -819,7 +815,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
 }
 
 fn sanitize_plain_text(raw: &str, scratch: &mut String) -> String {
-    ui::strip_escapes_and_controls_into(raw, scratch);
+    strip_escapes_and_controls_into(raw, scratch);
     scratch.clone()
 }
 
@@ -837,7 +833,7 @@ fn format_inspect_human(report: &InspectReport) -> String {
     for (idx, part) in report.chain.iter().enumerate() {
         let token = if idx == 0 {
             if let Some(cmd) = &report.command {
-                ui::strip_escapes_and_controls_into(&cmd.text, &mut scratch);
+                strip_escapes_and_controls_into(&cmd.text, &mut scratch);
                 let clean_cmd = scratch.trim();
                 if !clean_cmd.is_empty() {
                     clean_cmd.to_string()
@@ -871,14 +867,14 @@ fn format_inspect_human(report: &InspectReport) -> String {
     );
 
     for entry in &report.entries {
-        ui::strip_escapes_and_controls_into(&entry.label, &mut scratch);
+        strip_escapes_and_controls_into(&entry.label, &mut scratch);
         let mut label = scratch.trim().to_string();
         if label.is_empty() && !entry.text.is_empty() {
-            ui::strip_escapes_and_controls_into(&entry.text, &mut scratch);
+            strip_escapes_and_controls_into(&entry.text, &mut scratch);
             label = scratch.trim().to_string();
         }
 
-        ui::strip_escapes_and_controls_into(&entry.desc, &mut scratch);
+        strip_escapes_and_controls_into(&entry.desc, &mut scratch);
         let desc = scratch.trim();
 
         if desc.is_empty() {
@@ -1057,10 +1053,10 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{Introspect, PollResult};
-    use crate::model::{Entry, EntryKind, Pane};
-    use crate::session::UserAction;
-    use crate::ui::Viewport;
+    use zpane::discovery::{Introspect, PollResult};
+    use zpane::model::{Entry, EntryKind, Pane};
+    use zpane::session::UserAction;
+    use zpane::ui::Viewport;
 
     struct NullIntrospector;
 
@@ -1136,7 +1132,7 @@ mod tests {
 
     #[test]
     fn test_parse_cli_args_runtime_context_flags_and_errors() {
-        use crate::model::CwdEntry;
+        use zpane::model::CwdEntry;
 
         let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
         let ctx_path =
@@ -1751,8 +1747,8 @@ mod tests {
 
     #[test]
     fn test_format_inspect_human_and_pentest_sanitization() {
-        use crate::discovery::{inspect_command_chain_with, InspectReport, ShellDialect};
-        use crate::model::{Entry, EntryKind};
+        use zpane::discovery::{inspect_command_chain_with, InspectReport, ShellDialect};
+        use zpane::model::{Entry, EntryKind};
 
         // 1. Standard human output formatting with desc and empty desc.
         let mut git = Entry::new("git", "git", EntryKind::Cmdlet, "Distributed VCS");
