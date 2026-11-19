@@ -702,6 +702,7 @@ fn push_miller_cell_styled(
     is_selected: bool,
     is_active_pane: bool,
     is_committed: bool,
+    is_mandatory: bool,
     style: UiStyle,
 ) {
     if col_width == 0 {
@@ -732,9 +733,21 @@ fn push_miller_cell_styled(
 
     let rem = col_width.saturating_sub(ptr_w);
     let marker_w = if is_committed && rem >= 4 { 2 } else { 0 };
-    let show_badge = rem >= badge_w + marker_w + 3;
+    let req_badge = if is_mandatory {
+        if rem >= badge_w + marker_w + 9 {
+            " [req]"
+        } else if rem >= badge_w + marker_w + 5 {
+            " !"
+        } else {
+            ""
+        }
+    } else {
+        ""
+    };
+    let req_w = req_badge.len();
+    let show_badge = rem >= badge_w + marker_w + req_w + 3;
     let badge_reserved = if show_badge { badge_w + 1 } else { 0 };
-    let avail_label_w = rem - marker_w - badge_reserved;
+    let avail_label_w = rem - req_w - marker_w - badge_reserved;
 
     let cur_w = push_sanitized_truncated_styled(
         out,
@@ -748,6 +761,17 @@ fn push_miller_cell_styled(
 
     if avail_label_w > cur_w {
         push_repeated_space(out, avail_label_w - cur_w);
+    }
+
+    if req_w > 0 {
+        if !is_selected && !palette.match_hl.is_empty() {
+            out.push_str(palette.match_hl);
+        }
+        out.push_str(req_badge);
+        if !is_selected && !palette.match_hl.is_empty() {
+            out.push_str(palette.rst);
+            out.push_str(base_style);
+        }
     }
 
     if marker_w == 2 {
@@ -772,6 +796,7 @@ fn push_miller_cell_styled(
     if !base_style.is_empty()
         || (!is_selected && show_badge && !kind_color(theme, entry.kind).is_empty())
         || (!is_selected && marker_w == 2 && !palette.cmd_bar.is_empty())
+        || (!is_selected && req_w > 0 && !palette.match_hl.is_empty())
         || (!match_positions.is_empty() && !palette.match_hl.is_empty())
     {
         out.push_str(palette.rst);
@@ -795,10 +820,12 @@ fn push_miller_cell(
         is_selected,
         is_active_pane,
         false,
+        false,
         UiStyle::default(),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_pane_cell(
     out: &mut String,
     pane: &PaneList,
@@ -806,16 +833,21 @@ fn push_pane_cell(
     col_width: usize,
     is_active_pane: bool,
     committed_tokens: &[String],
+    active_param_set: Option<&str>,
+    is_pane2: bool,
     style: UiStyle,
 ) {
     let idx = pane.scroll_idx() + row_offset;
     if let Some((entry, match_positions)) = pane.row_at(idx) {
+        let is_param_or_flag = matches!(entry.kind, EntryKind::Flag | EntryKind::Param);
         let is_committed = !committed_tokens.is_empty()
-            && matches!(entry.kind, EntryKind::Flag | EntryKind::Param)
+            && is_param_or_flag
             && entry.is_emittable()
             && committed_tokens
                 .iter()
                 .any(|tok| entry.matches_parameter_token(tok));
+        let is_mandatory =
+            is_pane2 && is_param_or_flag && entry.is_mandatory_for_set_label(active_param_set);
         push_miller_cell_styled(
             out,
             entry,
@@ -824,6 +856,7 @@ fn push_pane_cell(
             idx == pane.sel_idx(),
             is_active_pane,
             is_committed,
+            is_mandatory,
             style,
         );
     } else {
@@ -1032,6 +1065,7 @@ fn push_inspector_field(
 
 fn build_expanded_inspector_rows_styled(
     entry: Option<&Entry>,
+    active_param_set: Option<&str>,
     w3: usize,
     max_rows: usize,
     style: UiStyle,
@@ -1109,6 +1143,47 @@ fn build_expanded_inspector_rows_styled(
         format!("Kind : {}", it.kind.badge())
     };
     push_inspector_field(&mut rows, palette.dim, &sets_raw, w3, wrap_w, max_rows);
+
+    let mut clr_parts = Vec::new();
+    if !it.mandatory_sets.is_empty() {
+        if it.is_mandatory_for_set_label(active_param_set) {
+            if it.mandatory_sets.iter().any(|s| s == "__AllParameterSets") {
+                clr_parts.push("Required: yes".to_string());
+            } else {
+                clr_parts.push(format!("Required: yes ({})", it.mandatory_sets.join(", ")));
+            }
+        } else {
+            clr_parts.push(format!(
+                "Required: no (only in {})",
+                it.mandatory_sets.join(", ")
+            ));
+        }
+    }
+    if let Some(pos) = it.position.filter(|&p| p >= 0) {
+        clr_parts.push(format!("Pos: {pos}"));
+    }
+    match (it.accepts_pipeline, it.accepts_pipeline_by_property_name) {
+        (true, true) => clr_parts.push("Pipe: ByValue, ByPropertyName".to_string()),
+        (true, false) => clr_parts.push("Pipe: ByValue".to_string()),
+        (false, true) => clr_parts.push("Pipe: ByPropertyName".to_string()),
+        (false, false) => {}
+    }
+    if let Some(ref range) = it.validate_range {
+        if !range.trim().is_empty() {
+            clr_parts.push(format!("Range: {}", range.trim()));
+        }
+    }
+    if !clr_parts.is_empty() {
+        let combined = clr_parts.join("  ");
+        if display_width_sanitized(&combined) < w3 {
+            push_inspector_field(&mut rows, palette.dim, &combined, w3, wrap_w, max_rows);
+        } else {
+            for part in &clr_parts {
+                push_inspector_field(&mut rows, palette.dim, part, w3, wrap_w, max_rows);
+            }
+        }
+    }
+
     if rows.len() < max_rows {
         rows.push((palette.border_dim, bar_cow_for(w3, ascii_borders)));
     }
@@ -1167,7 +1242,7 @@ fn build_expanded_inspector_rows(
     w3: usize,
     max_rows: usize,
 ) -> Vec<(&'static str, Cow<'static, str>)> {
-    build_expanded_inspector_rows_styled(entry, w3, max_rows, UiStyle::default())
+    build_expanded_inspector_rows_styled(entry, None, w3, max_rows, UiStyle::default())
 }
 
 /// Computes `(w1, w2, w3)` inside `inner_w` summing strictly to `inner_w`.
@@ -1245,6 +1320,7 @@ const MAX_INSPECTOR_SCROLLABLE_ROWS: usize = 512;
 /// Returns the maximum valid scroll offset for the expanded `F1` Inspector on `entry`.
 pub(crate) fn expanded_inspector_max_scroll(
     entry: Option<&Entry>,
+    active_param_set: Option<&str>,
     viewport: Viewport,
     style: UiStyle,
 ) -> usize {
@@ -1252,8 +1328,14 @@ pub(crate) fn expanded_inspector_max_scroll(
     let list_rows = viewport.rows(Pane::First);
     let inner_w = win_w.saturating_sub(4);
     let (_w1, _w2, w3) = split_pane_widths(inner_w);
-    let total_rows =
-        build_expanded_inspector_rows_styled(entry, w3, MAX_INSPECTOR_SCROLLABLE_ROWS, style).len();
+    let total_rows = build_expanded_inspector_rows_styled(
+        entry,
+        active_param_set,
+        w3,
+        MAX_INSPECTOR_SCROLLABLE_ROWS,
+        style,
+    )
+    .len();
     total_rows.saturating_sub(list_rows)
 }
 
@@ -1326,6 +1408,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     let expanded_rows = if st.inspector_expanded {
         build_expanded_inspector_rows_styled(
             selected_info_entry(st),
+            st.active_param_set,
             w3,
             MAX_INSPECTOR_SCROLLABLE_ROWS,
             st.style,
@@ -1455,6 +1538,8 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             w1,
             st.active_pane == Pane::First,
             &[],
+            None,
+            false,
             st.style,
         );
 
@@ -1468,6 +1553,8 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             w2,
             st.active_pane == Pane::Second,
             st.committed_tokens,
+            st.active_param_set,
+            true,
             st.style,
         );
 
@@ -1522,6 +1609,8 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
                     w3,
                     st.active_pane == Pane::Third,
                     &[],
+                    None,
+                    false,
                     st.style,
                 ),
             }
@@ -3051,5 +3140,92 @@ mod tests {
         assert!(bot_ascii.chars().all(|c| c == '\n' || c.is_ascii()));
         assert!(bot_ascii.contains("Detail line 25"));
         assert!(bot_ascii.contains("^ "));
+    }
+
+    #[test]
+    fn test_pane2_mandatory_marker_respects_active_set_widths_modes_and_f1_clr_metadata() {
+        let pane1 = PaneList::new(vec![Entry::new(
+            "Invoke-Op",
+            "Invoke-Op",
+            EntryKind::Cmdlet,
+            "Operation",
+        )]);
+        let req_param = Entry::new("-Path", "-Path", EntryKind::Param, "Target path")
+            .with_parameter_sets(vec!["ByPath".to_string(), "ById".to_string()])
+            .with_mandatory_sets(vec!["ByPath".to_string()])
+            .with_position(Some(0))
+            .with_pipeline(true, true)
+            .with_validate_range(Some("1..100".to_string()));
+        let opt_param = Entry::new("-Filter", "-Filter", EntryKind::Param, "Filter pattern")
+            .with_parameter_sets(vec!["__AllParameterSets".to_string()]);
+        let pane2 = PaneList::new(vec![req_param, opt_param]);
+        let empty = PaneList::default();
+
+        // 1. Active set ByPath -> -Path shows [req] indicator and preserves exact frame widths
+        for style in [
+            UiStyle::default(),
+            UiStyle {
+                theme: ThemePreset::None,
+                icons: IconMode::Ascii,
+                borders: BorderStyle::Ascii,
+            },
+        ] {
+            let raw = render_frame(&RenderState {
+                viewport: Viewport::new(120, 14),
+                active_pane: Pane::Second,
+                panes: [&pane1, &pane2, &empty],
+                command_line: "Invoke-Op -Path".to_string(),
+                active_param_set: Some("ByPath"),
+                subcmd_chain: &[],
+                committed_tokens: &[],
+                dialect: ShellDialect::PowerShell,
+                inspector_expanded: false,
+                inspector_scroll: 0,
+                style,
+            });
+            if style.theme == ThemePreset::None {
+                assert!(!has_ansi_color_escape(&raw));
+            }
+            let plain = strip_ansi(&raw);
+            assert!(plain.contains("[req]"), "expected [req] marker: {plain}");
+            for line in plain.lines() {
+                assert_eq!(UnicodeWidthStr::width(line), 120);
+            }
+        }
+
+        // 2. Active set ById -> -Path is optional in ById, so [req] is NOT shown in Pane 2
+        let by_id_plain = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(120, 14),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "Invoke-Op -Id 1".to_string(),
+            active_param_set: Some("ById"),
+            subcmd_chain: &[],
+            committed_tokens: &[],
+            dialect: ShellDialect::PowerShell,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        assert!(!by_id_plain.contains("[req]"));
+
+        // 3. F1 Inspector surfaces Pos, Pipe, Range, and Required metadata concisely
+        let inspector_plain = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(120, 16),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "Invoke-Op -Path".to_string(),
+            active_param_set: Some("ByPath"),
+            subcmd_chain: &[],
+            committed_tokens: &[],
+            dialect: ShellDialect::PowerShell,
+            inspector_expanded: true,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        assert!(inspector_plain.contains("Pos: 0"));
+        assert!(inspector_plain.contains("Pipe: ByValue, ByPropertyName"));
+        assert!(inspector_plain.contains("Range: 1..100"));
+        assert!(inspector_plain.contains("Required:"));
     }
 }

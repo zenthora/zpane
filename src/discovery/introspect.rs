@@ -6,7 +6,11 @@ use super::config::{
     load_user_config, UserConfig, MAX_INTROSPECT_TIMEOUT_MS, MIN_INTROSPECT_TIMEOUT_MS,
 };
 use super::help_parser::parse_cli_help;
-use super::powershell::{ps_metadata_path, sync_powershell_metadata};
+use super::powershell::{
+    apply_ps_help_to_entry, collect_ps_help_roots, is_safe_ps_help_cmd_name, load_ps_maml_file_map,
+    lookup_ps_maml_help_in_dirs, parse_get_help_json, ps_metadata_path,
+    resolve_powershell_executable, sync_powershell_metadata, PsCmdHelp,
+};
 use super::project_tasks::{merge_task_entries_front, project_task_entries_for_chain};
 use crate::model::{Entry, EntryKind, RuntimeContext};
 use crate::sanitize::{
@@ -27,21 +31,35 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 #[derive(Debug, Clone)]
-struct BgRequest {
-    cache_key: String,
-    cmd_chain: Vec<String>,
-    generation: u64,
-    probe_exe: bool,
+enum BgRequest {
+    Chain {
+        cache_key: String,
+        cmd_chain: Vec<String>,
+        generation: u64,
+        probe_exe: bool,
+    },
+    PsHelp {
+        cmd_key: String,
+        cmd_name: String,
+        help_file: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
-struct BgResponse {
-    cache_key: String,
-    entries: Vec<Entry>,
-    resolved_exe: Option<PathBuf>,
-    exe_fingerprint: Option<(u64, u64)>,
-    timed_out: bool,
-    generation: u64,
+enum BgResponse {
+    Chain {
+        cache_key: String,
+        entries: Vec<Entry>,
+        resolved_exe: Option<PathBuf>,
+        exe_fingerprint: Option<(u64, u64)>,
+        timed_out: bool,
+        generation: u64,
+    },
+    PsHelp {
+        cmd_key: String,
+        help: Option<PsCmdHelp>,
+        extra_entries: Vec<(String, PsCmdHelp)>,
+    },
 }
 
 /// Asynchronous updates surfaced by [`Introspect::poll_updates`].
@@ -51,12 +69,14 @@ pub struct PollResult {
     pub introspected: bool,
     /// `Some(entries)` when a background catalog metadata refresh (e.g. first-run PowerShell sync) finished.
     pub catalog_reloaded: Option<Vec<Entry>>,
+    /// `true` when one or more lazy PowerShell MAML/help lookups completed.
+    pub ps_help_updated: bool,
 }
 
 impl PollResult {
     /// Returns `true` when any background work produced new UI state.
     pub fn any(&self) -> bool {
-        self.introspected || self.catalog_reloaded.is_some()
+        self.introspected || self.catalog_reloaded.is_some() || self.ps_help_updated
     }
 }
 
@@ -66,6 +86,12 @@ pub trait Introspect {
     fn poll_updates(&mut self) -> PollResult;
     fn flush(&mut self) -> bool;
     fn invalidate_command(&mut self, _exe: &str) {}
+    /// Lazily queries PowerShell help documentation for `cmd` (with optional MAML `help_file`).
+    /// Returns `Some(help)` when already cached; otherwise requests background resolution
+    /// surfaced via [`Introspect::poll_updates`] (`ps_help_updated`).
+    fn query_ps_help(&mut self, _cmd: &str, _help_file: Option<&str>) -> Option<PsCmdHelp> {
+        None
+    }
 }
 
 const CLI_CACHE_SCHEMA_VERSION: u32 = 3;
@@ -664,6 +690,41 @@ fn run_man_with_timeout(man_path: &Path, args: &[&str], timeout_ms: u64) -> Comm
 /// Adapter signature for running a CLI command (`exe`, `args`) and returning its bounded run outcome.
 type CommandRunner = dyn Fn(&str, &[&str]) -> CommandRunOutcome + Send + Sync;
 
+/// Adapter signature for running a lazy on-demand PowerShell `Get-Help` lookup for a validated cmdlet name.
+type PsHelpRunner = dyn Fn(&str) -> Option<String> + Send + Sync;
+
+fn default_ps_help_runner(timeout: Duration) -> Arc<PsHelpRunner> {
+    let timeout_ms = clamp_introspect_timeout_ms(timeout);
+    Arc::new(move |cmd_name: &str| {
+        if !is_safe_ps_help_cmd_name(cmd_name) {
+            return None;
+        }
+        let ps_exe = resolve_powershell_executable()?;
+        let script = format!(
+            "$ErrorActionPreference='SilentlyContinue';\
+             $h=Get-Help -Name '{cmd_name}' -ErrorAction SilentlyContinue;\
+             if($h -is [array]){{$h=$h|Select-Object -First 1}};\
+             if($h -and $h.Name){{\
+                 $pl=@();\
+                 if($h.Parameters -and $h.Parameters.Parameter){{\
+                     $pl=@($h.Parameters.Parameter|ForEach-Object{{\
+                         @{{name=$_.Name;desc=(($_.Description|ForEach-Object{{$_.Text}})-join \"`n\")}}\
+                     }})\
+                 }};\
+                 @{{synopsis=[string]$h.Synopsis;description=(($h.Description|ForEach-Object{{$_.Text}})-join \"`n\");params=$pl}}|ConvertTo-Json -Depth 4 -Compress\
+             }}"
+        );
+        match run_command_with_timeout(
+            &ps_exe,
+            &["-NoLogo", "-NoProfile", "-Command", &script],
+            timeout_ms,
+        ) {
+            CommandRunOutcome::Output(out) if !out.trim().is_empty() => Some(out),
+            _ => None,
+        }
+    })
+}
+
 fn default_command_runner(path_dirs: Arc<[PathBuf]>, timeout: Duration) -> Arc<CommandRunner> {
     let timeout_ms = clamp_introspect_timeout_ms(timeout);
     Arc::new(move |exe: &str, args: &[&str]| {
@@ -1184,6 +1245,8 @@ pub struct CliIntrospector {
     verified_roots: HashMap<String, Option<ProbedExe>>,
     pending_keys: HashSet<String>,
     invalidated_gen: HashMap<String, u64>,
+    ps_help_cache: HashMap<String, Option<PsCmdHelp>>,
+    ps_help_pending: HashSet<String>,
     dirty: bool,
     dialect: ShellDialect,
     carapace_enabled: bool,
@@ -1224,7 +1287,17 @@ impl CliIntrospector {
         let exe_probe = default_exe_probe(path_dirs);
         let project_dir = std::env::current_dir().ok();
         let catalog_rx = maybe_spawn_ps_sync(dialect, runtime_ctx.clone());
-        Self::build_with_fallbacks(
+        let ps_help_roots = if dialect.is_powershell() {
+            Arc::from(collect_ps_help_roots())
+        } else {
+            Arc::from(Vec::new())
+        };
+        let ps_help_runner = if dialect.is_powershell() {
+            Some(default_ps_help_runner(timeout))
+        } else {
+            None
+        };
+        Self::build_with_all(
             dialect,
             cache,
             Some(path),
@@ -1235,6 +1308,8 @@ impl CliIntrospector {
             carapace_enabled,
             man_enabled,
             catalog_rx,
+            ps_help_roots,
+            ps_help_runner,
         )
     }
 
@@ -1453,6 +1528,28 @@ impl CliIntrospector {
         )
     }
 
+    #[cfg(test)]
+    fn with_ps_help_roots(
+        dialect: ShellDialect,
+        ps_help_roots: Vec<PathBuf>,
+        ps_help_runner: Option<Arc<PsHelpRunner>>,
+    ) -> Self {
+        Self::build_with_all(
+            dialect,
+            HashMap::new(),
+            None,
+            None,
+            wrap_option_runner(|_, _| None),
+            noop_exe_probe(),
+            true,
+            false,
+            false,
+            None,
+            Arc::from(ps_help_roots),
+            ps_help_runner,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_with_fallbacks(
         dialect: ShellDialect,
@@ -1465,6 +1562,37 @@ impl CliIntrospector {
         carapace_enabled: bool,
         man_enabled: bool,
         catalog_rx: Option<Receiver<Vec<Entry>>>,
+    ) -> Self {
+        Self::build_with_all(
+            dialect,
+            cache,
+            cache_path,
+            project_dir,
+            runner,
+            exe_probe,
+            spawn_worker,
+            carapace_enabled,
+            man_enabled,
+            catalog_rx,
+            Arc::from(Vec::new()),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_with_all(
+        dialect: ShellDialect,
+        cache: HashMap<String, CachedChainEntry>,
+        cache_path: Option<PathBuf>,
+        project_dir: Option<PathBuf>,
+        runner: Arc<CommandRunner>,
+        exe_probe: Arc<ExeProbe>,
+        spawn_worker: bool,
+        carapace_enabled: bool,
+        man_enabled: bool,
+        catalog_rx: Option<Receiver<Vec<Entry>>>,
+        ps_help_roots: Arc<[PathBuf]>,
+        ps_help_runner: Option<Arc<PsHelpRunner>>,
     ) -> Self {
         let (req_tx, res_rx) = if spawn_worker {
             let (req_tx, req_rx) = mpsc::channel::<BgRequest>();
@@ -1479,6 +1607,8 @@ impl CliIntrospector {
                 man_enabled,
                 worker_runner,
                 worker_probe,
+                ps_help_roots,
+                ps_help_runner,
             );
             (Some(req_tx), Some(res_rx))
         } else {
@@ -1491,6 +1621,8 @@ impl CliIntrospector {
             verified_roots: HashMap::new(),
             pending_keys: HashSet::new(),
             invalidated_gen: HashMap::new(),
+            ps_help_cache: HashMap::new(),
+            ps_help_pending: HashSet::new(),
             dirty: false,
             dialect,
             carapace_enabled,
@@ -1655,7 +1787,7 @@ impl CliIntrospector {
         let generation = self.current_generation(&key);
         if let Some(ref tx) = self.req_tx {
             if self.pending_keys.insert(key.clone()) {
-                let _ = tx.send(BgRequest {
+                let _ = tx.send(BgRequest::Chain {
                     cache_key: key,
                     cmd_chain: clean_chain.iter().map(|s| (*s).to_string()).collect(),
                     generation,
@@ -1667,9 +1799,35 @@ impl CliIntrospector {
         vec![Self::loading_entry(clean_chain)]
     }
 
+    /// Lazily queries PowerShell MAML/`Get-Help` documentation for `cmd`, queuing a background
+    /// lookup on cache miss.
+    pub fn query_ps_help(&mut self, cmd: &str, help_file: Option<&str>) -> Option<PsCmdHelp> {
+        if !self.dialect.is_powershell() {
+            return None;
+        }
+        let clean = cmd.trim();
+        if !is_safe_ps_help_cmd_name(clean) {
+            return None;
+        }
+        let cmd_key = clean.to_ascii_lowercase();
+        if let Some(cached) = self.ps_help_cache.get(&cmd_key) {
+            return cached.clone();
+        }
+        if let Some(ref tx) = self.req_tx {
+            if self.ps_help_pending.insert(cmd_key.clone()) {
+                let _ = tx.send(BgRequest::PsHelp {
+                    cmd_key,
+                    cmd_name: clean.to_string(),
+                    help_file: help_file.map(str::to_string),
+                });
+            }
+        }
+        None
+    }
+
     /// Drains completed background introspection responses and catalog refreshes.
     pub fn poll_updates(&mut self) -> PollResult {
-        let introspected = self.drain_ready();
+        let (introspected, ps_help_updated) = self.drain_ready();
         let catalog_reloaded = match self.catalog_rx.as_ref().map(Receiver::try_recv) {
             Some(Ok(entries)) => {
                 self.catalog_rx = None;
@@ -1684,20 +1842,22 @@ impl CliIntrospector {
         PollResult {
             introspected,
             catalog_reloaded,
+            ps_help_updated,
         }
     }
 
     /// Test-only blocking poll that waits for every queued background job to finish.
     #[cfg(test)]
     fn poll_blocking(&mut self) -> bool {
-        let mut updated = self.drain_ready();
+        let (mut updated, _) = self.drain_ready();
         while !self.pending_keys.is_empty() {
             let Some(ref rx) = self.res_rx else {
                 break;
             };
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(resp) => {
-                    if self.record(resp) {
+                    let (intro, _) = self.record(resp);
+                    if intro {
                         updated = true;
                     }
                 }
@@ -1707,56 +1867,102 @@ impl CliIntrospector {
         updated
     }
 
-    fn drain_ready(&mut self) -> bool {
+    #[cfg(test)]
+    fn poll_blocking_ps_help(&mut self) -> bool {
+        let (_, mut updated) = self.drain_ready();
+        while !self.ps_help_pending.is_empty() {
+            let Some(ref rx) = self.res_rx else {
+                break;
+            };
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(resp) => {
+                    let (_, ps_up) = self.record(resp);
+                    if ps_up {
+                        updated = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        updated
+    }
+
+    fn drain_ready(&mut self) -> (bool, bool) {
         let mut drained = Vec::new();
         if let Some(ref rx) = self.res_rx {
             while let Ok(resp) = rx.try_recv() {
                 drained.push(resp);
             }
         }
-        let mut updated = false;
+        let mut introspected = false;
+        let mut ps_help_updated = false;
         for resp in drained {
-            if self.record(resp) {
-                updated = true;
-            }
+            let (intro, ps_up) = self.record(resp);
+            introspected |= intro;
+            ps_help_updated |= ps_up;
         }
-        updated
+        (introspected, ps_help_updated)
     }
 
-    fn record(&mut self, resp: BgResponse) -> bool {
-        if resp.generation < self.current_generation(&resp.cache_key) {
-            return false;
-        }
-        self.pending_keys.remove(&resp.cache_key);
-        if resp.timed_out {
-            // Keep transient timeout fallback in-session so the UI leaves Loading state without
-            // re-spawning in a loop, while never dirtying or writing the persistent disk cache.
-            self.transient_timeouts.insert(resp.cache_key, resp.entries);
-            return true;
-        }
-        self.transient_timeouts.remove(&resp.cache_key);
-        let root = Self::root_exe(&resp.cache_key).to_string();
-        let (resolved_exe, exe_fingerprint) =
-            if resp.resolved_exe.is_some() || resp.exe_fingerprint.is_some() {
-                let probed = resp.resolved_exe.clone().zip(resp.exe_fingerprint);
-                self.verified_roots.insert(root, probed);
-                (resp.resolved_exe, resp.exe_fingerprint)
-            } else if let Some(Some((path, fp))) = self.verified_roots.get(&root) {
-                (Some(path.clone()), Some(*fp))
-            } else {
-                (None, None)
-            };
-        self.cache.insert(
-            resp.cache_key,
-            CachedChainEntry {
+    fn record(&mut self, resp: BgResponse) -> (bool, bool) {
+        match resp {
+            BgResponse::PsHelp {
+                cmd_key,
+                help,
+                extra_entries,
+            } => {
+                self.ps_help_pending.remove(&cmd_key);
+                let mut updated = help.is_some();
+                for (k, v) in extra_entries {
+                    self.ps_help_cache.entry(k).or_insert(Some(v));
+                }
+                self.ps_help_cache.insert(cmd_key, help);
+                updated |= !self.ps_help_cache.is_empty();
+                (false, updated)
+            }
+            BgResponse::Chain {
+                cache_key,
+                entries,
                 resolved_exe,
                 exe_fingerprint,
-                entries: resp.entries,
-                verified: true,
-            },
-        );
-        self.dirty = true;
-        true
+                timed_out,
+                generation,
+            } => {
+                if generation < self.current_generation(&cache_key) {
+                    return (false, false);
+                }
+                self.pending_keys.remove(&cache_key);
+                if timed_out {
+                    // Keep transient timeout fallback in-session so the UI leaves Loading state without
+                    // re-spawning in a loop, while never dirtying or writing the persistent disk cache.
+                    self.transient_timeouts.insert(cache_key, entries);
+                    return (true, false);
+                }
+                self.transient_timeouts.remove(&cache_key);
+                let root = Self::root_exe(&cache_key).to_string();
+                let (resolved_exe, exe_fingerprint) =
+                    if resolved_exe.is_some() || exe_fingerprint.is_some() {
+                        let probed = resolved_exe.clone().zip(exe_fingerprint);
+                        self.verified_roots.insert(root, probed);
+                        (resolved_exe, exe_fingerprint)
+                    } else if let Some(Some((path, fp))) = self.verified_roots.get(&root) {
+                        (Some(path.clone()), Some(*fp))
+                    } else {
+                        (None, None)
+                    };
+                self.cache.insert(
+                    cache_key,
+                    CachedChainEntry {
+                        resolved_exe,
+                        exe_fingerprint,
+                        entries,
+                        verified: true,
+                    },
+                );
+                self.dirty = true;
+                (true, false)
+            }
+        }
     }
 
     /// Persists the cache to disk if and only if new entries were recorded.
@@ -1934,6 +2140,10 @@ impl Introspect for CliIntrospector {
     fn invalidate_command(&mut self, exe: &str) {
         CliIntrospector::invalidate_command(self, exe)
     }
+
+    fn query_ps_help(&mut self, cmd: &str, help_file: Option<&str>) -> Option<PsCmdHelp> {
+        CliIntrospector::query_ps_help(self, cmd, help_file)
+    }
 }
 
 fn maybe_spawn_ps_sync(
@@ -1952,6 +2162,7 @@ fn maybe_spawn_ps_sync(
     Some(rx)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_background_worker(
     rx: Receiver<BgRequest>,
     tx: Sender<BgResponse>,
@@ -1960,6 +2171,8 @@ fn spawn_background_worker(
     man_enabled: bool,
     runner: Arc<CommandRunner>,
     exe_probe: Arc<ExeProbe>,
+    ps_help_roots: Arc<[PathBuf]>,
+    ps_help_runner: Option<Arc<PsHelpRunner>>,
 ) {
     thread::spawn(move || {
         let mut stack: Vec<BgRequest> = Vec::new();
@@ -1975,33 +2188,70 @@ fn spawn_background_worker(
                 stack.push(newer);
             }
             if let Some(req) = stack.pop() {
-                let chain_refs: Vec<&str> = req.cmd_chain.iter().map(|s| s.as_str()).collect();
-                let outcome = introspect_cli_chain_with_fallbacks(
-                    &chain_refs,
-                    dialect,
-                    carapace_enabled,
-                    man_enabled,
-                    &*runner,
-                );
-                let (resolved_exe, exe_fingerprint) = if req.probe_exe && !outcome.timed_out {
-                    match chain_refs.first().and_then(|exe| exe_probe(exe, None)) {
-                        Some((path, fp)) => (Some(path), Some(fp)),
-                        None => (None, None),
+                let resp = match req {
+                    BgRequest::Chain {
+                        cache_key,
+                        cmd_chain,
+                        generation,
+                        probe_exe,
+                    } => {
+                        let chain_refs: Vec<&str> = cmd_chain.iter().map(|s| s.as_str()).collect();
+                        let outcome = introspect_cli_chain_with_fallbacks(
+                            &chain_refs,
+                            dialect,
+                            carapace_enabled,
+                            man_enabled,
+                            &*runner,
+                        );
+                        let (resolved_exe, exe_fingerprint) = if probe_exe && !outcome.timed_out {
+                            match chain_refs.first().and_then(|exe| exe_probe(exe, None)) {
+                                Some((path, fp)) => (Some(path), Some(fp)),
+                                None => (None, None),
+                            }
+                        } else {
+                            (None, None)
+                        };
+                        BgResponse::Chain {
+                            cache_key,
+                            entries: outcome.entries,
+                            resolved_exe,
+                            exe_fingerprint,
+                            timed_out: outcome.timed_out,
+                            generation,
+                        }
                     }
-                } else {
-                    (None, None)
+                    BgRequest::PsHelp {
+                        cmd_key,
+                        cmd_name,
+                        help_file,
+                    } => {
+                        let mut extra_entries = Vec::new();
+                        let mut help = lookup_ps_maml_help_in_dirs(
+                            &cmd_name,
+                            help_file.as_deref(),
+                            &ps_help_roots,
+                        )
+                        .map(|(h, xml_path)| {
+                            if let Some(file_map) = load_ps_maml_file_map(&xml_path) {
+                                extra_entries.extend(file_map);
+                            }
+                            h
+                        });
+                        if help.is_none() && dialect.is_powershell() {
+                            if let Some(ref ps_runner) = ps_help_runner {
+                                if let Some(json_str) = ps_runner(&cmd_name) {
+                                    help = parse_get_help_json(&json_str);
+                                }
+                            }
+                        }
+                        BgResponse::PsHelp {
+                            cmd_key,
+                            help,
+                            extra_entries,
+                        }
+                    }
                 };
-                if tx
-                    .send(BgResponse {
-                        cache_key: req.cache_key,
-                        entries: outcome.entries,
-                        resolved_exe,
-                        exe_fingerprint,
-                        timed_out: outcome.timed_out,
-                        generation: req.generation,
-                    })
-                    .is_err()
-                {
+                if tx.send(resp).is_err() {
                     break;
                 }
             }
@@ -2041,6 +2291,12 @@ fn entries_eq(a: &Entry, b: &Entry) -> bool {
         && a.role == b.role
         && a.desc == b.desc
         && a.parameter_sets == b.parameter_sets
+        && a.mandatory_sets == b.mandatory_sets
+        && a.position == b.position
+        && a.accepts_pipeline == b.accepts_pipeline
+        && a.accepts_pipeline_by_property_name == b.accepts_pipeline_by_property_name
+        && a.validate_range == b.validate_range
+        && a.help_file == b.help_file
         && a.aliases == b.aliases
         && a.has_literal == b.has_literal
         && a.children.len() == b.children.len()
@@ -2205,6 +2461,29 @@ where
         man_enabled,
         project_dir,
         None,
+        &[],
+        &adapter,
+    )
+}
+
+#[cfg(test)]
+fn inspect_command_chain_with_ps_help(
+    dialect: ShellDialect,
+    catalog: &[Entry],
+    raw_chain: &[String],
+    ps_help_roots: &[PathBuf],
+) -> anyhow::Result<InspectReport> {
+    let adapter = |_exe: &str, _args: &[&str]| CommandRunOutcome::Output(String::new());
+    inspect_command_chain_with_outcomes(
+        dialect,
+        catalog,
+        raw_chain,
+        None,
+        false,
+        false,
+        None,
+        None,
+        ps_help_roots,
         &adapter,
     )
 }
@@ -2219,6 +2498,7 @@ fn inspect_command_chain_with_outcomes<F>(
     man_enabled: bool,
     project_dir: Option<&Path>,
     precollected_path_dirs: Option<Arc<[PathBuf]>>,
+    ps_help_roots: &[PathBuf],
     runner: &F,
 ) -> anyhow::Result<InspectReport>
 where
@@ -2243,7 +2523,7 @@ where
         );
     }
 
-    let command = matched_root.map(|entry| {
+    let mut command = matched_root.map(|entry| {
         let mut clean = entry.clone();
         clean.children.clear();
         clean
@@ -2257,7 +2537,20 @@ where
         };
         if let Some(node) = target {
             if !node.children.is_empty() {
-                let mut entries = node.children.clone();
+                let mut enriched_node = node.clone();
+                if chain.len() == 1 && is_catalog_cmd && !ps_help_roots.is_empty() {
+                    if let Some((help, _)) = lookup_ps_maml_help_in_dirs(
+                        &root_entry.text,
+                        root_entry.help_file.as_deref(),
+                        ps_help_roots,
+                    ) {
+                        apply_ps_help_to_entry(&mut enriched_node, &help);
+                        if let Some(ref mut cmd_meta) = command {
+                            cmd_meta.desc = enriched_node.desc.clone();
+                        }
+                    }
+                }
+                let mut entries = enriched_node.children;
                 if let Some(dir) = project_dir {
                     merge_task_entries_front(
                         &mut entries,
@@ -2378,6 +2671,11 @@ pub fn inspect_command_chain(
     let man_enabled = is_man_fallback_enabled_in(&path_dirs);
     let project_dir = std::env::current_dir().ok();
     let runner = default_command_runner(Arc::clone(&path_dirs), timeout);
+    let ps_help_roots = if dialect.is_powershell() {
+        collect_ps_help_roots()
+    } else {
+        Vec::new()
+    };
     inspect_command_chain_with_outcomes(
         dialect,
         &catalog,
@@ -2387,6 +2685,7 @@ pub fn inspect_command_chain(
         man_enabled,
         project_dir.as_deref(),
         Some(path_dirs),
+        &ps_help_roots,
         &*runner,
     )
 }
@@ -4245,5 +4544,72 @@ Options:
         assert!(!persisted.contains_key("git"));
 
         let _ = fs::remove_file(&cache_path);
+    }
+
+    #[test]
+    fn test_lazy_ps_help_lookup_and_inspect_enriches_cmdlet_and_parameter_descriptions() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!("zpane_ps_help_it_{}_{nonce}", std::process::id()));
+        let help_dir = root.join("Mod").join("en-US");
+        fs::create_dir_all(&help_dir).unwrap();
+        let maml = r#"<?xml version="1.0" encoding="utf-8"?>
+<helpItems schema="maml" xmlns="http://msh">
+  <command:command xmlns:maml="http://schemas.microsoft.com/maml/2004/10" xmlns:command="http://schemas.microsoft.com/maml/dev/command/2004/10">
+    <command:details>
+      <command:name>Get-Widget</command:name>
+      <maml:description><maml:para>Retrieves widgets lazily.</maml:para></maml:description>
+    </command:details>
+    <maml:description><maml:para>Full widget documentation.</maml:para></maml:description>
+    <command:parameters>
+      <command:parameter>
+        <maml:name>Name</maml:name>
+        <maml:description><maml:para>Widget filter name.</maml:para></maml:description>
+      </command:parameter>
+    </command:parameters>
+  </command:command>
+</helpItems>"#;
+        fs::write(help_dir.join("Mod.dll-Help.xml"), maml).unwrap();
+
+        let mut introspector =
+            CliIntrospector::with_ps_help_roots(ShellDialect::PowerShell, vec![root.clone()], None);
+        // First query queues background MAML lookup and returns None immediately
+        assert!(introspector
+            .query_ps_help("Get-Widget", Some("Mod.dll-Help.xml"))
+            .is_none());
+        assert!(introspector.poll_blocking_ps_help());
+        let cached = introspector
+            .query_ps_help("Get-Widget", Some("Mod.dll-Help.xml"))
+            .expect("cached MAML help available after poll");
+        assert_eq!(cached.synopsis, "Retrieves widgets lazily.");
+        assert_eq!(
+            cached.params.get("name").map(String::as_str),
+            Some("Widget filter name.")
+        );
+
+        // Synchronous inspect enriches both command synopsis and parameter description
+        let mut cmd = Entry::new("Get-Widget", "Get-Widget", EntryKind::Cmdlet, "Module: Mod")
+            .with_help_file(Some("Mod.dll-Help.xml".to_string()));
+        cmd.children = vec![Entry::new(
+            "-Name",
+            "-Name",
+            EntryKind::Param,
+            "[String] Parameter -Name",
+        )];
+        let report = inspect_command_chain_with_ps_help(
+            ShellDialect::PowerShell,
+            &[cmd],
+            &["Get-Widget".to_string()],
+            std::slice::from_ref(&root),
+        )
+        .expect("inspect succeeds");
+        let cmd_out = report.command.expect("command metadata");
+        assert!(cmd_out.desc.contains("Retrieves widgets lazily."));
+        assert!(cmd_out.desc.contains("Full widget documentation."));
+        assert_eq!(report.entries[0].desc, "[String] Widget filter name.");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

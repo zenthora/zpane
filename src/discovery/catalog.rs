@@ -5,8 +5,11 @@ use super::powershell::{
 use super::project_tasks::{discover_project_task_specs, merge_task_entries_front};
 use super::shell_rc::{collect_shell_rc_files, parse_posix_fish_definitions};
 use super::specs::{is_spec_filename, parse_spec_str, spec_search_dirs};
-use crate::model::{Entry, EntryKind, RuntimeContext};
-use crate::sanitize::{contains_ignore_ascii_case, is_disallowed_control, sanitize_single_line};
+use crate::model::{sanitize_variable_token, Entry, EntryKind, RuntimeContext};
+use crate::sanitize::{
+    contains_ignore_ascii_case, is_disallowed_control, sanitize_single_line,
+    strip_help_text_escapes,
+};
 use crate::shell::quote_single_for_dialect;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -806,6 +809,14 @@ where
     root
 }
 
+const MAX_SESSION_VARS: usize = 256;
+const MAX_SESSION_FUNCS: usize = 512;
+
+fn sanitize_context_single_line(raw: &str) -> String {
+    let stripped = strip_help_text_escapes(raw);
+    sanitize_single_line(stripped.trim()).trim().to_string()
+}
+
 fn build_var_scope_entry(dialect: ShellDialect, ctx: &RuntimeContext) -> Entry {
     let (label, desc) = match dialect {
         ShellDialect::PowerShell => (
@@ -838,6 +849,42 @@ fn build_var_scope_entry(dialect: ShellDialect, ctx: &RuntimeContext) -> Entry {
             );
         }
     }
+
+    if !ctx.session_vars.is_empty() {
+        let mut seen_vars: HashSet<String> = root
+            .children
+            .iter()
+            .map(|c| c.text.to_ascii_lowercase())
+            .collect();
+        for sv in ctx.session_vars.iter().take(MAX_SESSION_VARS) {
+            let raw_name = sv.name.trim();
+            if raw_name.is_empty() {
+                continue;
+            }
+            let candidate_tok = if raw_name.starts_with('$') {
+                Cow::Borrowed(raw_name)
+            } else {
+                Cow::Owned(format!("${raw_name}"))
+            };
+            let Some(safe_tok) = sanitize_variable_token(candidate_tok.as_ref(), dialect) else {
+                continue;
+            };
+            if !seen_vars.insert(safe_tok.to_ascii_lowercase()) {
+                continue;
+            }
+            let clean_val = sanitize_context_single_line(&sv.value);
+            let var_label = if clean_val.is_empty() {
+                safe_tok.clone()
+            } else {
+                format!("{safe_tok} ({clean_val})")
+            };
+            root.children.push(
+                Entry::new(&safe_tok, var_label, EntryKind::Var, &clean_val)
+                    .with_literal(!clean_val.is_empty()),
+            );
+        }
+    }
+
     for child in &mut root.children {
         let tok = child.text.clone();
         let val = sanitize_single_line(&child.desc).into_owned();
@@ -998,6 +1045,34 @@ pub(super) fn load_catalog_with_context(
         if let std::collections::hash_map::Entry::Vacant(e) = ps_map.entry(key.clone()) {
             ps_order.push(key);
             e.insert(def);
+        }
+    }
+
+    for sf in ctx.session_funcs.iter().take(MAX_SESSION_FUNCS) {
+        let clean_name = sanitize_context_single_line(&sf.name);
+        if !is_safe_command_token(&clean_name) {
+            continue;
+        }
+        let key = clean_name.to_ascii_lowercase();
+        if disabled.contains(&key) {
+            continue;
+        }
+        let clean_desc = sanitize_context_single_line(&sf.desc);
+        let desc = if clean_desc.is_empty() {
+            "Session function".to_string()
+        } else {
+            clean_desc
+        };
+        match ps_map.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                ps_order.push(key);
+                e.insert(Entry::new(&clean_name, &clean_name, EntryKind::Func, desc));
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if e.get().desc.is_empty() || e.get().desc == "PowerShell Func" {
+                    e.get_mut().desc = desc;
+                }
+            }
         }
     }
 
@@ -1383,19 +1458,19 @@ mod tests {
                 name: "myfn".to_string(),
                 kind: "Func".to_string(),
                 desc: "Profile function".to_string(),
-                params: vec![],
+                ..PsCommandExport::default()
             },
             PsCommandExport {
                 name: "Get-Item".to_string(),
                 kind: "Cmdlet".to_string(),
                 desc: "Module: Microsoft.PowerShell.Management".to_string(),
-                params: vec![],
+                ..PsCommandExport::default()
             },
             PsCommandExport {
                 name: "git".to_string(),
                 kind: "CLI".to_string(),
                 desc: "Shadowed by PATH git".to_string(),
-                params: vec![],
+                ..PsCommandExport::default()
             },
         ];
 
@@ -1487,6 +1562,7 @@ commands:
                 "git status".to_string(),
                 "cargo test --locked".to_string(),
             ],
+            ..RuntimeContext::default()
         };
 
         let catalog = load_catalog_with_context(ShellDialect::PowerShell, &fake, &ctx);
@@ -2035,5 +2111,90 @@ commands:
         assert!(just.children.iter().any(|c| c.text == "build"));
 
         let _ = fs::remove_dir_all(&proj_dir);
+    }
+
+    #[test]
+    fn test_runtime_context_session_vars_and_funcs_surface_in_scope_and_catalog() {
+        use crate::model::{SessionFunc, SessionVar};
+
+        let fake = FakeEnv {
+            vars: vec![],
+            path_dirs: vec![],
+            bins: HashMap::new(),
+            ps_metadata: None,
+            specs: vec![],
+            user_config: UserConfig::default(),
+            shell_rc: Vec::new(),
+        };
+        let ctx = RuntimeContext {
+            session_vars: vec![
+                SessionVar {
+                    name: "myToken".to_string(),
+                    value: "abc 123\x1b[31m".to_string(),
+                },
+                SessionVar {
+                    name: "$alreadyPrefixed".to_string(),
+                    value: "val".to_string(),
+                },
+                SessionVar {
+                    name: "bad; $(evil)".to_string(),
+                    value: "nope".to_string(),
+                },
+                SessionVar {
+                    name: "PWD".to_string(),
+                    value: "duplicate_builtin".to_string(),
+                },
+            ],
+            session_funcs: vec![
+                SessionFunc {
+                    name: "Invoke-MyHelper".to_string(),
+                    desc: "Live helper\x1b[0m".to_string(),
+                },
+                SessionFunc {
+                    name: "bad func; rm -rf".to_string(),
+                    desc: "hostile".to_string(),
+                },
+            ],
+            ..RuntimeContext::default()
+        };
+
+        let catalog = load_catalog_with_context(ShellDialect::PowerShell, &fake, &ctx);
+
+        let var_scope = catalog
+            .iter()
+            .find(|e| e.is_scope_root() && e.text == "$")
+            .expect("$ scope root");
+        let my_token = var_scope
+            .children
+            .iter()
+            .find(|c| c.text == "$myToken")
+            .expect("$myToken in $ scope");
+        assert_eq!(my_token.desc, "abc 123");
+        assert!(my_token.children.iter().any(|c| c.text == "$myToken"));
+        assert!(my_token
+            .children
+            .iter()
+            .any(|c| c.text == "'abc 123'" && c.kind == EntryKind::Value));
+
+        assert!(var_scope
+            .children
+            .iter()
+            .any(|c| c.text == "$alreadyPrefixed"));
+        assert!(!var_scope.children.iter().any(|c| c.text.contains("evil")));
+        assert_eq!(
+            var_scope
+                .children
+                .iter()
+                .filter(|c| c.text.eq_ignore_ascii_case("$PWD"))
+                .count(),
+            1
+        );
+
+        let fn_entry = catalog
+            .iter()
+            .find(|e| e.text == "Invoke-MyHelper" && e.kind == EntryKind::Func)
+            .expect("session function in Pane 1");
+        assert_eq!(fn_entry.desc, "Live helper");
+        assert!(!catalog.iter().any(|e| e.text.contains("rm -rf")));
     }
 }

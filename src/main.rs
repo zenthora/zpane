@@ -184,7 +184,7 @@ Options:
       --init <SHELL>         Print shell integration snippet (`pwsh`, `zsh`, `bash`, `fish`) and exit
       --inspect <CMD>        Inspect a command or subcommand chain non-interactively and exit
       --json                 Emit machine-readable JSON for non-interactive commands
-      --sync-ps              Sync PowerShell cmdlet & parameter metadata (requires pwsh) and exit
+      --sync-ps              Sync PowerShell cmdlet & parameter metadata (pwsh or powershell.exe) and exit
       --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
       --clear-cache          Delete persisted CLI help & PowerShell metadata cache files and exit
   -h, --help                 Print help
@@ -241,7 +241,25 @@ fn render_shell_init(target: ShellInitTarget) -> &'static str {
                 [array]::Reverse($recent)
             }
         }
-        $ctxPayload = @{ history = @($recent) } | ConvertTo-Json -Compress
+        $sVars = @(Get-Variable -Scope Global -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match '^[A-Za-z_][A-Za-z0-9_]*$' -and
+            $_.Name -notmatch '^(PWD|HOME|PROFILE|PID|PSVersionTable|PSHOME|PSUICulture|PSCulture|ExecutionContext|Host|MyInvocation|PSBoundParameters|PSCmdlet|PSCommandPath|PSScriptRoot|Sender|Event|EventArgs|EventSubscriber|SourceArgs|SourceEventArgs|Matches|LastExitCode|Error|StackTrace|Input|Args|OFS|ConfirmPreference|DebugPreference|ErrorActionPreference|InformationPreference|ProgressPreference|VerbosePreference|WarningPreference|WhatIfPreference|FormatEnumerationLimit|MaximumHistoryCount|OutputEncoding|NestedPromptLevel|ShellId|true|false|null|_)$' -and
+            ($_.Value -is [string] -or $_.Value -is [ValueType])
+        } | Select-Object -First 64 | ForEach-Object {
+            $vStr = ("$($_.Value)" -replace '[\r\n]+', ' ')
+            if ($vStr.Length -gt 120) { $vStr = $vStr.Substring(0, 120) }
+            @{ name = $_.Name; value = $vStr }
+        })
+        $sFuncs = @(Get-ChildItem Function: -ErrorAction SilentlyContinue | Where-Object {
+            -not $_.ModuleName -and $_.Name -notmatch '^([A-Za-z]:|__|TabExpansion|Prompt|Clear-Host|more|oss|help|Pause|cd\.\.|cd\\)$'
+        } | Select-Object -First 128 | ForEach-Object {
+            @{ name = $_.Name; desc = 'Session function' }
+        })
+        $ctxPayload = @{
+            history       = @($recent)
+            session_vars  = @($sVars)
+            session_funcs = @($sFuncs)
+        } | ConvertTo-Json -Depth 4 -Compress
         [System.IO.File]::WriteAllText($ctxFile, $ctxPayload, [System.Text.UTF8Encoding]::new($false))
 
         if (-not [string]::IsNullOrEmpty($line)) {
@@ -517,6 +535,12 @@ fn merge_runtime_context(base: &mut RuntimeContext, incoming: RuntimeContext) {
     }
     if !incoming.history.is_empty() {
         base.history.extend(incoming.history);
+    }
+    if !incoming.session_vars.is_empty() {
+        base.session_vars.extend(incoming.session_vars);
+    }
+    if !incoming.session_funcs.is_empty() {
+        base.session_funcs.extend(incoming.session_funcs);
     }
 }
 
@@ -947,11 +971,15 @@ fn main() -> anyhow::Result<()> {
                 }
                 // PowerShell is optional on Linux / Termux: only a hard error when explicitly requested.
                 Err(e) if !warm => {
-                    return Err(e.context("PowerShell metadata sync failed (is `pwsh` on PATH?)"));
+                    return Err(e.context(
+                        "PowerShell metadata sync failed (is `pwsh` or `powershell.exe` on PATH?)",
+                    ));
                 }
                 Err(_) => {
                     if !json {
-                        eprintln!("Skipping PowerShell metadata sync (`pwsh` not available).");
+                        eprintln!(
+                            "Skipping PowerShell metadata sync (`pwsh` / `powershell.exe` not available)."
+                        );
                     }
                     0
                 }
@@ -1205,6 +1233,7 @@ mod tests {
                         is_dir: true,
                     }],
                     history: vec!["git status".to_string(), "cargo test --locked".to_string()],
+                    ..RuntimeContext::default()
                 },
             })
         );
@@ -1911,5 +1940,31 @@ borders = "plain"
         assert!(frame.contains("┌"));
         assert!(frame.contains("> git"));
         assert!(!frame.contains("\x1b[38;5;"));
+    }
+
+    #[test]
+    fn test_pwsh_shell_init_and_context_merge_include_session_vars_and_funcs() {
+        let init = render_shell_init(ShellInitTarget::Pwsh);
+        assert!(init.contains("session_vars"));
+        assert!(init.contains("session_funcs"));
+        assert!(init.contains("--context-file"));
+        assert!(init.contains("ConvertTo-Json -Depth 4 -Compress"));
+
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+        let parsed = parse_cli_args(&s(&[
+            "--context",
+            r#"{"session_vars":[{"name":"apiUrl","value":"https://example.test"}],"session_funcs":[{"name":"Invoke-Local","desc":"Custom"}]}"#,
+        ]))
+        .expect("parse context with session vars/funcs");
+
+        match parsed {
+            CliCommand::Interactive(opts) => {
+                assert_eq!(opts.runtime_context.session_vars.len(), 1);
+                assert_eq!(opts.runtime_context.session_vars[0].name, "apiUrl");
+                assert_eq!(opts.runtime_context.session_funcs.len(), 1);
+                assert_eq!(opts.runtime_context.session_funcs[0].name, "Invoke-Local");
+            }
+            other => panic!("expected Interactive, got {other:?}"),
+        }
     }
 }

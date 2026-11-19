@@ -21,4 +21,5 @@ pub use introspect::{
     clear_disk_cache, inspect_command_chain, inspect_command_chain_with, warm_cli_cache,
     CliIntrospector, CommandRunOutcome, InspectReport, Introspect, PollResult,
 };
-pub use powershell::sync_powershell_metadata;
+pub(crate) use powershell::apply_ps_help_to_entry;
+pub use powershell::{sync_powershell_metadata, PsCmdHelp};

@@ -89,6 +89,22 @@ pub struct CwdEntry {
     pub is_dir: bool,
 }
 
+/// A live shell session variable captured from the host shell (e.g. PowerShell session vars).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionVar {
+    pub name: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// A live shell session function captured from the host shell (e.g. PowerShell `Function:` drive).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionFunc {
+    pub name: String,
+    #[serde(default)]
+    pub desc: String,
+}
+
 /// Dynamic runtime context captured from the host shell wrapper and/or working directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeContext {
@@ -104,6 +120,12 @@ pub struct RuntimeContext {
     /// Recent shell session commands (newest first) surfaced at the top of Pane 1.
     #[serde(default)]
     pub history: Vec<String>,
+    /// Live session variables captured from the host shell (surfaced in the `$` Scope Root).
+    #[serde(default)]
+    pub session_vars: Vec<SessionVar>,
+    /// Live session functions captured from the host shell (surfaced in Pane 1).
+    #[serde(default)]
+    pub session_funcs: Vec<SessionFunc>,
 }
 
 #[inline]
@@ -336,6 +358,18 @@ pub struct Entry {
     #[serde(default)]
     pub parameter_sets: Vec<String>,
     #[serde(default)]
+    pub mandatory_sets: Vec<String>,
+    #[serde(default)]
+    pub position: Option<i32>,
+    #[serde(default)]
+    pub accepts_pipeline: bool,
+    #[serde(default)]
+    pub accepts_pipeline_by_property_name: bool,
+    #[serde(default)]
+    pub validate_range: Option<String>,
+    #[serde(default)]
+    pub help_file: Option<String>,
+    #[serde(default)]
     pub aliases: Vec<String>,
     #[serde(default)]
     pub has_literal: bool,
@@ -356,6 +390,12 @@ impl Entry {
             desc: desc.into(),
             children: Vec::new(),
             parameter_sets: Vec::new(),
+            mandatory_sets: Vec::new(),
+            position: None,
+            accepts_pipeline: false,
+            accepts_pipeline_by_property_name: false,
+            validate_range: None,
+            help_file: None,
             aliases: Vec::new(),
             has_literal: false,
         }
@@ -383,6 +423,69 @@ impl Entry {
     pub fn with_parameter_sets(mut self, sets: Vec<String>) -> Self {
         self.parameter_sets = sets;
         self
+    }
+
+    pub fn with_mandatory_sets(mut self, sets: Vec<String>) -> Self {
+        self.mandatory_sets = sets;
+        self
+    }
+
+    pub fn with_position(mut self, position: Option<i32>) -> Self {
+        self.position = position;
+        self
+    }
+
+    pub fn with_pipeline(
+        mut self,
+        accepts_pipeline: bool,
+        accepts_pipeline_by_property_name: bool,
+    ) -> Self {
+        self.accepts_pipeline = accepts_pipeline;
+        self.accepts_pipeline_by_property_name = accepts_pipeline_by_property_name;
+        self
+    }
+
+    pub fn with_validate_range(mut self, range: Option<String>) -> Self {
+        self.validate_range = range;
+        self
+    }
+
+    pub fn with_help_file(mut self, help_file: Option<String>) -> Self {
+        self.help_file = help_file;
+        self
+    }
+
+    /// Returns `true` when this Entry is mandatory in `active_sets` (or in at least one
+    /// Parameter Set when `active_sets` is `None` or empty).
+    pub fn is_mandatory_for_sets(&self, active_sets: Option<&HashSet<String>>) -> bool {
+        if self.mandatory_sets.is_empty() {
+            return false;
+        }
+        if self.mandatory_sets.iter().any(|s| s == ALL_PARAMETER_SETS) {
+            return true;
+        }
+        match active_sets {
+            Some(sets) if !sets.is_empty() => self.mandatory_sets.iter().any(|m| sets.contains(m)),
+            _ => true,
+        }
+    }
+
+    /// Returns `true` when this Entry is mandatory for the comma-separated active Parameter
+    /// Set display label used in [`RenderState`].
+    pub fn is_mandatory_for_set_label(&self, active_label: Option<&str>) -> bool {
+        if self.mandatory_sets.is_empty() {
+            return false;
+        }
+        if self.mandatory_sets.iter().any(|s| s == ALL_PARAMETER_SETS) {
+            return true;
+        }
+        match active_label.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(label) => self
+                .mandatory_sets
+                .iter()
+                .any(|m| label.split(", ").any(|s| s == m)),
+            None => true,
+        }
     }
 
     pub fn with_aliases(mut self, aliases: Vec<String>) -> Self {
@@ -533,11 +636,12 @@ impl Entry {
 
     /// Returns this Entry's Pane 2 children narrowed to the active Parameter Sets implied
     /// by `tokens`, along with a sorted display label for the active Parameter Set(s).
+    /// Mandatory Parameters for the active Parameter Set(s) are stably prioritized first.
     pub fn children_for_tokens(&self, tokens: &[String]) -> (Vec<Entry>, Option<String>) {
         let active_sets = self.active_parameter_sets(tokens);
         let label = active_sets.as_ref().map(format_parameter_set_label);
 
-        if let Some(sets) = active_sets {
+        let mut out = if let Some(ref sets) = active_sets {
             let mut filtered = Vec::with_capacity(self.children.len());
             for p in &self.children {
                 if p.parameter_sets.is_empty()
@@ -548,12 +652,21 @@ impl Entry {
                     filtered.push(p.clone());
                 }
             }
-            if !filtered.is_empty() {
-                return (filtered, label);
+            if filtered.is_empty() {
+                self.children.clone()
+            } else {
+                filtered
             }
+        } else {
+            self.children.clone()
+        };
+
+        if out.iter().any(|p| !p.mandatory_sets.is_empty()) {
+            let sets_ref = active_sets.as_ref();
+            out.sort_by_key(|p| !p.is_mandatory_for_sets(sets_ref));
         }
 
-        (self.children.clone(), label)
+        (out, label)
     }
 }
 
@@ -646,6 +759,7 @@ mod tests {
                 },
             ],
             history: vec!["cargo test".to_string()],
+            ..RuntimeContext::default()
         };
 
         let branches = ctx.git_branch_entries();
@@ -810,6 +924,7 @@ mod tests {
             git_branches,
             cwd_entries,
             history: Vec::new(),
+            ..RuntimeContext::default()
         };
 
         // PowerShell dialect
@@ -1014,5 +1129,71 @@ mod tests {
         assert_eq!(label.as_deref(), Some("PathForce"));
         let names: Vec<&str> = children.iter().map(|e| e.text.as_str()).collect();
         assert_eq!(names, vec!["-Path", "-Force"]);
+    }
+
+    #[test]
+    fn test_entry_and_runtime_context_backward_compat_and_dynamic_mandatory_sorting() {
+        // 1. Legacy JSON without new CLR metadata / session fields deserializes cleanly
+        let legacy_entry_json = r#"{"text":"-Name","label":"-Name","kind":"Param","desc":"d"}"#;
+        let legacy_entry: Entry =
+            serde_json::from_str(legacy_entry_json).expect("deserialize legacy Entry");
+        assert!(legacy_entry.mandatory_sets.is_empty());
+        assert_eq!(legacy_entry.position, None);
+        assert!(!legacy_entry.accepts_pipeline);
+        assert!(!legacy_entry.accepts_pipeline_by_property_name);
+        assert_eq!(legacy_entry.validate_range, None);
+        assert_eq!(legacy_entry.help_file, None);
+        assert!(!legacy_entry.is_mandatory_for_sets(None));
+
+        let legacy_ctx_json = r#"{"git_branch":"main","history":["ls"]}"#;
+        let legacy_ctx: RuntimeContext =
+            serde_json::from_str(legacy_ctx_json).expect("deserialize legacy RuntimeContext");
+        assert!(legacy_ctx.session_vars.is_empty());
+        assert!(legacy_ctx.session_funcs.is_empty());
+
+        // 2. Parameter mandatory in SetA but optional in SetB updates dynamically and sorts first
+        let mut cmd = Entry::new("Invoke-Thing", "Invoke-Thing", EntryKind::Cmdlet, "");
+        cmd.children = vec![
+            Entry::new("-OptionalFirst", "-OptionalFirst", EntryKind::Param, "")
+                .with_parameter_sets(vec!["__AllParameterSets".to_string()]),
+            Entry::new("-Target", "-Target", EntryKind::Param, "")
+                .with_parameter_sets(vec!["SetA".to_string(), "SetB".to_string()])
+                .with_mandatory_sets(vec!["SetA".to_string()])
+                .with_position(Some(0))
+                .with_pipeline(true, false)
+                .with_validate_range(Some("1..10".to_string())),
+            Entry::new("-ModeA", "-ModeA", EntryKind::Flag, "")
+                .with_parameter_sets(vec!["SetA".to_string()]),
+            Entry::new("-ModeB", "-ModeB", EntryKind::Flag, "")
+                .with_parameter_sets(vec!["SetB".to_string()])
+                .with_mandatory_sets(vec!["SetB".to_string()]),
+        ];
+
+        // When no parameter set is active yet, mandatory params sort ahead of optional ones
+        let (initial, _) = cmd.children_for_tokens(&["Invoke-Thing".to_string()]);
+        let initial_names: Vec<&str> = initial.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            initial_names,
+            vec!["-Target", "-ModeB", "-OptionalFirst", "-ModeA"]
+        );
+
+        // Selecting -ModeB narrows to SetB: -Target is now optional in SetB, -ModeB stays mandatory
+        let (set_b, label_b) =
+            cmd.children_for_tokens(&["Invoke-Thing".to_string(), "-ModeB".to_string()]);
+        assert_eq!(label_b.as_deref(), Some("SetB"));
+        let set_b_names: Vec<&str> = set_b.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(set_b_names, vec!["-ModeB", "-OptionalFirst", "-Target"]);
+        let b_sets: HashSet<String> = ["SetB".to_string()].into_iter().collect();
+        assert!(!set_b[2].is_mandatory_for_sets(Some(&b_sets)));
+        assert!(set_b[0].is_mandatory_for_sets(Some(&b_sets)));
+
+        // Selecting -ModeA narrows to SetA: -Target is mandatory in SetA and sorts first
+        let (set_a, label_a) =
+            cmd.children_for_tokens(&["Invoke-Thing".to_string(), "-ModeA".to_string()]);
+        assert_eq!(label_a.as_deref(), Some("SetA"));
+        let set_a_names: Vec<&str> = set_a.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(set_a_names, vec!["-Target", "-OptionalFirst", "-ModeA"]);
+        let a_sets: HashSet<String> = ["SetA".to_string()].into_iter().collect();
+        assert!(set_a[0].is_mandatory_for_sets(Some(&a_sets)));
     }
 }

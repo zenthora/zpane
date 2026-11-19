@@ -325,6 +325,7 @@ pub struct UserConfig {
     pub disabled_tools: Vec<String>,
     pub history_limit: Option<usize>,
     pub introspect_timeout_ms: Option<u64>,
+    pub sync_profile: bool,
     pub ui: UiConfig,
     pub keybindings: KeybindingsConfig,
 }
@@ -573,6 +574,14 @@ fn parse_toml_u64(raw: &str) -> Option<u64> {
     }
 }
 
+fn parse_toml_bool(raw: &str) -> Option<bool> {
+    match raw.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_keybinding_chords(raw: &str) -> Result<Vec<KeyChord>, String> {
     let trimmed = raw.trim();
     let items = if trimmed.starts_with('[') {
@@ -674,6 +683,14 @@ fn apply_config_entry(
                             "Invalid integer for 'introspect_timeout_ms': {}",
                             val.trim()
                         ),
+                    ),
+                },
+                "sync_profile" if allow_discovery => match parse_toml_bool(val) {
+                    Some(b) => cfg.sync_profile = b,
+                    None => push_diag(
+                        diags,
+                        line_no,
+                        format!("Invalid boolean for 'sync_profile': {}", val.trim()),
                     ),
                 },
                 "theme" if allow_ui => match parse_toml_string_literal(val) {
@@ -1310,5 +1327,26 @@ toggle_inspector = "ctrl+badkey"
             manual_high.effective_introspect_timeout(),
             Duration::from_millis(10_000)
         );
+    }
+
+    #[test]
+    fn test_sync_profile_parsing_and_diagnostics() {
+        assert!(!UserConfig::default().sync_profile);
+
+        let (top_true, top_diags) =
+            parse_user_config_toml_with_diagnostics("sync_profile = true\n");
+        assert!(top_diags.is_empty(), "unexpected diags: {top_diags:?}");
+        assert!(top_true.sync_profile);
+
+        let (disc_false, disc_diags) =
+            parse_user_config_toml_with_diagnostics("[discovery]\nsync_profile = false\n");
+        assert!(disc_diags.is_empty(), "unexpected diags: {disc_diags:?}");
+        assert!(!disc_false.sync_profile);
+
+        let (bad_cfg, bad_diags) = parse_user_config_toml_with_diagnostics(
+            "sync_profile = \"true\"\n[ui]\nsync_profile = true\n[discovery]\nsync_profile = yes\n",
+        );
+        assert!(!bad_cfg.sync_profile);
+        assert_eq!(bad_diags.len(), 3);
     }
 }

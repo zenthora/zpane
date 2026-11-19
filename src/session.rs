@@ -1,5 +1,6 @@
 use crate::discovery::{
-    BindableAction, CliIntrospector, Introspect, KeybindingsConfig, ShellDialect, UiConfig, UiStyle,
+    apply_ps_help_to_entry, BindableAction, CliIntrospector, Introspect, KeybindingsConfig,
+    PsCmdHelp, ShellDialect, UiConfig, UiStyle,
 };
 use crate::fuzzy::PaneList;
 use crate::model::{
@@ -1072,6 +1073,8 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     last_p1_identity: Option<(String, EntryKind)>,
     last_p2_text: Option<String>,
     last_inspected_identity: Option<(String, EntryKind)>,
+    ps_help_requested: HashSet<String>,
+    ps_help_applied: HashSet<String>,
     skip_child_filter_clear_once: bool,
     introspector: I,
     catalog_loader: Option<CatalogLoader>,
@@ -1116,6 +1119,8 @@ impl<I: Introspect> MillerSession<I> {
             last_p1_identity: None,
             last_p2_text: None,
             last_inspected_identity: None,
+            ps_help_requested: HashSet::new(),
+            ps_help_applied: HashSet::new(),
             skip_child_filter_clear_once: false,
             introspector,
             catalog_loader: None,
@@ -1253,6 +1258,9 @@ impl<I: Introspect> MillerSession<I> {
         if let Some(entries) = poll.catalog_reloaded {
             self.apply_catalog_update(entries);
         }
+        if poll.ps_help_updated {
+            self.drain_ps_help_updates();
+        }
         if poll.introspected {
             self.invalidate_loading_panes();
         }
@@ -1261,7 +1269,82 @@ impl<I: Introspect> MillerSession<I> {
         true
     }
 
+    fn apply_ps_help_to_pane1(&mut self, cmd_key: &str, help: &PsCmdHelp) {
+        let prev_p1 = self
+            .selected_entry(Pane::First)
+            .map(|e| (e.text.clone(), e.kind));
+        let mut entries = self.panes[0].entries().to_vec();
+        let mut changed = false;
+        for e in &mut entries {
+            if matches!(
+                e.kind,
+                EntryKind::Cmdlet | EntryKind::Func | EntryKind::Alias
+            ) && e.text.eq_ignore_ascii_case(cmd_key)
+            {
+                apply_ps_help_to_entry(e, help);
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.panes[0].set_entries(entries);
+        if let Some((txt, kind)) = prev_p1 {
+            self.panes[0].select_first_matching(|e| e.text == txt && e.kind == kind);
+        }
+        self.pane2_cache_stale = true;
+        self.dirty = true;
+    }
+
+    fn maybe_request_ps_help(&mut self) {
+        if !self.dialect.is_powershell() {
+            return;
+        }
+        let Some((cmd_name, help_file)) = self.panes[0]
+            .selected()
+            .filter(|p1| {
+                matches!(
+                    p1.kind,
+                    EntryKind::Cmdlet | EntryKind::Func | EntryKind::Alias
+                )
+            })
+            .map(|p1| (p1.text.clone(), p1.help_file.clone()))
+        else {
+            return;
+        };
+        let key = cmd_name.to_ascii_lowercase();
+        if self.ps_help_applied.contains(&key) {
+            return;
+        }
+        if let Some(help) = self
+            .introspector
+            .query_ps_help(&cmd_name, help_file.as_deref())
+        {
+            self.apply_ps_help_to_pane1(&key, &help);
+            self.ps_help_requested.remove(&key);
+            self.ps_help_applied.insert(key);
+        } else {
+            self.ps_help_requested.insert(key);
+        }
+    }
+
+    fn drain_ps_help_updates(&mut self) {
+        if !self.dialect.is_powershell() || self.ps_help_requested.is_empty() {
+            return;
+        }
+        let pending: Vec<String> = self.ps_help_requested.iter().cloned().collect();
+        for key in pending {
+            if let Some(help) = self.introspector.query_ps_help(&key, None) {
+                self.apply_ps_help_to_pane1(&key, &help);
+                self.ps_help_requested.remove(&key);
+                self.ps_help_applied.insert(key);
+            }
+        }
+    }
+
     fn apply_catalog_update(&mut self, mut entries: Vec<Entry>) {
+        self.ps_help_requested.clear();
+        self.ps_help_applied.clear();
         sanitize_catalog_entries(&mut entries, self.dialect, &self.runtime_ctx);
         let prev_p1 = self
             .selected_entry(Pane::First)
@@ -1355,6 +1438,9 @@ impl<I: Introspect> MillerSession<I> {
             UserAction::ToggleInspector => {
                 self.inspector_expanded = !self.inspector_expanded;
                 self.inspector_scroll = 0;
+                if self.inspector_expanded {
+                    self.maybe_request_ps_help();
+                }
                 self.dirty = true;
                 return SessionOutcome::Continue;
             }
@@ -1450,8 +1536,12 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn scroll_inspector(&mut self, action: &UserAction) {
-        let max_scroll =
-            expanded_inspector_max_scroll(self.inspected_entry(), self.viewport, self.ui_style);
+        let max_scroll = expanded_inspector_max_scroll(
+            self.inspected_entry(),
+            self.active_param_set_label.as_deref(),
+            self.viewport,
+            self.ui_style,
+        );
         let page = self.viewport.rows(Pane::First).max(1);
         let prev = self.inspector_scroll.min(max_scroll);
         let next = match action {
@@ -1931,6 +2021,7 @@ impl<I: Introspect> MillerSession<I> {
     }
 
     fn sync_panes(&mut self) {
+        self.maybe_request_ps_help();
         for _ in 0..16 {
             let cur_p1_idx = self.panes[0].selected_source_idx();
             let cur_p2_idx = self.sync_pane2(cur_p1_idx);
@@ -2187,8 +2278,12 @@ impl<I: Introspect> MillerSession<I> {
             self.last_inspected_identity = inspected;
             self.inspector_scroll = 0;
         } else if self.inspector_expanded && self.inspector_scroll > 0 {
-            let max_scroll =
-                expanded_inspector_max_scroll(self.inspected_entry(), self.viewport, self.ui_style);
+            let max_scroll = expanded_inspector_max_scroll(
+                self.inspected_entry(),
+                self.active_param_set_label.as_deref(),
+                self.viewport,
+                self.ui_style,
+            );
             self.inspector_scroll = self.inspector_scroll.min(max_scroll);
         }
     }
@@ -2293,6 +2388,7 @@ mod tests {
             PollResult {
                 introspected,
                 catalog_reloaded,
+                ps_help_updated: false,
             }
         }
 
@@ -2985,6 +3081,7 @@ mod tests {
                 is_dir: false,
             }],
             history: vec![],
+            ..RuntimeContext::default()
         };
 
         let mut session = MillerSession::new(
@@ -5021,5 +5118,148 @@ confirm = "ctrl+y"
         assert_eq!(session.view().panes[0].sel_idx(), 1);
         session.apply(UserAction::ToggleInspector);
         assert_eq!(session.view().inspector_scroll, 0);
+    }
+
+    #[test]
+    fn test_session_dynamic_mandatory_sets_and_lazy_ps_help_enrichment() {
+        use crate::discovery::PsCmdHelp;
+
+        let ps_help_map: Rc<RefCell<HashMap<String, PsCmdHelp>>> = Default::default();
+        let ps_help_pending: Rc<RefCell<Vec<String>>> = Default::default();
+
+        struct PsHelpFake {
+            available: HashMap<String, PsCmdHelp>,
+            ready: Rc<RefCell<HashMap<String, PsCmdHelp>>>,
+            pending: Rc<RefCell<Vec<String>>>,
+        }
+
+        impl Introspect for PsHelpFake {
+            fn query(&mut self, _chain: &[&str]) -> Vec<Entry> {
+                Vec::new()
+            }
+            fn poll_updates(&mut self) -> PollResult {
+                let mut pend = self.pending.borrow_mut();
+                if pend.is_empty() {
+                    return PollResult::default();
+                }
+                let mut ready = self.ready.borrow_mut();
+                let mut updated = false;
+                for k in pend.drain(..) {
+                    if let Some(h) = self.available.get(&k) {
+                        ready.insert(k, h.clone());
+                        updated = true;
+                    }
+                }
+                PollResult {
+                    introspected: false,
+                    catalog_reloaded: None,
+                    ps_help_updated: updated,
+                }
+            }
+            fn flush(&mut self) -> bool {
+                false
+            }
+            fn query_ps_help(&mut self, cmd: &str, _help_file: Option<&str>) -> Option<PsCmdHelp> {
+                let k = cmd.to_ascii_lowercase();
+                if let Some(h) = self.ready.borrow().get(&k) {
+                    return Some(h.clone());
+                }
+                let mut pend = self.pending.borrow_mut();
+                if !pend.contains(&k) {
+                    pend.push(k);
+                }
+                None
+            }
+        }
+
+        let mut cmd = Entry::new(
+            "Invoke-Demo",
+            "Invoke-Demo",
+            EntryKind::Cmdlet,
+            "Module: Demo",
+        );
+        cmd.children = vec![
+            Entry::new(
+                "-Optional",
+                "-Optional",
+                EntryKind::Param,
+                "[String] Parameter -Optional",
+            )
+            .with_parameter_sets(vec!["__AllParameterSets".to_string()]),
+            Entry::new(
+                "-Target",
+                "-Target",
+                EntryKind::Param,
+                "[String] Parameter -Target",
+            )
+            .with_parameter_sets(vec!["SetA".to_string(), "SetB".to_string()])
+            .with_mandatory_sets(vec!["SetA".to_string()])
+            .with_position(Some(0)),
+            Entry::new(
+                "-ModeB",
+                "-ModeB",
+                EntryKind::Flag,
+                "[Switch] Parameter -ModeB",
+            )
+            .with_parameter_sets(vec!["SetB".to_string()]),
+        ];
+
+        let mut help_params = HashMap::new();
+        help_params.insert("target".to_string(), "Target resource name.".to_string());
+        let fake = PsHelpFake {
+            available: HashMap::from([(
+                "invoke-demo".to_string(),
+                PsCmdHelp {
+                    synopsis: "Invokes demo operation.".to_string(),
+                    description: "Detailed demo documentation.".to_string(),
+                    params: help_params,
+                },
+            )]),
+            ready: ps_help_map,
+            pending: ps_help_pending,
+        };
+
+        let mut session = MillerSession::new(
+            vec![cmd],
+            fake,
+            "",
+            Viewport::new(120, 20),
+            ShellDialect::PowerShell,
+        );
+
+        // Initially in Pane 2 before any tokens: -Target (mandatory in SetA) is sorted first with [req]
+        session.apply(UserAction::StepRight);
+        let p2_initial: Vec<&str> = session.view().panes[1]
+            .entries()
+            .iter()
+            .map(|e| e.text.as_str())
+            .collect();
+        assert_eq!(p2_initial, vec!["-Target", "-Optional", "-ModeB"]);
+        let raw_initial = session.render();
+        let frame_initial = crate::sanitize::strip_help_text_escapes(&raw_initial);
+        assert!(frame_initial.contains("[req]"));
+
+        // Poll lazy PowerShell help and verify both cmdlet and parameter descriptions update live!
+        assert!(session.poll_discovery());
+        let p2_after_help = session.view().panes[1]
+            .entries()
+            .iter()
+            .find(|e| e.text == "-Target")
+            .unwrap();
+        assert_eq!(p2_after_help.desc, "[String] Target resource name.");
+        let p1_after_help = session.view().panes[0].selected().unwrap();
+        assert!(p1_after_help.desc.contains("Invokes demo operation."));
+
+        // Commit -ModeB -> narrows active Parameter Set to SetB -> -Target is NO LONGER mandatory in SetB!
+        session.apply(UserAction::MoveDown);
+        session.apply(UserAction::MoveDown);
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.view().active_param_set, Some("SetB"));
+        let raw_set_b = session.render();
+        let frame_set_b = crate::sanitize::strip_help_text_escapes(&raw_set_b);
+        assert!(
+            !frame_set_b.contains("[req]"),
+            "Target is optional in SetB so [req] must disappear: {frame_set_b}"
+        );
     }
 }
