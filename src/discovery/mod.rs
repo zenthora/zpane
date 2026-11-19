@@ -14,10 +14,11 @@ pub use config::{
     config_path, load_user_config, load_user_config_with_diagnostics, parse_user_config_toml,
     parse_user_config_toml_with_diagnostics, BindableAction, BorderStyle, ConfigDiagnostic,
     IconMode, KeyChord, KeybindingsConfig, ThemePreset, UiConfig, UiStyle, UserConfig,
+    DEFAULT_INTROSPECT_TIMEOUT_MS, MAX_INTROSPECT_TIMEOUT_MS, MIN_INTROSPECT_TIMEOUT_MS,
 };
 pub use context::detect_runtime_context;
 pub use introspect::{
     clear_disk_cache, inspect_command_chain, inspect_command_chain_with, warm_cli_cache,
-    CliIntrospector, InspectReport, Introspect, PollResult,
+    CliIntrospector, CommandRunOutcome, InspectReport, Introspect, PollResult,
 };
 pub use powershell::sync_powershell_metadata;

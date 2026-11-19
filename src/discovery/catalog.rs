@@ -55,22 +55,8 @@ pub(super) const PRIORITY_CLI_TOOLS: &[&str] = &[
     "apt",
     "pacman",
     "pkg",
-    "z",
-    "zi",
-    "mkcd",
-    "ports",
-    "myip",
-    "fkill",
-    "fgs",
-    "fscoop",
-    "extract",
     "touch",
     "which",
-    "reload",
-    "ep",
-    "pkr",
-    "pki",
-    "pku",
 ];
 
 /// Which shell syntax zpane emits for variable tokens and which command sources it indexes.

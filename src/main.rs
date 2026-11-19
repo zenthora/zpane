@@ -1005,7 +1005,11 @@ fn main() -> anyhow::Result<()> {
 
     let runtime_ctx = detect_runtime_context(opts.runtime_context);
     let pane1_entries = load_catalog(dialect, &runtime_ctx);
-    let introspector = CliIntrospector::new(dialect, &runtime_ctx);
+    let introspector = CliIntrospector::with_timeout(
+        dialect,
+        &runtime_ctx,
+        user_config.effective_introspect_timeout(),
+    );
 
     let (tw, th) = size().unwrap_or((
         opts.fallback_width.min(u16::MAX as usize) as u16,

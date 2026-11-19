@@ -7,10 +7,18 @@ use std::fmt;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 pub(super) const MAX_CONFIG_BYTES: u64 = 256 * 1024;
 const MAX_CONFIG_ARRAY_ITEMS: usize = 1_024;
 const MAX_DIAGNOSTICS: usize = 64;
+
+/// Default CLI Introspection child-process timeout in milliseconds.
+pub const DEFAULT_INTROSPECT_TIMEOUT_MS: u64 = 750;
+/// Minimum allowed CLI Introspection timeout in milliseconds.
+pub const MIN_INTROSPECT_TIMEOUT_MS: u64 = 100;
+/// Maximum allowed CLI Introspection timeout in milliseconds.
+pub const MAX_INTROSPECT_TIMEOUT_MS: u64 = 10_000;
 
 /// Selectable terminal color palette preset for [`UiConfig`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -316,8 +324,22 @@ pub struct UserConfig {
     pub priority_tools: Vec<String>,
     pub disabled_tools: Vec<String>,
     pub history_limit: Option<usize>,
+    pub introspect_timeout_ms: Option<u64>,
     pub ui: UiConfig,
     pub keybindings: KeybindingsConfig,
+}
+
+impl UserConfig {
+    /// Returns the effective bounded CLI Introspection timeout, defaulting to
+    /// [`DEFAULT_INTROSPECT_TIMEOUT_MS`] (`750ms`) and clamped to
+    /// [`MIN_INTROSPECT_TIMEOUT_MS`]..=[`MAX_INTROSPECT_TIMEOUT_MS`] (`100..=10_000` ms).
+    pub fn effective_introspect_timeout(&self) -> Duration {
+        let ms = self
+            .introspect_timeout_ms
+            .unwrap_or(DEFAULT_INTROSPECT_TIMEOUT_MS)
+            .clamp(MIN_INTROSPECT_TIMEOUT_MS, MAX_INTROSPECT_TIMEOUT_MS);
+        Duration::from_millis(ms)
+    }
 }
 
 /// Location of `zpane`'s user configuration file (`ZPANE_CONFIG`, `%LOCALAPPDATA%\zpane\config.toml`,
@@ -535,6 +557,22 @@ fn parse_toml_usize(raw: &str) -> Option<usize> {
     }
 }
 
+fn parse_toml_u64(raw: &str) -> Option<u64> {
+    let raw_num = raw.trim();
+    if raw_num.is_empty() {
+        return None;
+    }
+    if !raw_num.starts_with('_') && !raw_num.ends_with('_') && !raw_num.contains("__") {
+        if raw_num.contains('_') {
+            raw_num.replace('_', "").parse::<u64>().ok()
+        } else {
+            raw_num.parse::<u64>().ok()
+        }
+    } else {
+        None
+    }
+}
+
 fn parse_keybinding_chords(raw: &str) -> Result<Vec<KeyChord>, String> {
     let trimmed = raw.trim();
     let items = if trimmed.starts_with('[') {
@@ -612,6 +650,30 @@ fn apply_config_entry(
                         diags,
                         line_no,
                         format!("Invalid integer for 'history_limit': {}", val.trim()),
+                    ),
+                },
+                "introspect_timeout_ms" if allow_discovery => match parse_toml_u64(val) {
+                    Some(ms) => {
+                        let clamped =
+                            ms.clamp(MIN_INTROSPECT_TIMEOUT_MS, MAX_INTROSPECT_TIMEOUT_MS);
+                        cfg.introspect_timeout_ms = Some(clamped);
+                        if clamped != ms {
+                            push_diag(
+                                diags,
+                                line_no,
+                                format!(
+                                    "Value for 'introspect_timeout_ms' ({ms}) out of range ({MIN_INTROSPECT_TIMEOUT_MS}..={MAX_INTROSPECT_TIMEOUT_MS}); clamped to {clamped}"
+                                ),
+                            );
+                        }
+                    }
+                    None => push_diag(
+                        diags,
+                        line_no,
+                        format!(
+                            "Invalid integer for 'introspect_timeout_ms': {}",
+                            val.trim()
+                        ),
                     ),
                 },
                 "theme" if allow_ui => match parse_toml_string_literal(val) {
@@ -1167,5 +1229,86 @@ toggle_inspector = "ctrl+badkey"
         assert_eq!(diags_bad.len(), 1);
         assert_eq!(diags_bad[0].line, 3);
         assert!(diags_bad[0].message.contains("Unknown key 'bogus'"));
+    }
+
+    #[test]
+    fn test_introspect_timeout_ms_parsing_bounds_and_diagnostics() {
+        use std::time::Duration;
+
+        // Default timeout is 750ms
+        assert_eq!(
+            UserConfig::default().effective_introspect_timeout(),
+            Duration::from_millis(750)
+        );
+        assert_eq!(UserConfig::default().introspect_timeout_ms, None);
+
+        // Top-level and [discovery] parsing with underscores
+        let (top_cfg, top_diags) =
+            parse_user_config_toml_with_diagnostics("introspect_timeout_ms = 1_500\n");
+        assert!(top_diags.is_empty(), "unexpected diags: {top_diags:?}");
+        assert_eq!(top_cfg.introspect_timeout_ms, Some(1500));
+        assert_eq!(
+            top_cfg.effective_introspect_timeout(),
+            Duration::from_millis(1500)
+        );
+
+        let (disc_cfg, disc_diags) =
+            parse_user_config_toml_with_diagnostics("[discovery]\nintrospect_timeout_ms = 250\n");
+        assert!(disc_diags.is_empty(), "unexpected diags: {disc_diags:?}");
+        assert_eq!(disc_cfg.introspect_timeout_ms, Some(250));
+        assert_eq!(
+            disc_cfg.effective_introspect_timeout(),
+            Duration::from_millis(250)
+        );
+
+        // Out-of-range values clamp safely to 100..=10_000 ms with non-fatal diagnostics
+        let (low_cfg, low_diags) =
+            parse_user_config_toml_with_diagnostics("[discovery]\nintrospect_timeout_ms = 25\n");
+        assert_eq!(low_cfg.introspect_timeout_ms, Some(100));
+        assert_eq!(
+            low_cfg.effective_introspect_timeout(),
+            Duration::from_millis(100)
+        );
+        assert_eq!(low_diags.len(), 1);
+        assert!(low_diags[0].message.contains("introspect_timeout_ms"));
+
+        let (high_cfg, high_diags) =
+            parse_user_config_toml_with_diagnostics("introspect_timeout_ms = 99_999\n");
+        assert_eq!(high_cfg.introspect_timeout_ms, Some(10_000));
+        assert_eq!(
+            high_cfg.effective_introspect_timeout(),
+            Duration::from_millis(10_000)
+        );
+        assert_eq!(high_diags.len(), 1);
+        assert!(high_diags[0].message.contains("introspect_timeout_ms"));
+
+        // Invalid syntax and wrong section emit non-fatal diagnostics and keep defaults
+        let (bad_cfg, bad_diags) = parse_user_config_toml_with_diagnostics(
+            "introspect_timeout_ms = -50\n[ui]\nintrospect_timeout_ms = 500\n[discovery]\nintrospect_timeout_ms = \"fast\"\n",
+        );
+        assert_eq!(bad_cfg.introspect_timeout_ms, None);
+        assert_eq!(
+            bad_cfg.effective_introspect_timeout(),
+            Duration::from_millis(750)
+        );
+        assert_eq!(bad_diags.len(), 3);
+
+        // Programmatically constructed out-of-range values are still safely bounded
+        let manual_low = UserConfig {
+            introspect_timeout_ms: Some(1),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            manual_low.effective_introspect_timeout(),
+            Duration::from_millis(100)
+        );
+        let manual_high = UserConfig {
+            introspect_timeout_ms: Some(60_000),
+            ..UserConfig::default()
+        };
+        assert_eq!(
+            manual_high.effective_introspect_timeout(),
+            Duration::from_millis(10_000)
+        );
     }
 }
