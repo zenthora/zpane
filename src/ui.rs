@@ -197,6 +197,8 @@ fn border_chars_for(style: BorderStyle) -> BorderChars {
 fn ascii_icon_equiv(ch: char) -> Option<&'static str> {
     match ch {
         '❯' => Some(">"),
+        '›' => Some(">"),
+        '✓' => Some("*"),
         'ℹ' => Some("i"),
         '✏' => Some("*"),
         '🔀' => Some("<>"),
@@ -249,6 +251,15 @@ fn icon_info(icons: IconMode) -> &'static str {
         "i"
     } else {
         "ℹ"
+    }
+}
+
+#[inline]
+fn icon_committed(icons: IconMode) -> char {
+    if icons == IconMode::Ascii {
+        '*'
+    } else {
+        '✓'
     }
 }
 
@@ -681,7 +692,8 @@ fn push_pane_header(
 }
 
 /// Renders a Miller cell directly into `out` strictly bounded to `col_width` display columns,
-/// with fuzzy-match highlighting, selection styling, and right-aligned `[Kind]` badge when space permits.
+/// with fuzzy-match highlighting, selection styling, optional committed marker, and right-aligned `[Kind]` badge.
+#[allow(clippy::too_many_arguments)]
 fn push_miller_cell_styled(
     out: &mut String,
     entry: &Entry,
@@ -689,6 +701,7 @@ fn push_miller_cell_styled(
     col_width: usize,
     is_selected: bool,
     is_active_pane: bool,
+    is_committed: bool,
     style: UiStyle,
 ) {
     if col_width == 0 {
@@ -718,8 +731,10 @@ fn push_miller_cell_styled(
     }
 
     let rem = col_width.saturating_sub(ptr_w);
-    let show_badge = rem >= badge_w + 3;
-    let avail_label_w = if show_badge { rem - badge_w - 1 } else { rem };
+    let marker_w = if is_committed && rem >= 4 { 2 } else { 0 };
+    let show_badge = rem >= badge_w + marker_w + 3;
+    let badge_reserved = if show_badge { badge_w + 1 } else { 0 };
+    let avail_label_w = rem - marker_w - badge_reserved;
 
     let cur_w = push_sanitized_truncated_styled(
         out,
@@ -735,7 +750,19 @@ fn push_miller_cell_styled(
         push_repeated_space(out, avail_label_w - cur_w);
     }
 
+    if marker_w == 2 {
+        out.push(' ');
+        if !is_selected && !palette.cmd_bar.is_empty() {
+            out.push_str(palette.cmd_bar);
+        }
+        out.push(icon_committed(icons));
+    }
+
     if show_badge {
+        if !is_selected && marker_w == 2 && !palette.cmd_bar.is_empty() {
+            out.push_str(palette.rst);
+            out.push_str(base_style);
+        }
         out.push(' ');
         if !is_selected {
             out.push_str(kind_color(theme, entry.kind));
@@ -744,6 +771,7 @@ fn push_miller_cell_styled(
     }
     if !base_style.is_empty()
         || (!is_selected && show_badge && !kind_color(theme, entry.kind).is_empty())
+        || (!is_selected && marker_w == 2 && !palette.cmd_bar.is_empty())
         || (!match_positions.is_empty() && !palette.match_hl.is_empty())
     {
         out.push_str(palette.rst);
@@ -766,6 +794,7 @@ fn push_miller_cell(
         col_width,
         is_selected,
         is_active_pane,
+        false,
         UiStyle::default(),
     );
 }
@@ -776,10 +805,17 @@ fn push_pane_cell(
     row_offset: usize,
     col_width: usize,
     is_active_pane: bool,
+    committed_tokens: &[String],
     style: UiStyle,
 ) {
     let idx = pane.scroll_idx() + row_offset;
     if let Some((entry, match_positions)) = pane.row_at(idx) {
+        let is_committed = !committed_tokens.is_empty()
+            && matches!(entry.kind, EntryKind::Flag | EntryKind::Param)
+            && entry.is_emittable()
+            && committed_tokens
+                .iter()
+                .any(|tok| entry.matches_parameter_token(tok));
         push_miller_cell_styled(
             out,
             entry,
@@ -787,6 +823,7 @@ fn push_pane_cell(
             col_width,
             idx == pane.sel_idx(),
             is_active_pane,
+            is_committed,
             style,
         );
     } else {
@@ -801,8 +838,11 @@ pub struct RenderState<'a> {
     pub panes: [&'a PaneList; 3],
     pub command_line: String,
     pub active_param_set: Option<&'a str>,
+    pub subcmd_chain: &'a [String],
+    pub committed_tokens: &'a [String],
     pub dialect: ShellDialect,
     pub inspector_expanded: bool,
+    pub inspector_scroll: usize,
     pub style: UiStyle,
 }
 
@@ -1140,10 +1180,132 @@ fn split_pane_widths(inner_w: usize) -> (usize, usize, usize) {
     (w1, w2, w3)
 }
 
-const FOOTER_PS: &str = " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Sync PS  [Enter] Accept  [Esc]";
-const FOOTER_RELOAD: &str = " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Enter] Accept  [Esc]";
-const FOOTER_PS_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Sync PS  [Enter] Accept  [Esc]";
-const FOOTER_RELOAD_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Enter] Accept  [Esc]";
+/// Formats Pane 2's subcommand breadcrumb header into `out`, shortening leading segments
+/// when `w2` is narrow so the deepest active subcommand and count remain legible.
+fn write_pane2_breadcrumb_header(
+    out: &mut String,
+    p1_entry: Option<&Entry>,
+    subcmd_chain: &[String],
+    visible_len: usize,
+    w2: usize,
+    icons: IconMode,
+) {
+    let sep = if icons == IconMode::Ascii {
+        " > "
+    } else {
+        " › "
+    };
+    let root = p1_entry
+        .map(|e| {
+            if e.kind == EntryKind::History {
+                e.text.split_whitespace().next().unwrap_or(e.text.as_str())
+            } else {
+                e.text.as_str()
+            }
+        })
+        .filter(|s| !s.is_empty());
+
+    out.clear();
+    out.push_str(" 2. ");
+    let mut has_prev = false;
+    if let Some(root_name) = root {
+        out.push_str(root_name);
+        has_prev = true;
+    }
+    for seg in subcmd_chain {
+        if has_prev {
+            out.push_str(sep);
+        }
+        out.push_str(seg);
+        has_prev = true;
+    }
+    let _ = write!(out, " ({visible_len}) ");
+
+    if display_width_sanitized(out) <= w2 {
+        return;
+    }
+
+    if let Some(last_seg) = subcmd_chain.last() {
+        let mut compact = String::new();
+        let ellipsis = icon_ellipsis(icons);
+        if subcmd_chain.len() > 1 || root.is_some() {
+            let _ = write!(compact, " 2. {ellipsis}{sep}{last_seg} ({visible_len}) ");
+        } else {
+            let _ = write!(compact, " 2. {last_seg} ({visible_len}) ");
+        }
+        if display_width_sanitized(&compact) <= w2 {
+            *out = compact;
+        }
+    }
+}
+
+/// Maximum wrapped rows retained by the scrollable `F1` Inspector drawer.
+const MAX_INSPECTOR_SCROLLABLE_ROWS: usize = 512;
+
+/// Returns the maximum valid scroll offset for the expanded `F1` Inspector on `entry`.
+pub(crate) fn expanded_inspector_max_scroll(
+    entry: Option<&Entry>,
+    viewport: Viewport,
+    style: UiStyle,
+) -> usize {
+    let win_w = viewport.width.max(Viewport::MIN_WIDTH.saturating_sub(1));
+    let list_rows = viewport.rows(Pane::First);
+    let inner_w = win_w.saturating_sub(4);
+    let (_w1, _w2, w3) = split_pane_widths(inner_w);
+    let total_rows =
+        build_expanded_inspector_rows_styled(entry, w3, MAX_INSPECTOR_SCROLLABLE_ROWS, style).len();
+    total_rows.saturating_sub(list_rows)
+}
+
+fn write_inspector_header(
+    out: &mut String,
+    scroll: usize,
+    list_rows: usize,
+    total_rows: usize,
+    w3: usize,
+    icons: IconMode,
+) {
+    out.clear();
+    if total_rows <= list_rows || list_rows == 0 {
+        out.push_str(" 3. Inspector [F1 Close] ");
+        return;
+    }
+    let start_row = scroll + 1;
+    let end_row = (scroll + list_rows).min(total_rows);
+    let can_up = scroll > 0;
+    let can_down = scroll + list_rows < total_rows;
+    let arrows = match (can_up, can_down, icons) {
+        (true, true, IconMode::Unicode) => "↑↓ ",
+        (true, false, IconMode::Unicode) => "↑ ",
+        (false, true, IconMode::Unicode) => "↓ ",
+        (true, true, IconMode::Ascii) => "^v ",
+        (true, false, IconMode::Ascii) => "^ ",
+        (false, true, IconMode::Ascii) => "v ",
+        _ => "",
+    };
+    let _ = write!(
+        out,
+        " 3. Inspector [{arrows}{start_row}-{end_row}/{total_rows}] [F1 Close] "
+    );
+    if display_width_sanitized(out) <= w3 {
+        return;
+    }
+    out.clear();
+    let _ = write!(
+        out,
+        " 3. Inspector [{arrows}{start_row}-{end_row}/{total_rows}] "
+    );
+    if display_width_sanitized(out) <= w3 {
+        return;
+    }
+    out.clear();
+    let _ = write!(out, " 3. [{arrows}{start_row}-{end_row}/{total_rows}] ");
+}
+
+const FOOTER_PS: &str = " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Sync PS  [Ctrl+O] Pipe  [Enter] Accept  [Esc]";
+const FOOTER_RELOAD: &str = " [↑/↓|Ctrl+N/P] Move  [←/→] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Ctrl+O] Pipe  [Enter] Accept  [Esc]";
+const FOOTER_PS_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Sync PS  [Ctrl+O] Pipe  [Enter] Accept  [Esc]";
+const FOOTER_RELOAD_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Ctrl+O] Pipe  [Enter] Accept  [Esc]";
 
 pub fn render_frame(st: &RenderState<'_>) -> String {
     let palette = palette_for(st.style.theme);
@@ -1162,10 +1324,19 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         selected_info_entry(st)
     };
     let expanded_rows = if st.inspector_expanded {
-        build_expanded_inspector_rows_styled(selected_info_entry(st), w3, list_rows, st.style)
+        build_expanded_inspector_rows_styled(
+            selected_info_entry(st),
+            w3,
+            MAX_INSPECTOR_SCROLLABLE_ROWS,
+            st.style,
+        )
     } else {
         Vec::new()
     };
+    let inspector_total_rows = expanded_rows.len();
+    let inspector_scroll = st
+        .inspector_scroll
+        .min(inspector_total_rows.saturating_sub(list_rows));
 
     let estimated_cap = ((list_rows + 6) * (win_w * 2 + 128)).clamp(4096, 65536);
     let mut sb = String::with_capacity(estimated_cap);
@@ -1201,7 +1372,16 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     sb.push(borders.t_down);
     scratch.clear();
-    if let Some(set_name) = st.active_param_set {
+    if !st.subcmd_chain.is_empty() {
+        write_pane2_breadcrumb_header(
+            &mut scratch,
+            st.panes[0].selected(),
+            st.subcmd_chain,
+            st.panes[1].visible_len(),
+            w2,
+            icons,
+        );
+    } else if let Some(set_name) = st.active_param_set {
         let _ = write!(
             scratch,
             " 2. Params [Set: {set_name}] ({}) ",
@@ -1226,10 +1406,18 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
 
     sb.push(borders.t_down);
     if st.inspector_expanded {
+        write_inspector_header(
+            &mut scratch,
+            inspector_scroll,
+            list_rows,
+            inspector_total_rows,
+            w3,
+            icons,
+        );
         push_pane_header(
             &mut sb,
             header_color(Pane::Third),
-            " 3. Inspector [F1 Close] ",
+            &scratch,
             w3,
             palette,
             icons,
@@ -1266,6 +1454,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             r,
             w1,
             st.active_pane == Pane::First,
+            &[],
             st.style,
         );
 
@@ -1278,6 +1467,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
             r,
             w2,
             st.active_pane == Pane::Second,
+            st.committed_tokens,
             st.style,
         );
 
@@ -1285,7 +1475,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
         sb.push(borders.vertical);
         push_styled_end(&mut sb, palette.border_dim, palette.rst);
         if st.inspector_expanded {
-            if let Some((color, text)) = expanded_rows.get(r) {
+            if let Some((color, text)) = expanded_rows.get(inspector_scroll + r) {
                 sb.push_str(color);
                 push_padded_text_with(&mut sb, text, w3, icons);
                 push_styled_end(&mut sb, color, palette.rst);
@@ -1331,6 +1521,7 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
                     r - PANE3_INSPECTOR_ROWS,
                     w3,
                     st.active_pane == Pane::Third,
+                    &[],
                     st.style,
                 ),
             }
@@ -1553,8 +1744,11 @@ mod tests {
             panes: [&empty, &empty, &empty],
             command_line: String::new(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         };
 
@@ -1584,8 +1778,11 @@ mod tests {
                 panes: [&pane1, &pane2, &pane3],
                 command_line: "git commit".to_string(),
                 active_param_set: None,
+                subcmd_chain: &[],
+                committed_tokens: &[],
                 dialect: ShellDialect::Posix,
                 inspector_expanded: false,
+                inspector_scroll: 0,
                 style: UiStyle::default(),
             };
             let plain = strip_ansi(&render_frame(&st));
@@ -1610,8 +1807,11 @@ mod tests {
             panes: [&empty, &empty, &empty],
             command_line: String::new(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::PowerShell,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         }));
         assert!(ps_frame.contains("[Ctrl+R] Sync PS"));
@@ -1622,8 +1822,11 @@ mod tests {
             panes: [&empty, &empty, &empty],
             command_line: String::new(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         }));
         assert!(posix_frame.contains("[Ctrl+R] Reload"));
@@ -1664,8 +1867,11 @@ mod tests {
             panes: [&pane1, &empty, &pane3],
             command_line: "cmd7 --flag4".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         });
 
@@ -1698,8 +1904,11 @@ mod tests {
             panes: [&pane1, &pane2, &empty],
             command_line: "git".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         };
         let (title0, desc0) = inspector_header(&st_p1);
@@ -1766,8 +1975,11 @@ mod tests {
             panes: [&pane1, &pane2, &empty],
             command_line: "Get-Process -Id".to_string(),
             active_param_set: Some("Id"),
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::PowerShell,
             inspector_expanded: true,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         }));
 
@@ -1866,8 +2078,11 @@ mod tests {
             panes: [&pane1, &pane2, &empty],
             command_line: "cmd -VeryLongParameterName value-at-the-very-end".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: true,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         });
         assert!(raw.contains("\x1b[K\r\n"));
@@ -1933,8 +2148,11 @@ mod tests {
                 command_line: "git \x1b]52;c;cHduZWQ=\x07\x1b[6nstatus\u{009b}31m\x00\x7f"
                     .to_string(),
                 active_param_set: Some("\x1b]0;title\x07IdSet\u{202e}"),
+                subcmd_chain: &[],
+                committed_tokens: &[],
                 dialect: ShellDialect::Posix,
                 inspector_expanded: expanded,
+                inspector_scroll: 0,
                 style: UiStyle::default(),
             });
 
@@ -2001,8 +2219,11 @@ mod tests {
             panes: [&pane1, &empty, &empty],
             command_line: "cmd".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: true,
+            inspector_scroll: 0,
             style: UiStyle::default(),
         });
         assert!(!raw.contains("\x1b]"));
@@ -2151,8 +2372,11 @@ mod tests {
                     panes: [&pane1, &empty, &empty],
                     command_line: "Get-Item \u{202e}--evil\x1bPbad\x1b\\".to_string(),
                     active_param_set: Some("Default\x1b^pm\x1b\\"),
+                    subcmd_chain: &[],
+                    committed_tokens: &[],
                     dialect: ShellDialect::PowerShell,
                     inspector_expanded: expanded,
+                    inspector_scroll: 0,
                     style: UiStyle::default(),
                 });
                 assert!(!raw.contains("apc_payload"));
@@ -2256,8 +2480,11 @@ mod tests {
                 panes: [&pane1, &pane2, &pane3],
                 command_line: "Get-Process -Name explorer".to_string(),
                 active_param_set: Some("Name"),
+                subcmd_chain: &[],
+                committed_tokens: &[],
                 dialect: ShellDialect::PowerShell,
                 inspector_expanded: expanded,
+                inspector_scroll: 0,
                 style: UiStyle::default(),
             };
             for i in 0..count {
@@ -2341,8 +2568,11 @@ mod tests {
             panes: [&pane1, &pane2, &empty],
             command_line: "git commit".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: with_empty_no_color,
         });
         assert!(has_ansi_color_escape(&colored_frame));
@@ -2362,8 +2592,11 @@ mod tests {
                     panes: [&pane1, &pane2, &empty],
                     command_line: "git commit".to_string(),
                     active_param_set: None,
+                    subcmd_chain: &[],
+                    committed_tokens: &[],
                     dialect: ShellDialect::Posix,
                     inspector_expanded: expanded,
+                    inspector_scroll: 0,
                     style,
                 });
                 assert!(
@@ -2414,8 +2647,11 @@ mod tests {
             panes: [&pane1, &pane2, &pane3],
             command_line: "git branch".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle {
                 theme: ThemePreset::Dark,
                 ..UiStyle::default()
@@ -2427,8 +2663,11 @@ mod tests {
             panes: [&pane1, &pane2, &pane3],
             command_line: "git branch".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle {
                 theme: ThemePreset::Light,
                 ..UiStyle::default()
@@ -2440,8 +2679,11 @@ mod tests {
             panes: [&pane1, &pane2, &pane3],
             command_line: "git branch".to_string(),
             active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
             dialect: ShellDialect::Posix,
             inspector_expanded: false,
+            inspector_scroll: 0,
             style: UiStyle {
                 theme: ThemePreset::Ansi16,
                 ..UiStyle::default()
@@ -2464,8 +2706,11 @@ mod tests {
                         panes: [&pane1, &pane2, &pane3],
                         command_line: "git branch main".to_string(),
                         active_param_set: Some("Default"),
+                        subcmd_chain: &[],
+                        committed_tokens: &[],
                         dialect: ShellDialect::Posix,
                         inspector_expanded: expanded,
+                        inspector_scroll: 0,
                         style: UiStyle {
                             theme: ThemePreset::Light,
                             icons: IconMode::Unicode,
@@ -2525,8 +2770,11 @@ mod tests {
                     command_line: "git checkout very-long-branch-name-that-overflows-narrow-view"
                         .to_string(),
                     active_param_set: None,
+                    subcmd_chain: &[],
+                    committed_tokens: &[],
                     dialect: ShellDialect::Posix,
                     inspector_expanded: expanded,
+                    inspector_scroll: 0,
                     style: UiStyle {
                         theme: ThemePreset::None,
                         icons: IconMode::Ascii,
@@ -2560,5 +2808,248 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_pane2_header_renders_subcommand_breadcrumb_unicode_ascii_and_min_width() {
+        let pane1 = PaneList::new(vec![Entry::new("git", "git", EntryKind::Cli, "Git VCS")]);
+        let pane2 = PaneList::new(vec![
+            Entry::new("add", "add", EntryKind::Subcmd, "Add remote"),
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Verbose"),
+        ]);
+        let empty = PaneList::default();
+        let chain_one = vec!["remote".to_string()];
+        let chain_two = vec!["remote".to_string(), "add".to_string()];
+
+        let unicode_one = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "git remote add".to_string(),
+            active_param_set: None,
+            subcmd_chain: &chain_one,
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        assert!(unicode_one.contains("2. git › remote (2)"));
+
+        let unicode_two = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(110, 14),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "git remote add".to_string(),
+            active_param_set: None,
+            subcmd_chain: &chain_two,
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        assert!(unicode_two.contains("2. git › remote › add (2)"));
+
+        let ascii_one = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "git remote add".to_string(),
+            active_param_set: None,
+            subcmd_chain: &chain_one,
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle {
+                theme: ThemePreset::None,
+                icons: IconMode::Ascii,
+                borders: BorderStyle::Ascii,
+            },
+        }));
+        assert!(ascii_one.contains("2. git > remote (2)"));
+        assert!(ascii_one.chars().all(|c| c == '\n' || c.is_ascii()));
+
+        let min_frame = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(Viewport::MIN_WIDTH, 14),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "git remote add".to_string(),
+            active_param_set: None,
+            subcmd_chain: &chain_two,
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        let lines: Vec<&str> = min_frame.lines().collect();
+        assert_eq!(lines.len(), 14);
+        for line in lines {
+            assert_eq!(UnicodeWidthStr::width(line), Viewport::MIN_WIDTH);
+        }
+    }
+
+    #[test]
+    fn test_committed_flag_and_param_markers_in_pane2_preserve_width_across_modes() {
+        let pane1 = PaneList::new(vec![Entry::new("cmd", "cmd", EntryKind::Cli, "CLI")]);
+        let pane2 = PaneList::new(vec![
+            Entry::new("-v", "-v", EntryKind::Flag, "Verbose")
+                .with_aliases(vec!["verbose".to_string()]),
+            Entry::new("-Id", "-Id (-PID)", EntryKind::Param, "Id")
+                .with_aliases(vec!["PID".to_string()]),
+            Entry::new("--dry-run", "--dry-run", EntryKind::Flag, "Dry run"),
+            Entry::new("status", "status", EntryKind::Subcmd, "Status"),
+        ]);
+        let empty = PaneList::default();
+        let committed = vec![
+            "--verbose".to_string(),
+            "-PID:42".to_string(),
+            "status".to_string(),
+        ];
+
+        let unicode_plain = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::Second,
+            panes: [&pane1, &pane2, &empty],
+            command_line: "cmd --verbose -PID:42".to_string(),
+            active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &committed,
+            dialect: ShellDialect::PowerShell,
+            inspector_expanded: false,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        let v_line = unicode_plain.lines().find(|l| l.contains("-v")).unwrap();
+        let id_line = unicode_plain.lines().find(|l| l.contains("-Id")).unwrap();
+        let dry_line = unicode_plain
+            .lines()
+            .find(|l| l.contains("--dry-run"))
+            .unwrap();
+        let sub_line = unicode_plain
+            .lines()
+            .find(|l| l.contains("status"))
+            .unwrap();
+        assert!(
+            v_line.contains('✓'),
+            "committed Flag must show ✓: {v_line:?}"
+        );
+        assert!(
+            id_line.contains('✓'),
+            "committed Param via alias must show ✓: {id_line:?}"
+        );
+        assert!(
+            !dry_line.contains('✓'),
+            "uncommitted Flag must not show ✓: {dry_line:?}"
+        );
+        assert!(
+            !sub_line.contains('✓'),
+            "Subcmd must not show ✓: {sub_line:?}"
+        );
+
+        for width in [Viewport::MIN_WIDTH, 100] {
+            let ascii_raw = render_frame(&RenderState {
+                viewport: Viewport::new(width, 14),
+                active_pane: Pane::Second,
+                panes: [&pane1, &pane2, &empty],
+                command_line: "cmd --verbose -PID:42".to_string(),
+                active_param_set: None,
+                subcmd_chain: &[],
+                committed_tokens: &committed,
+                dialect: ShellDialect::PowerShell,
+                inspector_expanded: false,
+                inspector_scroll: 0,
+                style: UiStyle {
+                    theme: ThemePreset::None,
+                    icons: IconMode::Ascii,
+                    borders: BorderStyle::Ascii,
+                },
+            });
+            assert!(!has_ansi_color_escape(&ascii_raw));
+            let ascii_plain = strip_ansi(&ascii_raw);
+            assert!(ascii_plain.chars().all(|c| c == '\n' || c.is_ascii()));
+            assert!(!ascii_plain.contains('✓'));
+            let ascii_v_line = ascii_plain.lines().find(|l| l.contains("-v")).unwrap();
+            assert!(
+                ascii_v_line.contains('*'),
+                "ASCII mode must show * marker on committed Flag: {ascii_v_line:?}"
+            );
+            for line in ascii_plain.lines() {
+                assert_eq!(UnicodeWidthStr::width(line), width);
+            }
+        }
+    }
+
+    #[test]
+    fn test_expanded_inspector_scroll_offset_clamps_and_renders_indicator() {
+        let long_desc = (1..=25)
+            .map(|i| format!("Detail line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pane1 = PaneList::new(vec![Entry::new("cmd", "cmd", EntryKind::Cli, long_desc)]);
+        let empty = PaneList::default();
+
+        // Height 14 -> list_rows = 8. Top of inspector shows lines 1-8 and down indicator.
+        let top_plain = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &empty, &empty],
+            command_line: "cmd".to_string(),
+            active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: true,
+            inspector_scroll: 0,
+            style: UiStyle::default(),
+        }));
+        assert_eq!(top_plain.lines().count(), 14);
+        assert!(top_plain.contains("Detail line 01"));
+        assert!(!top_plain.contains("Detail line 25"));
+        assert!(top_plain.contains("↓ 1-8/"));
+
+        // Mid scroll shows middle lines and both up/down indicator.
+        let mid_plain = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &empty, &empty],
+            command_line: "cmd".to_string(),
+            active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: true,
+            inspector_scroll: 10,
+            style: UiStyle::default(),
+        }));
+        assert_eq!(mid_plain.lines().count(), 14);
+        assert!(!mid_plain.contains("Detail line 01"));
+        assert!(mid_plain.contains("Detail line 10"));
+        assert!(mid_plain.contains("↑↓ 11-18/"));
+
+        // Oversized offset clamps cleanly to bottom and ASCII mode uses ASCII arrows.
+        let bot_ascii = strip_ansi(&render_frame(&RenderState {
+            viewport: Viewport::new(100, 14),
+            active_pane: Pane::First,
+            panes: [&pane1, &empty, &empty],
+            command_line: "cmd".to_string(),
+            active_param_set: None,
+            subcmd_chain: &[],
+            committed_tokens: &[],
+            dialect: ShellDialect::Posix,
+            inspector_expanded: true,
+            inspector_scroll: 999,
+            style: UiStyle {
+                theme: ThemePreset::None,
+                icons: IconMode::Ascii,
+                borders: BorderStyle::Ascii,
+            },
+        }));
+        assert_eq!(bot_ascii.lines().count(), 14);
+        assert!(bot_ascii.chars().all(|c| c == '\n' || c.is_ascii()));
+        assert!(bot_ascii.contains("Detail line 25"));
+        assert!(bot_ascii.contains("^ "));
     }
 }

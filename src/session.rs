@@ -13,7 +13,7 @@ use crate::shell::{
     tokenize_shell_words_for_dialect,
 };
 pub use crate::shell::{split_pipeline_prefix, tokenize_shell_words};
-use crate::ui::{render_frame, RenderState, Viewport};
+use crate::ui::{expanded_inspector_max_scroll, render_frame, RenderState, Viewport};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
@@ -35,6 +35,7 @@ pub enum UserAction {
     ClearFilter,
     ReloadCatalog,
     ToggleInspector,
+    ChainPipeline,
     Resize(usize, usize),
     Confirm,
     Cancel,
@@ -54,11 +55,17 @@ impl UserAction {
             (KeyCode::Char('?'), mods) if mods.contains(KeyModifiers::ALT) => {
                 Some(UserAction::ToggleInspector)
             }
+            (KeyCode::Char('|'), mods)
+                if mods.contains(KeyModifiers::ALT) && !mods.contains(KeyModifiers::CONTROL) =>
+            {
+                Some(UserAction::ChainPipeline)
+            }
             (KeyCode::Char(ch), mods) if mods == KeyModifiers::CONTROL => {
                 match ch.to_ascii_lowercase() {
                     'c' => Some(UserAction::Cancel),
                     'r' => Some(UserAction::ReloadCatalog),
                     'u' => Some(UserAction::ClearFilter),
+                    'o' => Some(UserAction::ChainPipeline),
                     'p' | 'k' => Some(UserAction::MoveUp),
                     'n' | 'j' => Some(UserAction::MoveDown),
                     'f' => Some(UserAction::StepRight),
@@ -114,6 +121,7 @@ impl From<BindableAction> for UserAction {
             BindableAction::ClearFilter => Self::ClearFilter,
             BindableAction::ReloadCatalog => Self::ReloadCatalog,
             BindableAction::ToggleInspector => Self::ToggleInspector,
+            BindableAction::ChainPipeline => Self::ChainPipeline,
             BindableAction::Confirm => Self::Confirm,
             BindableAction::Cancel => Self::Cancel,
         }
@@ -347,6 +355,16 @@ impl CommandLine {
 
     fn tokens(&self) -> &[String] {
         &self.tokens
+    }
+
+    fn active_option_tokens(&self) -> &[String] {
+        let start = self.subcmd_token_indices.last().map_or(1, |&idx| idx + 1);
+        let tail = self.tokens.get(start..).unwrap_or(&[]);
+        let end = tail
+            .iter()
+            .position(|tok| tok == "--" || tok == "--%")
+            .unwrap_or(tail.len());
+        &tail[..end]
     }
 
     fn push_token_dedup(&mut self, token: String) {
@@ -1053,6 +1071,7 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     pane2_tokens_rev: u64,
     last_p1_identity: Option<(String, EntryKind)>,
     last_p2_text: Option<String>,
+    last_inspected_identity: Option<(String, EntryKind)>,
     skip_child_filter_clear_once: bool,
     introspector: I,
     catalog_loader: Option<CatalogLoader>,
@@ -1068,6 +1087,7 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     viewport: Viewport,
     dialect: ShellDialect,
     inspector_expanded: bool,
+    inspector_scroll: usize,
     ui_style: UiStyle,
     keybindings: KeybindingsConfig,
     dirty: bool,
@@ -1095,6 +1115,7 @@ impl<I: Introspect> MillerSession<I> {
             pane2_tokens_rev: u64::MAX,
             last_p1_identity: None,
             last_p2_text: None,
+            last_inspected_identity: None,
             skip_child_filter_clear_once: false,
             introspector,
             catalog_loader: None,
@@ -1110,6 +1131,7 @@ impl<I: Introspect> MillerSession<I> {
             viewport,
             dialect,
             inspector_expanded: false,
+            inspector_scroll: 0,
             ui_style: UiStyle::default(),
             keybindings: KeybindingsConfig::default(),
             dirty: true,
@@ -1323,6 +1345,7 @@ impl<I: Introspect> MillerSession<I> {
             UserAction::Cancel => {
                 if self.inspector_expanded {
                     self.inspector_expanded = false;
+                    self.inspector_scroll = 0;
                     self.dirty = true;
                     return SessionOutcome::Continue;
                 }
@@ -1331,6 +1354,7 @@ impl<I: Introspect> MillerSession<I> {
             UserAction::Confirm => return SessionOutcome::Confirmed(self.command_line()),
             UserAction::ToggleInspector => {
                 self.inspector_expanded = !self.inspector_expanded;
+                self.inspector_scroll = 0;
                 self.dirty = true;
                 return SessionOutcome::Continue;
             }
@@ -1362,7 +1386,13 @@ impl<I: Introspect> MillerSession<I> {
             | UserAction::PageUp
             | UserAction::PageDown
             | UserAction::MoveHome
-            | UserAction::MoveEnd => self.apply_navigation(&action),
+            | UserAction::MoveEnd => {
+                if self.inspector_expanded {
+                    self.scroll_inspector(&action);
+                } else {
+                    self.apply_navigation(&action);
+                }
+            }
             UserAction::StepRight => self.step_right(),
             UserAction::StepLeft => self.step_left(),
             UserAction::AcceptToken => self.accept_token(),
@@ -1378,6 +1408,7 @@ impl<I: Introspect> MillerSession<I> {
                     self.finish_filter_edit();
                 }
             }
+            UserAction::ChainPipeline => self.chain_pipeline(),
         }
 
         if self.dirty {
@@ -1403,6 +1434,37 @@ impl<I: Introspect> MillerSession<I> {
             _ => false,
         };
         if moved {
+            self.dirty = true;
+        }
+    }
+
+    fn inspected_entry(&self) -> Option<&Entry> {
+        let cur_p1 = self.panes[0].selected();
+        let cur_p2 = self.panes[1].selected();
+        let cur_p3 = self.panes[2].selected();
+        match self.active_pane {
+            Pane::Third => cur_p3.or(cur_p2).or(cur_p1),
+            Pane::Second => cur_p2.or(cur_p1),
+            Pane::First => cur_p1,
+        }
+    }
+
+    fn scroll_inspector(&mut self, action: &UserAction) {
+        let max_scroll =
+            expanded_inspector_max_scroll(self.inspected_entry(), self.viewport, self.ui_style);
+        let page = self.viewport.rows(Pane::First).max(1);
+        let prev = self.inspector_scroll.min(max_scroll);
+        let next = match action {
+            UserAction::MoveUp => prev.saturating_sub(1),
+            UserAction::MoveDown => (prev + 1).min(max_scroll),
+            UserAction::PageUp => prev.saturating_sub(page),
+            UserAction::PageDown => (prev + page).min(max_scroll),
+            UserAction::MoveHome => 0,
+            UserAction::MoveEnd => max_scroll,
+            _ => prev,
+        };
+        if next != self.inspector_scroll {
+            self.inspector_scroll = next;
             self.dirty = true;
         }
     }
@@ -1725,9 +1787,20 @@ impl<I: Introspect> MillerSession<I> {
                 }
             }
             self.dirty = true;
-        } else if self.cmd.pipeline_prefix.take().is_some() {
-            self.active_pane = Pane::First;
-            self.cmd.resume_preview(Pane::Second);
+        } else if let Some(prefix) = self.cmd.pipeline_prefix.take() {
+            let trimmed = prefix.trim_end();
+            if trimmed.ends_with('|') && !trimmed.ends_with("||") {
+                let without_pipe = trimmed[..trimmed.len() - 1].trim_end();
+                if !without_pipe.is_empty() {
+                    self.restore_pipeline_stage(without_pipe);
+                } else {
+                    self.active_pane = Pane::First;
+                    self.cmd.resume_preview(Pane::Second);
+                }
+            } else {
+                self.active_pane = Pane::First;
+                self.cmd.resume_preview(Pane::Second);
+            }
             self.dirty = true;
         } else if self.active_pane != Pane::First {
             self.active_pane = match self.active_pane {
@@ -1738,6 +1811,68 @@ impl<I: Introspect> MillerSession<I> {
             self.cmd.resume_preview(Pane::Third);
             self.dirty = true;
         }
+    }
+
+    fn chain_pipeline(&mut self) {
+        if self.cmd.tokens().is_empty() {
+            return;
+        }
+        let assembled = self.command_line();
+        let trimmed = assembled.trim();
+        if trimmed.is_empty() || (trimmed.ends_with('|') && !trimmed.ends_with("||")) {
+            return;
+        }
+        self.cmd.pipeline_prefix = Some(format!("{trimmed} |"));
+        self.cmd.tokens.clear();
+        self.cmd.tokens_rev += 1;
+        self.cmd.subcmd_chain.clear();
+        self.cmd.subcmd_token_indices.clear();
+        self.cmd.pending_pane2_seed = None;
+        self.cmd.pending_pane2_reselect = None;
+        self.cmd.pending_inline_pane3_seed = None;
+        self.cmd.pending_pane3_seeds.clear();
+        self.cmd.suppress_pane1_preview = false;
+        self.cmd.suppress_pane2_preview = false;
+        self.cmd.suppress_pane3_preview = false;
+
+        self.panes[0].clear_filter();
+        self.panes[1].clear_filter();
+        self.panes[2].clear_filter();
+        self.panes[0].reset_cursor();
+        self.panes[1].set_entries(Vec::new());
+        self.panes[2].set_entries(Vec::new());
+        self.pane2_cache_state = None;
+        self.pane2_cache_stale = false;
+        self.pane3_cache_state = None;
+        self.last_p1_identity = None;
+        self.last_p2_text = None;
+        self.active_param_set_label = None;
+        self.inspector_expanded = false;
+        self.active_pane = Pane::First;
+        self.dirty = true;
+    }
+
+    fn restore_pipeline_stage(&mut self, stage_buffer: &str) {
+        self.panes[0].clear_filter();
+        self.panes[0].reset_cursor();
+        self.panes[1].clear_filter();
+        self.panes[2].clear_filter();
+        let (mut cmd, active_pane) =
+            CommandLine::from_initial_buffer(stage_buffer, &mut self.panes[0], self.dialect);
+        if cmd.tokens.len() == 1 && active_pane == Pane::Second {
+            cmd.suppress_pane2_preview = true;
+        } else if cmd.tokens.len() >= 2 && active_pane == Pane::Second {
+            cmd.suppress_pane3_preview = true;
+        }
+        self.cmd = cmd;
+        self.active_pane = active_pane;
+        self.pane2_cache_state = None;
+        self.pane2_cache_stale = false;
+        self.pane3_cache_state = None;
+        self.last_p1_identity = None;
+        self.last_p2_text = None;
+        self.active_param_set_label = None;
+        self.sync_panes();
     }
 
     /// Assembles the current live Command Line string from Committed Tokens and cursor preview.
@@ -1760,8 +1895,11 @@ impl<I: Introspect> MillerSession<I> {
             panes: [&self.panes[0], &self.panes[1], &self.panes[2]],
             command_line: self.command_line(),
             active_param_set: self.active_param_set_label.as_deref(),
+            subcmd_chain: &self.cmd.subcmd_chain,
+            committed_tokens: self.cmd.active_option_tokens(),
             dialect: self.dialect,
             inspector_expanded: self.inspector_expanded,
+            inspector_scroll: self.inspector_scroll,
             style: self.ui_style,
         }
     }
@@ -2043,6 +2181,15 @@ impl<I: Introspect> MillerSession<I> {
     fn clamp_scroll(&mut self) {
         for pane in Pane::ALL {
             self.panes[pane.index()].clamp_scroll(self.viewport.rows(pane));
+        }
+        let inspected = self.inspected_entry().map(|e| (e.text.clone(), e.kind));
+        if inspected != self.last_inspected_identity {
+            self.last_inspected_identity = inspected;
+            self.inspector_scroll = 0;
+        } else if self.inspector_expanded && self.inspector_scroll > 0 {
+            let max_scroll =
+                expanded_inspector_max_scroll(self.inspected_entry(), self.viewport, self.ui_style);
+            self.inspector_scroll = self.inspector_scroll.min(max_scroll);
         }
     }
 }
@@ -4608,5 +4755,271 @@ confirm = "ctrl+y"
             ))),
             SessionOutcome::Confirmed("git status".to_string())
         );
+    }
+
+    #[test]
+    fn test_session_subcmd_breadcrumb_updates_through_navigation() {
+        let mut add = Entry::new("add", "add", EntryKind::Subcmd, "Add remote");
+        add.children = vec![Entry::new("-f", "-f", EntryKind::Flag, "Fetch")];
+        let mut remote = Entry::new("remote", "remote", EntryKind::Subcmd, "Manage remotes");
+        remote.children = vec![add];
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git VCS");
+        git.children = vec![remote];
+
+        let mut session = MillerSession::new(
+            vec![git],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(110, 14),
+            ShellDialect::Posix,
+        );
+        assert!(session.view().subcmd_chain.is_empty());
+
+        session.apply(UserAction::StepRight); // Pane 2: remote
+        session.apply(UserAction::StepRight); // Pane 3: add
+        session.apply(UserAction::StepRight); // Slide into remote -> Pane 2: add
+        assert_eq!(session.view().subcmd_chain, &["remote".to_string()]);
+        let frame = session.render();
+        assert!(frame.contains("2. git › remote (1)"));
+
+        session.apply(UserAction::StepLeft); // Pane 3 -> Pane 2 (still inside remote)
+        assert_eq!(session.view().active_pane, Pane::Second);
+        assert_eq!(session.view().subcmd_chain, &["remote".to_string()]);
+
+        session.apply(UserAction::StepLeft); // Pop remote back to Pane 2 of git
+        assert!(session.view().subcmd_chain.is_empty());
+        let root_frame = session.render();
+        assert!(root_frame.contains("2. Subcommands / Params (1)"));
+    }
+
+    #[test]
+    fn test_session_tracks_committed_pane2_tokens_in_active_segment_only() {
+        let mut tool = Entry::new("tool", "tool", EntryKind::Cli, "CLI");
+        let mut sub = Entry::new("sub", "sub", EntryKind::Subcmd, "Subcommand");
+        sub.children = vec![
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Sub verbose"),
+            Entry::new("--only-sub", "--only-sub", EntryKind::Flag, "Only sub"),
+        ];
+        tool.children = vec![
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Root verbose"),
+            Entry::new("--name", "--name", EntryKind::Param, "Name")
+                .with_aliases(vec!["n".to_string()]),
+            sub,
+        ];
+
+        let mut session = MillerSession::new(
+            vec![tool],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(110, 14),
+            ShellDialect::Posix,
+        );
+
+        // Moving cursor over `--verbose` in Pane 2 without committing must not mark it.
+        session.apply(UserAction::StepRight);
+        assert!(session.view().committed_tokens.is_empty());
+        assert!(!session.render().contains('✓'));
+
+        // Committing `--verbose` marks it in Pane 2.
+        session.apply(UserAction::AcceptToken);
+        assert_eq!(session.view().committed_tokens, &["--verbose".to_string()]);
+        let after_flag = session.render();
+        let v_row = after_flag
+            .lines()
+            .find(|l| l.contains("--verbose"))
+            .unwrap();
+        let n_row = after_flag.lines().find(|l| l.contains("--name")).unwrap();
+        assert!(v_row.contains('✓'));
+        assert!(!n_row.contains('✓'));
+
+        // Popping `--verbose` with Backspace removes the marker.
+        session.apply(UserAction::Backspace);
+        assert!(session.view().committed_tokens.is_empty());
+        assert!(!session.render().contains('✓'));
+
+        // Commit `--verbose` then slide into `sub`: parent's `--verbose` must not mark `sub`'s `--verbose`.
+        let mut inner = Entry::new("inner", "inner", EntryKind::Subcmd, "Inner subcommand");
+        inner.children = vec![Entry::new(
+            "--only-inner",
+            "--only-inner",
+            EntryKind::Flag,
+            "Only inner",
+        )];
+        let mut sub2 = Entry::new("sub", "sub", EntryKind::Subcmd, "Subcommand");
+        sub2.children = vec![
+            inner,
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Sub verbose"),
+        ];
+        let mut tool2 = Entry::new("tool", "tool", EntryKind::Cli, "CLI");
+        tool2.children = vec![
+            Entry::new("--verbose", "--verbose", EntryKind::Flag, "Root verbose"),
+            sub2,
+        ];
+        let mut sub_sess = MillerSession::new(
+            vec![tool2],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(110, 14),
+            ShellDialect::Posix,
+        );
+        sub_sess.apply(UserAction::StepRight); // Pane 2: --verbose
+        sub_sess.apply(UserAction::AcceptToken); // commits root --verbose
+        assert_eq!(sub_sess.view().committed_tokens, &["--verbose".to_string()]);
+        sub_sess.apply(UserAction::MoveDown); // sub
+        sub_sess.apply(UserAction::StepRight); // Pane 3 of sub (inner)
+        sub_sess.apply(UserAction::StepRight); // slide into sub (Pane 2 shows inner, --verbose)
+        assert_eq!(sub_sess.view().subcmd_chain, &["sub".to_string()]);
+        assert_eq!(sub_sess.view().committed_tokens, &["inner".to_string()]);
+        assert!(!sub_sess.render().contains('✓'));
+    }
+
+    #[test]
+    fn test_chain_pipeline_keybindings_fold_and_backspace_undo() {
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(UserAction::ChainPipeline)
+        );
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(KeyCode::Char('|'), KeyModifiers::ALT)),
+            Some(UserAction::ChainPipeline)
+        );
+        assert_eq!(
+            UserAction::from_key_event(KeyEvent::new(
+                KeyCode::Char('|'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            )),
+            Some(UserAction::ChainPipeline)
+        );
+
+        let mut git = Entry::new("git", "git", EntryKind::Cli, "Git");
+        git.children = vec![Entry::new("status", "status", EntryKind::Subcmd, "Status")];
+        let mut grep = Entry::new("grep", "grep", EntryKind::Cli, "Search");
+        grep.children = vec![Entry::new("-i", "-i", EntryKind::Flag, "Ignore case")];
+        let mut wc = Entry::new("wc", "wc", EntryKind::Cli, "Word count");
+        wc.children = vec![Entry::new("-l", "-l", EntryKind::Flag, "Lines")];
+
+        let mut session = MillerSession::new(
+            vec![git, grep, wc],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(110, 14),
+            ShellDialect::Posix,
+        );
+
+        // No-op when active segment has no committed tokens yet.
+        session.apply(UserAction::ChainPipeline);
+        assert_eq!(session.view().active_pane, Pane::First);
+        assert_eq!(session.command_line(), "git");
+
+        // Build `git status` and chain into pipeline stage 2.
+        session.apply(UserAction::StepRight); // Pane 2: status
+        assert_eq!(session.command_line(), "git status");
+        session.apply(UserAction::ChainPipeline);
+        assert_eq!(session.view().active_pane, Pane::First);
+        assert!(session.view().subcmd_chain.is_empty());
+        assert_eq!(session.command_line(), "git status | git");
+
+        // Second immediate ChainPipeline with empty stage-2 tokens is a safe no-op.
+        session.apply(UserAction::ChainPipeline);
+        assert_eq!(session.command_line(), "git status | git");
+
+        // Build `grep -i` in stage 2 and chain stage 3 `wc -l`.
+        session.apply(UserAction::MoveDown); // grep
+        session.apply(UserAction::StepRight); // Pane 2: -i
+        session.apply(UserAction::AcceptToken); // commits -i
+        assert_eq!(session.command_line(), "git status | grep -i");
+
+        session.apply(UserAction::ChainPipeline);
+        assert_eq!(session.view().active_pane, Pane::First);
+        session.apply(UserAction::MoveDown); // grep
+        session.apply(UserAction::MoveDown); // wc
+        session.apply(UserAction::StepRight); // Pane 2: -l
+        assert_eq!(session.command_line(), "git status | grep -i | wc -l");
+
+        // Backspace pops `wc` back to empty stage 3 (`git status | grep -i | ...`),
+        // then next Backspace undoes the pipeline boundary back to `git status | grep -i`.
+        session.apply(UserAction::Backspace); // pops `wc`
+        assert_eq!(session.view().active_pane, Pane::First);
+        session.apply(UserAction::Backspace); // pops second `|` boundary
+        assert_eq!(session.command_line(), "git status | grep -i");
+
+        // Pop `-i` and `grep`, then Backspace undoes the first `|` boundary back to `git status`.
+        session.apply(UserAction::Backspace); // pops `-i`
+        session.apply(UserAction::Backspace); // pops `grep`
+        assert_eq!(session.view().active_pane, Pane::First);
+        session.apply(UserAction::Backspace); // pops first `|` boundary
+        assert_eq!(session.command_line(), "git status");
+        assert_eq!(session.view().active_pane, Pane::Third);
+    }
+
+    #[test]
+    fn test_expanded_inspector_scroll_routing_and_reset() {
+        let long_desc = (1..=25)
+            .map(|i| format!("Line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let e1 = Entry::new("cmd1", "cmd1", EntryKind::Cli, long_desc);
+        let e2 = Entry::new("cmd2", "cmd2", EntryKind::Cli, "Short description");
+
+        let mut session = MillerSession::new(
+            vec![e1, e2],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::new(100, 14),
+            ShellDialect::Posix,
+        );
+
+        session.apply(UserAction::ToggleInspector);
+        assert!(session.view().inspector_expanded);
+        assert_eq!(session.view().inspector_scroll, 0);
+
+        // Down/PgDn/End scroll the inspector without moving Pane 1's cursor (`cmd1` stays selected).
+        session.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(session.view().inspector_scroll, 1);
+        assert_eq!(session.view().panes[0].sel_idx(), 0);
+
+        session.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        )));
+        assert!(session.view().inspector_scroll > 1);
+        assert_eq!(session.view().panes[0].sel_idx(), 0);
+
+        session.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+        let end_scroll = session.view().inspector_scroll;
+        assert!(end_scroll >= 10);
+        let bottom_frame = session.render();
+        assert!(bottom_frame.contains("Line 25"));
+        assert_eq!(bottom_frame.lines().count(), 14);
+
+        session.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        assert_eq!(session.view().inspector_scroll, end_scroll - 1);
+
+        session.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        )));
+        assert!(session.view().inspector_scroll < end_scroll - 1);
+
+        session.handle_terminal_event(Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        assert_eq!(session.view().inspector_scroll, 0);
+        assert_eq!(session.view().panes[0].sel_idx(), 0);
+
+        // Closing inspector resets scroll offset.
+        session.apply(UserAction::MoveDown);
+        assert_eq!(session.view().inspector_scroll, 1);
+        session.apply(UserAction::Cancel);
+        assert!(!session.view().inspector_expanded);
+        assert_eq!(session.view().inspector_scroll, 0);
+
+        // Switching entries resets scroll offset when re-opened.
+        session.apply(UserAction::ToggleInspector);
+        session.apply(UserAction::MoveDown);
+        assert_eq!(session.view().inspector_scroll, 1);
+        session.apply(UserAction::ToggleInspector); // close
+        session.apply(UserAction::MoveDown); // move Pane 1 to cmd2
+        assert_eq!(session.view().panes[0].sel_idx(), 1);
+        session.apply(UserAction::ToggleInspector);
+        assert_eq!(session.view().inspector_scroll, 0);
     }
 }

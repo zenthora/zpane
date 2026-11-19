@@ -141,6 +141,7 @@ pub enum BindableAction {
     ClearFilter,
     ReloadCatalog,
     ToggleInspector,
+    ChainPipeline,
     Confirm,
     Cancel,
 }
@@ -161,6 +162,7 @@ impl BindableAction {
             "clear_filter" => Some(Self::ClearFilter),
             "reload_catalog" | "reload" => Some(Self::ReloadCatalog),
             "toggle_inspector" | "inspector" => Some(Self::ToggleInspector),
+            "chain_pipeline" | "pipeline" => Some(Self::ChainPipeline),
             "confirm" => Some(Self::Confirm),
             "cancel" => Some(Self::Cancel),
             _ => None,
@@ -996,6 +998,27 @@ history_limit = 10
             }
         );
         assert_eq!(top_cfg.history_limit, Some(10));
+    }
+
+    #[test]
+    fn test_parse_chain_pipeline_keybinding() {
+        let raw = r#"
+[keybindings]
+chain_pipeline = "ctrl+o"
+pipeline = "alt+|"
+"#;
+        let (cfg, diags) = parse_user_config_toml_with_diagnostics(raw);
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+        assert_eq!(
+            cfg.keybindings
+                .resolve(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(BindableAction::ChainPipeline)
+        );
+        assert_eq!(
+            cfg.keybindings
+                .resolve(KeyEvent::new(KeyCode::Char('|'), KeyModifiers::ALT)),
+            Some(BindableAction::ChainPipeline)
+        );
     }
 
     #[test]
