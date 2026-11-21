@@ -104,15 +104,35 @@ impl ShellDialect {
         shell: Option<&str>,
         is_windows: bool,
     ) -> Self {
+        Self::detect_with_reason_from_env(
+            zpane_shell,
+            has_ps_module_path,
+            has_fish_version,
+            has_nu_version,
+            shell,
+            is_windows,
+        )
+        .0
+    }
+
+    pub(super) fn detect_with_reason_from_env(
+        zpane_shell: Option<&str>,
+        has_ps_module_path: bool,
+        has_fish_version: bool,
+        has_nu_version: bool,
+        shell: Option<&str>,
+        is_windows: bool,
+    ) -> (Self, String) {
         if let Some(zs) = zpane_shell.map(str::trim).filter(|s| !s.is_empty()) {
+            let clean_zs = sanitize_single_line(zs);
             if zs.eq_ignore_ascii_case("pwsh") || zs.eq_ignore_ascii_case("powershell") {
-                return ShellDialect::PowerShell;
+                return (ShellDialect::PowerShell, format!("ZPANE_SHELL={clean_zs}"));
             }
             if zs.eq_ignore_ascii_case("nu") || zs.eq_ignore_ascii_case("nushell") {
-                return ShellDialect::Nushell;
+                return (ShellDialect::Nushell, format!("ZPANE_SHELL={clean_zs}"));
             }
             if zs.eq_ignore_ascii_case("fish") {
-                return ShellDialect::Fish;
+                return (ShellDialect::Fish, format!("ZPANE_SHELL={clean_zs}"));
             }
             if zs.eq_ignore_ascii_case("posix")
                 || zs.eq_ignore_ascii_case("bash")
@@ -123,28 +143,55 @@ impl ShellDialect {
                 || zs.eq_ignore_ascii_case("ksh")
                 || zs.eq_ignore_ascii_case("mksh")
             {
-                return ShellDialect::Posix;
+                return (ShellDialect::Posix, format!("ZPANE_SHELL={clean_zs}"));
             }
         }
         if has_nu_version {
-            ShellDialect::Nushell
-        } else if is_windows || has_ps_module_path {
-            ShellDialect::PowerShell
-        } else if has_fish_version
-            || shell
-                .map(str::trim)
-                .map(|s| s == "fish" || s.ends_with("/fish"))
-                .unwrap_or(false)
-        {
-            ShellDialect::Fish
-        } else if shell
+            (ShellDialect::Nushell, "NU_VERSION".to_string())
+        } else if has_ps_module_path {
+            (ShellDialect::PowerShell, "PSModulePath".to_string())
+        } else if is_windows {
+            (ShellDialect::PowerShell, "OS default (Windows)".to_string())
+        } else if has_fish_version {
+            (ShellDialect::Fish, "FISH_VERSION".to_string())
+        } else if let Some(s) = shell
             .map(str::trim)
-            .map(|s| s == "nu" || s.ends_with("/nu"))
-            .unwrap_or(false)
+            .filter(|s| *s == "fish" || s.ends_with("/fish"))
         {
-            ShellDialect::Nushell
+            (
+                ShellDialect::Fish,
+                format!("SHELL={}", sanitize_single_line(s)),
+            )
+        } else if let Some(s) = shell
+            .map(str::trim)
+            .filter(|s| *s == "nu" || s.ends_with("/nu"))
+        {
+            (
+                ShellDialect::Nushell,
+                format!("SHELL={}", sanitize_single_line(s)),
+            )
         } else {
-            ShellDialect::Posix
+            (ShellDialect::Posix, "OS default (Unix)".to_string())
+        }
+    }
+
+    /// Short machine-readable tag for this shell dialect (`pwsh`, `posix`, `fish`, `nu`).
+    pub const fn tag(self) -> &'static str {
+        match self {
+            ShellDialect::PowerShell => "pwsh",
+            ShellDialect::Posix => "posix",
+            ShellDialect::Fish => "fish",
+            ShellDialect::Nushell => "nu",
+        }
+    }
+
+    /// Human-readable display label for this shell dialect.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            ShellDialect::PowerShell => "PowerShell",
+            ShellDialect::Posix => "POSIX",
+            ShellDialect::Fish => "Fish",
+            ShellDialect::Nushell => "Nushell",
         }
     }
 
@@ -467,19 +514,36 @@ pub(super) fn non_empty_abs_env_path(var: &str) -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-/// Per-user cache directory: `%LOCALAPPDATA%\zpane` on Windows,
-/// `$XDG_CACHE_HOME/zpane` or `~/.cache/zpane` on Linux / Termux.
-pub(super) fn cache_dir() -> PathBuf {
-    let base = if cfg!(windows) {
-        non_empty_abs_env_path("LOCALAPPDATA").or_else(|| {
-            non_empty_abs_env_path("USERPROFILE").map(|p| p.join("AppData").join("Local"))
-        })
+pub(super) fn cache_dir_from(
+    is_windows: bool,
+    local_appdata: Option<&Path>,
+    userprofile: Option<&Path>,
+    xdg_cache_home: Option<&Path>,
+    home: Option<&Path>,
+) -> PathBuf {
+    let base = if is_windows {
+        local_appdata
+            .map(Path::to_path_buf)
+            .or_else(|| userprofile.map(|p| p.join("AppData").join("Local")))
     } else {
-        non_empty_abs_env_path("XDG_CACHE_HOME")
-            .or_else(|| non_empty_abs_env_path("HOME").map(|h| h.join(".cache")))
+        xdg_cache_home
+            .map(Path::to_path_buf)
+            .or_else(|| home.map(|h| h.join(".cache")))
     }
     .unwrap_or_else(env::temp_dir);
     base.join("zpane")
+}
+
+/// Per-user cache directory: `%LOCALAPPDATA%\zpane` on Windows,
+/// `$XDG_CACHE_HOME/zpane` or `~/.cache/zpane` on Linux / Termux.
+pub(super) fn cache_dir() -> PathBuf {
+    cache_dir_from(
+        cfg!(windows),
+        non_empty_abs_env_path("LOCALAPPDATA").as_deref(),
+        non_empty_abs_env_path("USERPROFILE").as_deref(),
+        non_empty_abs_env_path("XDG_CACHE_HOME").as_deref(),
+        non_empty_abs_env_path("HOME").as_deref(),
+    )
 }
 
 #[cfg(unix)]
@@ -668,11 +732,11 @@ pub(super) fn collect_path_dirs_with_prefix(
     dirs
 }
 
-fn load_specs_from_dir_bounded(
+pub(super) fn list_spec_files_in_dir(
     dir: &Path,
     max_files: usize,
     seen_canon_dirs: &mut HashSet<PathBuf>,
-) -> Vec<(String, String)> {
+) -> Vec<(String, PathBuf, String)> {
     if max_files == 0 {
         return Vec::new();
     }
@@ -713,8 +777,19 @@ fn load_specs_from_dir_bounded(
     files
         .into_iter()
         .filter_map(|(name, path)| {
-            read_bounded_string(&path, MAX_SPEC_BYTES as u64).map(|body| (name, body))
+            read_bounded_string(&path, MAX_SPEC_BYTES as u64).map(|body| (name, path, body))
         })
+        .collect()
+}
+
+fn load_specs_from_dir_bounded(
+    dir: &Path,
+    max_files: usize,
+    seen_canon_dirs: &mut HashSet<PathBuf>,
+) -> Vec<(String, String)> {
+    list_spec_files_in_dir(dir, max_files, seen_canon_dirs)
+        .into_iter()
+        .map(|(name, _path, body)| (name, body))
         .collect()
 }
 

@@ -31,6 +31,15 @@ pub enum ThemePreset {
 }
 
 impl ThemePreset {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Dark => "dark",
+            Self::Light => "light",
+            Self::Ansi16 => "ansi16",
+            Self::None => "none",
+        }
+    }
+
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "dark" => Some(Self::Dark),
@@ -51,6 +60,13 @@ pub enum IconMode {
 }
 
 impl IconMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unicode => "unicode",
+            Self::Ascii => "ascii",
+        }
+    }
+
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "unicode" => Some(Self::Unicode),
@@ -70,6 +86,14 @@ pub enum BorderStyle {
 }
 
 impl BorderStyle {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rounded => "rounded",
+            Self::Plain => "plain",
+            Self::Ascii => "ascii",
+        }
+    }
+
     fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "rounded" => Some(Self::Rounded),
@@ -126,6 +150,15 @@ impl HeightSpec {
             .parse::<usize>()
             .map_err(|_| format!("Invalid integer or percentage: {raw}"))?;
         Self::from_rows(rows)
+    }
+}
+
+impl fmt::Display for HeightSpec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Rows(r) => write!(f, "{r}"),
+            Self::Percent(p) => write!(f, "{p}%"),
+        }
     }
 }
 
@@ -402,30 +435,50 @@ impl UserConfig {
     }
 }
 
-/// Location of `zpane`'s user configuration file (`ZPANE_CONFIG`, `%LOCALAPPDATA%\zpane\config.toml`,
-/// `$XDG_CONFIG_HOME/zpane/config.toml`, or `~/.config/zpane/config.toml`).
-pub fn config_path() -> PathBuf {
-    if let Ok(explicit) = env::var("ZPANE_CONFIG") {
+pub(super) fn config_path_from(
+    is_windows: bool,
+    zpane_config: Option<&str>,
+    local_appdata: Option<&Path>,
+    userprofile: Option<&Path>,
+    xdg_config_home: Option<&Path>,
+    home: Option<&Path>,
+    fallback_cache_dir: &Path,
+) -> PathBuf {
+    if let Some(explicit) = zpane_config {
         let trimmed = explicit.trim();
         if !trimmed.is_empty() && !trimmed.contains('\0') {
             return PathBuf::from(trimmed);
         }
     }
-    if cfg!(windows) {
-        non_empty_abs_env_path("LOCALAPPDATA")
-            .or_else(|| {
-                non_empty_abs_env_path("USERPROFILE").map(|p| p.join("AppData").join("Local"))
-            })
+    if is_windows {
+        local_appdata
+            .map(Path::to_path_buf)
+            .or_else(|| userprofile.map(|p| p.join("AppData").join("Local")))
             .unwrap_or_else(env::temp_dir)
             .join("zpane")
             .join("config.toml")
-    } else if let Some(xdg) = non_empty_abs_env_path("XDG_CONFIG_HOME") {
+    } else if let Some(xdg) = xdg_config_home {
         xdg.join("zpane").join("config.toml")
-    } else if let Some(home) = non_empty_abs_env_path("HOME") {
+    } else if let Some(home) = home {
         home.join(".config").join("zpane").join("config.toml")
     } else {
-        cache_dir().join("config.toml")
+        fallback_cache_dir.join("config.toml")
     }
+}
+
+/// Location of `zpane`'s user configuration file (`ZPANE_CONFIG`, `%LOCALAPPDATA%\zpane\config.toml`,
+/// `$XDG_CONFIG_HOME/zpane/config.toml`, or `~/.config/zpane/config.toml`).
+pub fn config_path() -> PathBuf {
+    let explicit = env::var("ZPANE_CONFIG").ok();
+    config_path_from(
+        cfg!(windows),
+        explicit.as_deref(),
+        non_empty_abs_env_path("LOCALAPPDATA").as_deref(),
+        non_empty_abs_env_path("USERPROFILE").as_deref(),
+        non_empty_abs_env_path("XDG_CONFIG_HOME").as_deref(),
+        non_empty_abs_env_path("HOME").as_deref(),
+        &cache_dir(),
+    )
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -963,7 +1016,9 @@ pub fn parse_user_config_toml(raw: &str) -> UserConfig {
     parse_user_config_toml_with_diagnostics(raw).0
 }
 
-fn load_user_config_from_path_with_diagnostics(path: &Path) -> (UserConfig, Vec<ConfigDiagnostic>) {
+pub(super) fn load_user_config_from_path_with_diagnostics(
+    path: &Path,
+) -> (UserConfig, Vec<ConfigDiagnostic>) {
     let mut diags = Vec::new();
     let pre = match fs::metadata(path) {
         Ok(m) => m,

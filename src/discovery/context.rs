@@ -133,7 +133,7 @@ fn resolve_git_common_dir(git_dir: &Path) -> PathBuf {
     }
 }
 
-fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
+pub(super) fn detect_git_context_in(start_dir: &Path) -> (Option<String>, Vec<String>) {
     let Some(git_dir) = resolve_git_dir(start_dir) else {
         return (None, Vec::new());
     };

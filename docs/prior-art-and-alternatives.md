@@ -11,11 +11,11 @@ Modern command-line environments suffer from a severe discoverability and cognit
 - PowerShell introduces a rich, object-oriented cmdlet model (`Verb-Noun`, parameter sets, dynamic parameters, `[ValidateSet]` enums, and live session variables), yet interacting with these capabilities typically requires memorizing syntax, spamming `Get-Help`, or falling back to single-line completion menus.
 - Standard tab completion (such as PSReadLine's inline `MenuComplete` or Zsh completion) presents flat, 1-dimensional lists or simple 2D grids under the cursor line. These models lack multi-level contextual hierarchy: selecting an option immediately obscures its parent context, flag documentation, and valid argument choices.
 
-`zpane` addresses this problem by introducing a **blazing-fast, 3-column Miller layout** (cascading horizontal tree hierarchy popularized by macOS Finder, `ranger`, and `yazi`) specifically mapped to command generation:
-1. **Column 1 (Root / Scopes):** Scopes (`$env:*`, `$global:*`), Windows `%PATH%` executables, and reflected PowerShell Cmdlets/Functions/Aliases.
-2. **Column 2 (Subcommands / Options):** Subcommands, parameter flags, switches, or variable keys.
-3. **Column 3 (Values / Arguments / Previews):** Valid enum values, switch state toggles, variable contents, path elements, and live help descriptions.
-4. **Shell Integration:** Written in Rust, running directly on Windows console handles (`CONOUT$`), operating in raw VT mode on the alternate screen buffer, and returning the completed string directly into the active **PSReadLine** buffer via `[Microsoft.PowerShell.PSConsoleReadLine]::Replace`.
+`zpane` addresses this problem by introducing a **blazing-fast, 3-pane Miller layout** (cascading horizontal tree hierarchy popularized by macOS Finder, `ranger`, and `yazi`) specifically mapped to command generation across PowerShell, POSIX shells (`bash`/`zsh`), Fish, and Nushell:
+1. **Pane 1 (Command / Scope):** Variable Scope Roots (`$env:*` / `$global:*` in PowerShell, `$` in POSIX/Fish, `$env.*` / `$nu.*` in Nushell), `PATH` executables, shell RC functions/aliases, project-local task tools (`package.json`, `justfile`, `Makefile`, `mise.toml`), and reflected PowerShell Cmdlets/Functions/Aliases.
+2. **Pane 2 (Subcommands / Options):** Subcommands (with multi-level breadcrumb sliding), parameter flags, switches, project tasks, or variable keys, with dynamic PowerShell `ParameterSet` exclusivity pruning.
+3. **Pane 3 (Values / Arguments / Previews):** Valid enum/`[ValidateSet]`/`[ArgumentCompletions]` values, switch toggles, variable contents, path segments, live help descriptions, and a scrollable expanded Inspector (`F1`).
+4. **Cross-Platform Shell Integration:** Written in Rust, rendering directly to `CONOUT$` on Windows or `/dev/tty` on macOS/Linux/Termux in either full alternate-screen mode or inline partial-height mode (`--height <ROWS|PCT>`), and injecting the assembled command back into the active prompt buffer via `zpane init <pwsh|zsh|bash|fish|nu> [--bind|--no-bind]` with cursor-aware `--cursor` suffix preservation.
 
 This research document investigates the existing software landscape, prior art, direct conceptual equivalents, and ecosystem alternatives across primary sources (official GitHub repositories, source code, specifications, and package distributions). It synthesizes comparative metrics, identifies the distinct value proposition of `zpane`, and outlines high-impact architectural opportunities inspired by related projects.
 
@@ -287,7 +287,7 @@ The following matrix systematically evaluates `zpane` alongside the identified p
 
 | Tool | UI Paradigm | Implementation Language | Discovery / Introspection Engine | Parameter / Argument Inspection | Shell Handoff / Integration | Target Platform & Ecosystem | Latency & Startup Overhead |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **`zpane`** | **3-Pane Miller Columns** + Status/Preview Pane | **Rust** (Crossterm, Rayon) | **Dual Hybrid**: Live `--help` regex JIT + PS CLR Reflection (`ps_metadata.json`) | **Yes**: Enums, switch flags, path segments, variable values | **Direct Buffer Replace** via PSReadLine API (`--out` / `Replace`) | **Windows / PowerShell & Native CLI** | **< 10ms** (Instant compiled binary, VT raw mode) |
+| **`zpane`** | **3-Pane Miller Columns** (Full-Screen & Inline `--height`) + Scrollable Inspector | **Rust** (Crossterm, Rayon) | **Dual Hybrid**: Live JIT (`--help` grammars, `man`, `carapace`, `cli_cache_<dialect>.json`) + PS CLR Reflection & MAML Help (`ps_metadata.json`) + XDG Specs & Project Tasks | **Yes**: Enums, switches, `[ValidateRange]`/`[ArgumentCompletions]`, path segments, variables, custom prompts | **Direct In-Place Buffer Replace** (`zpane init pwsh\|zsh\|bash\|fish\|nu`, cursor-aware `--cursor`) | **Cross-Platform**: Windows, macOS (arm64/x86_64), Linux (x86_64/arm64), Termux (aarch64) | **< 10ms** (Instant compiled binary, DEC 2026 sync, `CONOUT$` / `/dev/tty`) |
 | **`bract`** | **Lazy Miller Columns** + Guided Input Forms | **Rust** (Ratatui, Crossterm) | **JIT CLI Help**: Framework grammars (Cobra, Clap, Knack) + `mise` | **Yes**: Guided form fields for flags and arguments | **Clipboard Copy** or direct process execution | **Linux / macOS** (Cloud & dev toolchains) | **Fast** (Compiled binary, background threading) |
 | **`cmdpeek`** | **Single-List Fuzzy Picker** | **TypeScript / Node.js** | **Live JIT Parsing**: Scrapes `--help` / man pages on the fly | **Partial**: Explores flags and options | **Stdout print** / Clipboard copy | **Cross-Platform** (Requires Node.js runtime) | **Moderate** (~80–150ms Node.js VM spin-up) |
 | **`inshellisense`** | **IDE Vertical Dropdown** + Help Popup | **TypeScript / Node.js** (Rust port: `is-rs`) | **Curated Specifications** (600+ Fig autocomplete specs) | **Yes**: Subcommands, flags, predefined option lists | **Prompt Buffer Mutation** via terminal interceptor | **Cross-Platform** (Bash, Zsh, Fish, PowerShell) | **Moderate** (Persistent background wrapper process) |
@@ -310,80 +310,62 @@ Among all analyzed tools, **no single existing utility matches the exact archite
 `zpane` occupies a distinct architectural niche defined by four foundational differentiators:
 
 ### 1. The Dual-Engine Hybrid Discovery Model
-Unlike purely Unix-focused CLI explorers or purely PowerShell-focused cmdlets, `zpane` reconciles the two fundamentally divergent worlds of modern Windows terminal operations:
-- **The PowerShell CLR / AST Universe:** Seamlessly reflects compiled cmdlets, functions, and aliases. It extracts parameter names, aliases, types, switch flags, and `[ValidateSet]` constraints via `ps_metadata.json`—populating Column 2 with parameters and Column 3 with allowed enum values.
-- **The Windows `%PATH%` Native Executable Universe:** Scans system PATH for native binaries (`.exe`, `.cmd`, `.bat`). When navigated, it launches non-blocking asynchronous worker threads that query `<binary> --help` or `-h` with strict timeouts (450ms) and `CREATE_NO_WINDOW` flags (preventing flickering console windows on Windows), parsing subcommands and flags using high-throughput regular expressions.
-- **First-Class Variable and Environment Scopes:** Unifies environment variables (`$env:*`) and session variables (`$global:*`, `$PWD`, `$HOME`, `$PROFILE`) directly into Column 1, expanding path tokens into Column 2 and literal values into Column 3.
+Unlike purely Unix-focused CLI explorers or purely PowerShell-focused cmdlets, `zpane` reconciles both worlds across Windows, macOS, Linux, and Termux:
+- **The PowerShell CLR / MAML Universe:** Reflects compiled cmdlets, functions, and aliases via `pwsh` (with automatic Windows PowerShell 5.1 `powershell.exe` fallback) into `ps_metadata.json`, capturing parameter names, aliases, types, switch flags, `[ValidateSet]`/`Enum`/`[ArgumentCompletions]` values, `[ValidateRange]` constraints, mandatory/positional/pipeline metadata, and `ParameterSet` memberships—augmented lazily with MAML `*-Help.xml` and `Get-Help` documentation.
+- **The Cross-Platform Native CLI & Spec Universe:** Scans `PATH` for native binaries (`.exe`/`.cmd`/`.bat` on Windows; `+x` executables and symlinks on Unix/Termux) and introspects `<binary> --help` / `-h` asynchronously with a configurable timeout (default `750`ms, `100..=10000`ms), lazy binary fingerprinting in dialect-scoped `cli_cache_<dialect>.json`, section-aware grammars (Cobra, Clap, Knack/Argparse, winget, git), Unix `man`-page fallback, XDG declarative specs (`zpane/specs` → `carapace/specs` → legacy cache), optional `carapace <cmd> export` fallback, and zero-subprocess project-local task discovery (`package.json`, `justfile`/`.justfile`, `Makefile`/`makefile`/`GNUmakefile`, `mise.toml`/`.mise.toml`).
+- **First-Class Dialect-Aware Variable Scopes:** Adapts automatically across **PowerShell** (`$env:*`, `$global:*`), **POSIX** (`$*`, `$?`, `$!`), **Fish** (`$*`, `$status`, `$last_pid`, `$fish_pid`), and **Nushell** (`$env.*`, `$nu.*`, `$in`), expanding path-list variables into Pane 2 and literal values into Pane 3.
 
-### 2. True 3-Column Cascading Tree for Command Construction
+### 2. True 3-Pane Cascading Tree for Command Construction
 Traditional autocomplete menus are ephemeral 1D dropdowns: as soon as you type or drill down, parent context disappears.
 - In `zpane`, the user retains continuous visual orientation across the entire syntax tree:
-  - **Left Pane:** Where you originated (e.g. `git`, `winget`, `Get-Process`, or `$env:PATH`).
-  - **Center Pane:** What option or subcommand is currently active (e.g. `remote`, `install`, `-ComputerName`).
-  - **Right Pane:** The downstream implications (allowed enum arguments, switch toggles, variable literal values, or flag descriptions).
-- Arrow keys provide natural spatial traversal (`Right` to descend, `Left` to ascend, `Up`/`Down` to navigate options), while typing dynamically fuzzy-filters only the currently active column.
+  - **Pane 1 (Left):** Where you originated (e.g. `git`, `winget`, `Get-Process`, or `$env:PATH`).
+  - **Pane 2 (Center):** What option or subcommand is currently active (e.g. `remote`, `install`, `-ComputerName`), with breadcrumb trails for deep subcommand chains and committed-token markers.
+  - **Pane 3 (Right):** The downstream implications (allowed enum arguments, switch toggles, variable literal values, custom value prompts, or full scrollable Inspector docs via `F1`).
+- Arrow keys and home-row chords provide natural spatial traversal (`Right` to descend, `Left` to ascend, `Up`/`Down` to navigate options, `Ctrl+O`/`Alt+|` to chain pipelines), while typing dynamically fuzzy-filters only the currently active Pane.
 
-### 3. In-Place PSReadLine Buffer Injection (Zero Subshell Spawning)
-A major defect of tools like `bract`, `navi`, or standalone TUIs is the handoff barrier:
-- Spawning a child subshell to run the command destroys shell state (environment changes like `cd` or `$env:FOO = 'bar'` are lost when the subshell terminates; PowerShell object pipelines cannot cross process boundaries).
+### 3. In-Place Multi-Shell Prompt Buffer Injection (Zero Subshell Spawning)
+A major defect of standalone TUIs is the handoff barrier:
+- Spawning a child subshell to run the command destroys shell state (environment changes like `cd` or variable assignments are lost when the subshell terminates; PowerShell and Nushell structured pipelines cannot cross process boundaries).
 - Copying to the clipboard forces a manual paste step (`Ctrl+V`).
-- `zpane` bridges directly into PowerShell's prompt buffer:
+- `zpane init <pwsh|zsh|bash|fish|nu> [--bind <CHORD> | --no-bind]` generates native prompt-editor widgets (default `Alt+m`) for **PowerShell** (`PSReadLine`), **Zsh** (`zle`), **Bash** (`bind -x`), **Fish** (`commandline`), and **Nushell** (`$env.config.keybindings`):
   ```powershell
-  # PSReadLine Keybinding Integration
-  Set-PSReadLineKeyHandler -Chord 'Ctrl+m' -ScriptBlock {
-      $line = $null; $cursor = $null
-      [Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$line, [ref]$cursor)
-      $tmp = [System.IO.Path]::GetTempFileName()
-      try {
-          zpane --initial "$line" --out-file "$tmp"
-          if (Test-Path $tmp) {
-              $newCmd = (Get-Content $tmp -Raw).Trim()
-              if ($newCmd) {
-                  [Microsoft.PowerShell.PSConsoleReadLine]::Replace(0, $line.Length, $newCmd)
-              }
-          }
-      } finally {
-          Remove-Item $tmp -ErrorAction SilentlyContinue
-      }
-  }
+  # PowerShell ($PROFILE) — generated by `zpane init pwsh`
+  Invoke-Expression (& zpane init pwsh | Out-String)
   ```
-  When accepted, the built command replaces the live buffer in place. The user can immediately review it, tweak arguments, pipe it into another cmdlet (`| Format-Table`), or press Enter to record it into native PSReadLine history.
+  Each widget forwards the active prompt line, cursor offset (`--cursor`), and recent live history (plus session variables/functions in PowerShell). When accepted, the built command replaces the live buffer in place while preserving any trailing text past the cursor—so the user can review it, pipe it further, or execute it directly in native shell history.
 
-### 4. Zero-Latency Native Windows Console Architecture
-- Implemented as a compiled, stripped native binary (~2.1 MB) with no runtime dependencies (no Node.js, Python, or .NET CLR spin-up cost).
-- Directly opens the Win32 console handle `CONOUT$`, explicitly enables Virtual Terminal Processing (`ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT`), switches to the alternate screen buffer (`\x1b[?1049h`), and hides the cursor (`\x1b[?25l`).
-- Renders whole screen frames into a single allocated UTF-16 buffer written via Win32 `WriteConsoleW`, guaranteeing zero screen tearing, instantaneous redraws, and clean restoration of the user's terminal upon exit.
+### 4. Cross-Platform Zero-Latency Native Terminal Architecture
+- Implemented as a compiled, stripped native binary with no runtime dependencies (no Node.js, Python, or .NET CLR spin-up cost) and distributed via `crates.io`, `cargo-binstall`, Homebrew (macOS/Linux arm64 & x86_64), Scoop, WinGet, Arch, Debian/Ubuntu, Fedora, and Termux.
+- Renders directly to the Win32 console handle `CONOUT$` (`WriteConsoleW` UTF-16 buffer with Virtual Terminal Processing) on Windows and directly to `/dev/tty` on macOS, Linux, and Termux—keeping stdout strictly clean for command handoff and JSON output.
+- Supports both full alternate-screen rendering (`\x1b[?1049h`) and inline partial-height rendering (`--height <ROWS|PCT>`, `[ui].height`/`min_height`), DEC Mode 2026 Synchronized Output (`\x1b[?2026h`…`\x1b[?2026l`), selectable themes (`dark`, `light`, `ansi16`, `none`), automatic `NO_COLOR` / `TERM=dumb` compliance, ASCII icon/border modes, and read-only `zpane doctor [--json]` environment diagnostics.
 
 ---
 
-## 5. Cross-Pollinated Architecture & Roadmap Opportunities
+## 5. Cross-Pollinated Architecture & Implemented Capabilities
 
-Analyzing the strengths of prior art directly informed several core capabilities implemented in `zpane`, as well as future roadmap extensions:
+Analyzing the strengths of prior art directly informed the core capabilities now implemented in `zpane`:
 
-### 1. Framework-Specific Help Grammar Parsers (Inspired by `bract` — Implemented)
-- **Architecture:** Rather than relying solely on naive regexes, `zpane` detects section headers (`CORE COMMANDS`, `Commands:`, `Flags:`, `Options:`, Git prose headers) and parses framework-specific CLI patterns across **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **winget**, and **git** (`-h`), automatically extracting `[possible values: ...]` and `[default: ...]` into Column 3 children.
+### 1. Framework-Specific Help Grammars & `man` Fallback (Inspired by `bract` & `cmdpeek` — Implemented)
+- **Architecture:** Rather than relying solely on naive regexes, `zpane` detects section headers (`CORE COMMANDS`, `Commands:`, `Flags:`, `Options:`, Git prose headers) and parses framework-specific CLI patterns across **Cobra** (`gh`, `kubectl`, `docker`), **Clap** (`cargo`, `rg`, `fd`, `prek`), **Knack / Argparse** (`az`, Python CLIs), **winget**, and **git** (`-h`), extracting `[possible values: ...]` and `[default: ...]` into Pane 3 children, and falls back to Unix `man` pages when `--help` yields no entries.
 
-### 2. Declarative Specification & Carapace Bridge Fallback (Inspired by `carapace` & Fig — Roadmap)
-- **Opportunity:**
-  - Support loading lightweight declarative JSON/YAML specs (such as `carapace-spec` or simplified Fig specs) from a local directory (`%LOCALAPPDATA%\zpane\specs\`).
-  - If `carapace-bin` is installed on the user's system, allow `zpane` to query `carapace <cmd> export` as a secondary introspection provider, instantly gaining rich, structured completions for 500+ CLI tools without manual maintenance.
+### 2. XDG Declarative Specifications & Carapace Bridge Fallback (Inspired by `carapace` & Fig — Implemented)
+- **Architecture:**
+  - Loads lightweight declarative `carapace-spec` (`.yaml`/`.yml`/`.json`) and simplified Fig (`.json`) specs in strict XDG precedence order (`$XDG_CONFIG_HOME/zpane/specs` → `$XDG_CONFIG_HOME/carapace/specs` → legacy cache fallback, with `%APPDATA%` / `%LOCALAPPDATA%` equivalents on Windows).
+  - Automatically queries `carapace <cmd> export` when `carapace` is available on `PATH` and `--help`/`-h` parsing yields no entries.
 
 ### 3. Interactive Argument / Value Prompts (Inspired by `navi` & `intelli-shell` — Implemented)
 - **Architecture:**
-  - When a user selects a parameter or subcommand in Column 2 and types in Column 3, `zpane` dynamically surfaces an interactive `✏ Use "<value>"` item and interpolates the custom argument directly into the live command preview and output buffer.
+  - When a user selects a parameter or subcommand in Pane 2 and types in Pane 3, `zpane` dynamically surfaces an interactive `✏ Use "<value>"` entry and interpolates the custom argument directly into the live Command Line and output buffer.
 
-### 4. ParameterSet Exclusivity Pruning (Inspired by `Show-Command` & PowerShell AST — Implemented)
+### 4. ParameterSet Exclusivity Pruning & Rich CLR/MAML Metadata (Inspired by `Show-Command` & PowerShell AST — Implemented)
 - **Architecture:**
-  - `ps_metadata.json` records `parameter_sets` for every reflected PowerShell parameter.
-  - Once the user appends a parameter belonging to specific `ParameterSet`s, `zpane` computes the active parameter set intersection and dynamically prunes mutually exclusive parameters from Column 2, displaying `[Set: ...]` in the Column 2 header.
+  - `ps_metadata.json` records `parameter_sets`, mandatory sets, positional indices, pipeline-binding modes, `[ValidateRange]` bounds, `[ValidateSet]`/`Enum`/`[ArgumentCompletions]` values, and MAML `help_file` pointers across both `pwsh` and Windows PowerShell 5.1 (`powershell.exe`).
+  - Once the user appends a parameter belonging to specific `ParameterSet`s, `zpane` computes the active parameter set intersection and dynamically prunes mutually exclusive parameters from Pane 2, displaying `[Set: ...]` in the Pane 2 header while lazily enriching descriptions from MAML `*-Help.xml` and `Get-Help`.
 
-### 5. Dynamic Runtime Context Extraction (Inspired by `atuin` & `carapace`)
-- **Current State:** Variable scopes `$env:*` and `$global:*` are loaded once at startup.
-- **Opportunity:**
-  - Allow the PowerShell wrapper function to pass dynamic context into `zpane` via command-line flags or JSON payload:
-    - Current Git branch (for `git` commands).
-    - Current directory files/folders.
-    - Active PowerShell session history (allowing recent commands to appear at the top of Column 1).
+### 5. Dynamic Runtime Context & Project-Local Task Discovery (Inspired by `atuin`, `carapace`, and `bract` — Implemented)
+- **Architecture:**
+  - Automatically extracts Git branches (including linked worktrees), shallow CWD files/directories, recent shell history across PowerShell/Zsh/Bash/Fish/Nushell (plus live session history/vars/funcs via `--context-file` / `--history`), and project-local tasks from `package.json`, `justfile`/`.justfile`, `GNUmakefile`/`makefile`/`Makefile`, and `mise.toml`/`.mise.toml` with zero subprocess overhead.
+  - Exposes `zpane doctor [--json]` as a strictly read-only diagnostic view over dialect detection, `config.toml` validation, caches, XDG spec precedence, external providers, and runtime context.
 
 ---
 

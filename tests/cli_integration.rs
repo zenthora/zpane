@@ -142,7 +142,12 @@ fn cli_version_prints_package_version_with_clean_stderr() {
 fn cli_help_prints_usage_and_env_vars_with_clean_stderr() {
     let ws = TempWorkspace::new("help");
 
-    for args in [&["--help"][..], &["-h"][..], &["init", "--help"][..]] {
+    for args in [
+        &["--help"][..],
+        &["-h"][..],
+        &["init", "--help"][..],
+        &["doctor", "--help"][..],
+    ] {
         let out = run_isolated(&ws, args);
         assert!(out.status.success(), "{args:?} failed: {out:?}");
         assert!(
@@ -153,6 +158,8 @@ fn cli_help_prints_usage_and_env_vars_with_clean_stderr() {
         let stdout = String::from_utf8(out.stdout).expect("utf8 stdout");
         assert!(stdout.contains("Usage: zpane"), "missing usage: {stdout}");
         assert!(stdout.contains("zpane init <pwsh|zsh|bash|fish|nu>"));
+        assert!(stdout.contains("zpane doctor [--json]"));
+        assert!(stdout.contains("--doctor"));
         assert!(stdout.contains("--cursor <OFFSET>"));
         assert!(stdout.contains("--height <ROWS|PCT>"));
         assert!(stdout.contains("--bind <CHORD>"));
@@ -160,6 +167,7 @@ fn cli_help_prints_usage_and_env_vars_with_clean_stderr() {
         assert!(stdout.contains("zpane inspect [--json] <CMD>..."));
         assert!(stdout.contains("ZPANE_SHELL"));
         assert!(stdout.contains("ZPANE_CONFIG"));
+        assert!(stdout.contains("NO_COLOR"));
     }
 }
 
@@ -607,4 +615,143 @@ fn cli_cursor_validation_and_session_suffix_preservation() {
         session.apply(UserAction::Confirm),
         SessionOutcome::Confirmed("git status --short && cargo test".to_string())
     );
+}
+
+#[test]
+fn cli_doctor_human_and_json_report_diagnostics_read_only() {
+    let ws = TempWorkspace::new("doctor");
+    let uncreated_cache_base = ws.path().join("missing_cache_base");
+    let uncreated_config_base = ws.path().join("missing_config_base");
+    let uncreated_config_file = ws.path().join("missing_cfg").join("config.toml");
+    let empty_bin = ws.path().join("empty_bin");
+    let work_dir = ws.path().join("work");
+    fs::create_dir_all(&empty_bin).expect("create empty bin");
+    fs::create_dir_all(&work_dir).expect("create work dir");
+
+    let run_doctor = |args: &[&str], cfg_path: &Path| -> Output {
+        let mut cmd = Command::new(zpane_bin());
+        cmd.current_dir(&work_dir)
+            .env("LOCALAPPDATA", &uncreated_cache_base)
+            .env("APPDATA", &uncreated_config_base)
+            .env("USERPROFILE", &uncreated_config_base)
+            .env("HOME", &uncreated_config_base)
+            .env("XDG_CACHE_HOME", &uncreated_cache_base)
+            .env("XDG_CONFIG_HOME", &uncreated_config_base)
+            .env("XDG_DATA_HOME", &uncreated_config_base)
+            .env("ZPANE_CONFIG", cfg_path)
+            .env("ZPANE_SHELL", "posix")
+            .env("PATH", &empty_bin)
+            .env_remove("NO_COLOR")
+            .env_remove("TERM")
+            .env_remove("HISTFILE")
+            .env_remove("PSModulePath")
+            .env_remove("FISH_VERSION")
+            .env_remove("NU_VERSION")
+            .env_remove("SHELL")
+            .args(args);
+        cmd.output().expect("execute zpane doctor")
+    };
+
+    // 1. Human `zpane doctor` exits 0 with clean stdout & empty stderr and creates nothing.
+    let human = run_doctor(&["doctor"], &uncreated_config_file);
+    assert!(human.status.success(), "doctor failed: {human:?}");
+    assert!(
+        human.stderr.is_empty(),
+        "doctor wrote unexpected stderr: {:?}",
+        String::from_utf8_lossy(&human.stderr)
+    );
+    let human_out = String::from_utf8(human.stdout).expect("utf8 stdout");
+    assert!(human_out.contains("zpane doctor"));
+    assert!(human_out.contains("Shell Dialect: POSIX (posix)"));
+    assert!(human_out.contains("ZPANE_SHELL=posix"));
+    assert!(human_out.contains("Providers:"));
+    assert!(human_out.contains("Runtime Context:"));
+
+    // 2. Both `zpane doctor --json` and `zpane --doctor --json` emit valid structured JSON
+    //    with empty stderr and leave missing cache/config directories uncreated.
+    for args in [&["doctor", "--json"][..], &["--doctor", "--json"][..]] {
+        let out = run_doctor(args, &uncreated_config_file);
+        assert!(out.status.success(), "{args:?} failed: {out:?}");
+        assert!(
+            out.stderr.is_empty(),
+            "{args:?} wrote unexpected stderr: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: Value = serde_json::from_slice(&out.stdout).expect("valid doctor JSON");
+        assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(json["dialect"]["dialect"], "posix");
+        assert_eq!(json["dialect"]["label"], "POSIX");
+        assert_eq!(json["dialect"]["reason"], "ZPANE_SHELL=posix");
+        assert_eq!(json["config"]["exists"], false);
+        assert_eq!(json["config"]["status"], "missing");
+        assert_eq!(json["cache"]["dir_exists"], false);
+        assert_eq!(json["cache"]["ps_metadata"]["status"], "missing");
+        assert_eq!(json["cache"]["cli_cache"]["status"], "missing");
+        assert!(json["specs"]["search_dirs"].is_array());
+        assert!(json["providers"]["pwsh"]["available"].is_boolean());
+        assert!(json["providers"]["powershell_exe"]["available"].is_boolean());
+        assert!(json["providers"]["carapace"]["available"].is_boolean());
+        assert!(json["providers"]["man"]["available"].is_boolean());
+        assert!(json["runtime"]["project_task_files"].is_array());
+    }
+
+    assert!(
+        !uncreated_cache_base.exists(),
+        "zpane doctor must never create missing cache directories"
+    );
+    assert!(
+        !uncreated_config_base.exists(),
+        "zpane doctor must never create missing config/spec directories"
+    );
+    assert!(
+        !uncreated_config_file.exists(),
+        "zpane doctor must never create missing config.toml"
+    );
+
+    // 3. Invalid ZPANE_CONFIG diagnostics and CWD project task files surface cleanly.
+    let bad_cfg = ws.path().join("warn_config.toml");
+    fs::write(
+        &bad_cfg,
+        "history_limit = 22\nunknown_option = \"oops\"\n[ui]\ntheme = \"light\"\n",
+    )
+    .expect("write config with warning");
+    fs::write(
+        work_dir.join("package.json"),
+        r#"{"scripts":{"dev":"vite","test":"cargo test"}}"#,
+    )
+    .expect("write package.json");
+
+    let warn_json_out = run_doctor(&["doctor", "--json"], &bad_cfg);
+    assert!(warn_json_out.status.success());
+    assert!(warn_json_out.stderr.is_empty());
+    let warn_json: Value = serde_json::from_slice(&warn_json_out.stdout).expect("valid json");
+    assert_eq!(warn_json["config"]["exists"], true);
+    assert_eq!(warn_json["config"]["status"], "warnings");
+    assert_eq!(warn_json["config"]["overrides"]["history_limit"], 22);
+    assert_eq!(
+        warn_json["config"]["overrides"]["ui"]["configured_theme"],
+        "light"
+    );
+    assert!(warn_json["config"]["diagnostics"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|d| d["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown_option")))));
+    assert!(warn_json["runtime"]["project_task_files"]
+        .as_array()
+        .is_some_and(|arr| arr
+            .iter()
+            .any(|t| t["file"] == "package.json" && t["task_count"] == 2)));
+
+    // 4. Invalid `doctor` CLI invocations exit non-zero with empty stdout and non-empty stderr.
+    for bad in [
+        &["doctor", "extra"][..],
+        &["--doctor", "--warm"][..],
+        &["--doctor=true"][..],
+    ] {
+        let out = run_isolated(&ws, bad);
+        assert!(!out.status.success(), "{bad:?} must fail");
+        assert!(out.stdout.is_empty());
+        assert!(!out.stderr.is_empty());
+    }
 }

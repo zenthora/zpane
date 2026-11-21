@@ -15,14 +15,14 @@ const MAX_SPEC_TREE_DEPTH: usize = 24;
 const MAX_SPEC_CHILDREN: usize = 1_024;
 
 #[derive(Debug, Clone)]
-struct SpecDirEnv {
-    is_windows: bool,
-    xdg_config_home: Option<PathBuf>,
-    home: Option<PathBuf>,
-    appdata: Option<PathBuf>,
-    local_appdata: Option<PathBuf>,
-    userprofile: Option<PathBuf>,
-    cache_dir: PathBuf,
+pub(super) struct SpecDirEnv {
+    pub(super) is_windows: bool,
+    pub(super) xdg_config_home: Option<PathBuf>,
+    pub(super) home: Option<PathBuf>,
+    pub(super) appdata: Option<PathBuf>,
+    pub(super) local_appdata: Option<PathBuf>,
+    pub(super) userprofile: Option<PathBuf>,
+    pub(super) cache_dir: PathBuf,
 }
 
 fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf, is_windows: bool) {
@@ -40,7 +40,7 @@ fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf, is_windows: bool
     }
 }
 
-fn spec_search_dirs_from(env: &SpecDirEnv) -> Vec<PathBuf> {
+pub(super) fn spec_search_dirs_from(env: &SpecDirEnv) -> Vec<PathBuf> {
     let mut dirs = Vec::with_capacity(5);
     if env.is_windows {
         let roaming = env.appdata.clone().or_else(|| {

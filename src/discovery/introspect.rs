@@ -95,7 +95,7 @@ pub trait Introspect {
 }
 
 const CLI_CACHE_SCHEMA_VERSION: u32 = 3;
-const MAX_CLI_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+pub(super) const MAX_CLI_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CMD_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_MAN_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_MAN_LINES: usize = 4_096;
@@ -443,8 +443,35 @@ fn noop_exe_probe() -> Arc<ExeProbe> {
     Arc::new(|_, _| None)
 }
 
+pub(super) fn cli_cache_path_in(dir: &Path, dialect: ShellDialect) -> PathBuf {
+    dir.join(format!("cli_cache_{}.json", dialect_cache_tag(dialect)))
+}
+
 fn cli_cache_path_for(dialect: ShellDialect) -> PathBuf {
-    cache_dir().join(format!("cli_cache_{}.json", dialect_cache_tag(dialect)))
+    cli_cache_path_in(&cache_dir(), dialect)
+}
+
+/// Counts valid schema-v3 entries matching `dialect` from serialized CLI cache bytes.
+/// Returns `Err(())` when the bytes are not valid JSON cache records.
+pub(super) fn count_cli_cache_entries_from_bytes(
+    bytes: &[u8],
+    dialect: ShellDialect,
+) -> Result<usize, ()> {
+    let records =
+        serde_json::from_slice::<HashMap<String, CachedChainRecord>>(bytes).map_err(|_| ())?;
+    let expected_tag = dialect_cache_tag(dialect);
+    let count = records
+        .iter()
+        .filter(|(key, rec)| {
+            rec.schema_version == CLI_CACHE_SCHEMA_VERSION
+                && validate_cache_key(key)
+                && rec
+                    .dialect
+                    .as_deref()
+                    .is_none_or(|saved| saved == expected_tag)
+        })
+        .count();
+    Ok(count)
 }
 
 fn legacy_cli_cache_path() -> PathBuf {

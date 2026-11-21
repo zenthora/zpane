@@ -1,6 +1,7 @@
 mod catalog;
 mod config;
 mod context;
+mod doctor;
 mod help_parser;
 mod history;
 mod introspect;
@@ -18,6 +19,14 @@ pub use config::{
     MIN_INTROSPECT_TIMEOUT_MS,
 };
 pub use context::detect_runtime_context;
+pub use doctor::{
+    build_doctor_report, collect_doctor_report, format_doctor_human, CacheDiagnostics,
+    CliCacheDiagnostics, ConfigDiagnosticEntry, ConfigDiagnostics, ConfigOverrides,
+    DialectDiagnostics, DoctorEnv, DoctorReport, HistoryDiagnostics, LoadedSpecDiagnostics,
+    ProjectTaskFileDiagnostics, ProviderAvailability, ProvidersDiagnostics,
+    PsMetadataCacheDiagnostics, RuntimeDiagnostics, SpecDirDiagnostics, SpecsDiagnostics,
+    UiDiagnostics,
+};
 pub use introspect::{
     clear_disk_cache, inspect_command_chain, inspect_command_chain_with, warm_cli_cache,
     CliIntrospector, CommandRunOutcome, InspectReport, Introspect, PollResult,

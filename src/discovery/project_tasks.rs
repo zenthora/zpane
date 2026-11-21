@@ -679,6 +679,88 @@ fn build_run_subcmd(desc: &str, alias: Option<&str>, tasks: Vec<Entry>) -> Entry
     run
 }
 
+fn resolve_existing_candidate_name(
+    dir_names: &HashSet<String>,
+    candidates: &[&str],
+) -> Option<String> {
+    for &candidate in candidates {
+        if dir_names.contains(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    None
+}
+
+/// Read-only detection of supported project task files in `dir` (`package.json`,
+/// `justfile`/`.justfile`, `GNUmakefile`/`makefile`/`Makefile`, `mise.toml`/`.mise.toml`)
+/// along with the number of parsed tasks discovered in each file.
+pub(super) fn detect_project_task_files(dir: &Path) -> Vec<(String, std::path::PathBuf, usize)> {
+    const KNOWN_LOWER: &[&str] = &[
+        "package.json",
+        "justfile",
+        ".justfile",
+        "gnumakefile",
+        "makefile",
+        "mise.toml",
+        ".mise.toml",
+    ];
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut dir_names = HashSet::new();
+    for entry in rd.take(10_000).flatten() {
+        if let Some(name) = entry.file_name().to_str() {
+            if KNOWN_LOWER
+                .iter()
+                .any(|known| name.eq_ignore_ascii_case(known))
+            {
+                dir_names.insert(name.to_string());
+            }
+        }
+    }
+
+    let mut found = Vec::new();
+
+    if let Some(name) = resolve_existing_candidate_name(&dir_names, &["package.json"]) {
+        let path = dir.join(&name);
+        if let Some(raw) = read_bounded_string(&path, MAX_TASK_FILE_BYTES) {
+            let count = parse_package_json_scripts(&raw).len();
+            found.push((name, path, count));
+        }
+    }
+
+    if let Some(name) = resolve_existing_candidate_name(
+        &dir_names,
+        &["justfile", "Justfile", ".justfile", ".Justfile"],
+    ) {
+        let path = dir.join(&name);
+        if let Some(raw) = read_bounded_string(&path, MAX_TASK_FILE_BYTES) {
+            let count = parse_justfile_recipes(&raw).len();
+            found.push((name, path, count));
+        }
+    }
+
+    if let Some(name) =
+        resolve_existing_candidate_name(&dir_names, &["GNUmakefile", "makefile", "Makefile"])
+    {
+        let path = dir.join(&name);
+        if let Some(raw) = read_bounded_string(&path, MAX_TASK_FILE_BYTES) {
+            let count = parse_makefile_targets(&raw).len();
+            found.push((name, path, count));
+        }
+    }
+
+    if let Some(name) = resolve_existing_candidate_name(&dir_names, &["mise.toml", ".mise.toml"]) {
+        let path = dir.join(&name);
+        if let Some(raw) = read_bounded_string(&path, MAX_TASK_FILE_BYTES) {
+            let count = parse_mise_toml_tasks(&raw).len();
+            found.push((name, path, count));
+        }
+    }
+
+    found
+}
+
 /// Discovers project-local task targets in `dir` (`justfile`, `Makefile`, `package.json`, `mise.toml`)
 /// without spawning any subprocesses and returns root tool [`Entry`] specs for catalog merging.
 pub(super) fn discover_project_task_specs(dir: &Path) -> Vec<Entry> {

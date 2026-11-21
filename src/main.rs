@@ -8,9 +8,10 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use zpane::discovery::{
-    clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog,
-    load_user_config_with_diagnostics, reload_catalog, sync_powershell_metadata, warm_cli_cache,
-    CliIntrospector, HeightSpec, InspectReport, ShellDialect, UiStyle, UserConfig,
+    clear_disk_cache, collect_doctor_report, detect_runtime_context, format_doctor_human,
+    inspect_command_chain, load_catalog, load_user_config_with_diagnostics, reload_catalog,
+    sync_powershell_metadata, warm_cli_cache, CliIntrospector, HeightSpec, InspectReport,
+    ShellDialect, UiStyle, UserConfig,
 };
 use zpane::model::RuntimeContext;
 use zpane::sanitize::strip_escapes_and_controls_into;
@@ -433,6 +434,7 @@ zpane - 3-pane Miller column command, parameter & variable explorer
 Usage: zpane [OPTIONS] [--] [INITIAL_TOKENS]...
        zpane init <pwsh|zsh|bash|fish|nu> [--bind <CHORD> | --no-bind]
        zpane inspect [--json] <CMD>...
+       zpane doctor [--json]
 
 Options:
       --initial <TEXT>       Seed the command builder with an existing command buffer
@@ -448,6 +450,7 @@ Options:
       --bind <CHORD>         Keybinding chord for `init`/`--init` (e.g. `Alt+m`, `Ctrl+g`, `Ctrl+Space`, `F2`)
       --no-bind              Define the shell init widget/helper without registering a keybinding
       --inspect <CMD>        Inspect a command or subcommand chain non-interactively and exit
+      --doctor               Print read-only environment, config, cache, spec & provider diagnostics and exit
       --json                 Emit machine-readable JSON for non-interactive commands
       --sync-ps              Sync PowerShell cmdlet & parameter metadata (pwsh or powershell.exe) and exit
       --warm                 Sync PowerShell metadata (if available) + pre-warm CLI help cache and exit
@@ -458,6 +461,7 @@ Options:
 Environment:
   ZPANE_SHELL                Force token dialect: `pwsh` ($env:X), `posix` ($X), `fish` ($status), or `nu` ($env.X)
   ZPANE_CONFIG               Override user config path (`config.toml`)
+  NO_COLOR                   Disable ANSI color output when set to any non-empty value (uses bold/reverse only)
 ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1078,6 +1082,7 @@ struct CliOptions {
 #[derive(Debug, PartialEq, Eq)]
 enum PendingMode {
     ClearCache,
+    Doctor,
     SyncPs { warm: bool },
     Init(ShellInitTarget),
     InspectFlag(String),
@@ -1093,6 +1098,9 @@ enum CliCommand {
         bind_mode: InitBindMode,
     },
     ClearCache {
+        json: bool,
+    },
+    Doctor {
         json: bool,
     },
     SyncPs {
@@ -1392,9 +1400,46 @@ fn parse_init_subcommand(args: &[String]) -> anyhow::Result<CliCommand> {
     Ok(CliCommand::Init { target, bind_mode })
 }
 
+fn parse_doctor_subcommand(args: &[String]) -> anyhow::Result<CliCommand> {
+    let mut json = false;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        let (flag, inline_val) = if arg.starts_with("--") {
+            match arg.split_once('=') {
+                Some((f, v)) => (f, Some(v)),
+                None => (arg, None),
+            }
+        } else {
+            (arg, None)
+        };
+        match flag {
+            "-h" | "--help" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                return Ok(CliCommand::Help);
+            }
+            "--json" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                json = true;
+                i += 1;
+            }
+            _ => {
+                anyhow::bail!(
+                    "Unexpected argument '{}' for `doctor`",
+                    sanitize_error_arg(arg)
+                );
+            }
+        }
+    }
+    Ok(CliCommand::Doctor { json })
+}
+
 fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     if args.first().map(String::as_str) == Some("init") {
         return parse_init_subcommand(args);
+    }
+    if args.first().map(String::as_str) == Some("doctor") {
+        return parse_doctor_subcommand(args);
     }
 
     let mut initial_buffer = String::new();
@@ -1432,6 +1477,11 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         {
             if !saw_double_dash && !has_positional && mode_cmd.is_none() && arg == "inspect" {
                 mode_cmd = Some(PendingMode::InspectSubcmd);
+                i += 1;
+                continue;
+            }
+            if !saw_double_dash && !has_positional && mode_cmd.is_none() && arg == "doctor" {
+                mode_cmd = Some(PendingMode::Doctor);
                 i += 1;
                 continue;
             }
@@ -1484,6 +1534,14 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
                     anyhow::bail!("Conflicting command mode option {flag}");
                 }
                 mode_cmd = Some(PendingMode::ClearCache);
+                i += 1;
+            }
+            "--doctor" => {
+                ensure_no_inline_value(flag, inline_val)?;
+                if mode_cmd.is_some() {
+                    anyhow::bail!("Conflicting command mode option {flag}");
+                }
+                mode_cmd = Some(PendingMode::Doctor);
                 i += 1;
             }
             "--init" => {
@@ -1593,11 +1651,12 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
 
     match mode_cmd {
         Some(PendingMode::ClearCache) => return Ok(CliCommand::ClearCache { json }),
+        Some(PendingMode::Doctor) => return Ok(CliCommand::Doctor { json }),
         Some(PendingMode::SyncPs { warm }) => return Ok(CliCommand::SyncPs { warm, json }),
         Some(PendingMode::Init(target)) => {
             if json {
                 anyhow::bail!(
-                    "Option --json requires a non-interactive command (--inspect, --clear-cache, --sync-ps, or --warm)"
+                    "Option --json requires a non-interactive command (--doctor, --inspect, --clear-cache, --sync-ps, or --warm)"
                 );
             }
             let bind_mode = resolve_init_bind_mode(init_bind_chord, init_no_bind)?;
@@ -1629,7 +1688,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         None => {
             if json {
                 anyhow::bail!(
-                    "Option --json requires a non-interactive command (--inspect, --clear-cache, --sync-ps, or --warm)"
+                    "Option --json requires a non-interactive command (--doctor, --inspect, --clear-cache, --sync-ps, or --warm)"
                 );
             }
         }
@@ -1774,6 +1833,15 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::json!({ "cleared": removed }));
             } else {
                 eprintln!("Cleared {removed} cached metadata file(s).");
+            }
+            return Ok(());
+        }
+        CliCommand::Doctor { json } => {
+            let report = collect_doctor_report();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", format_doctor_human(&report));
             }
             return Ok(());
         }
@@ -3244,5 +3312,70 @@ borders = "plain"
         let g3 = TerminalGuard::enter_with(no_dsr, 30, Some(15)).unwrap();
         assert_eq!(g3.mode(), ui::DisplayMode::FullAltScreen);
         assert!(g3.io.written.contains("\x1b[?1049h"));
+    }
+
+    #[test]
+    fn test_parse_cli_args_doctor_subcommand_flag_and_errors() {
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            parse_cli_args(&s(&["doctor"])).unwrap(),
+            CliCommand::Doctor { json: false }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["doctor", "--json"])).unwrap(),
+            CliCommand::Doctor { json: true }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--doctor"])).unwrap(),
+            CliCommand::Doctor { json: false }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--doctor", "--json"])).unwrap(),
+            CliCommand::Doctor { json: true }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--json", "--doctor"])).unwrap(),
+            CliCommand::Doctor { json: true }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--json", "doctor"])).unwrap(),
+            CliCommand::Doctor { json: true }
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["doctor", "-h"])).unwrap(),
+            CliCommand::Help
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["doctor", "--help"])).unwrap(),
+            CliCommand::Help
+        );
+        assert_eq!(
+            parse_cli_args(&s(&["--doctor", "--help"])).unwrap(),
+            CliCommand::Help
+        );
+
+        // `-- doctor` still seeds interactive mode with the literal word "doctor".
+        let interactive = parse_cli_args(&s(&["--", "doctor"])).unwrap();
+        match interactive {
+            CliCommand::Interactive(opts) => assert_eq!(opts.initial_buffer, "doctor"),
+            other => panic!("expected Interactive, got {other:?}"),
+        }
+
+        for bad in [
+            &["doctor", "extra"][..],
+            &["doctor", "--clear-cache"][..],
+            &["doctor", "--json=true"][..],
+            &["--doctor", "extra"][..],
+            &["--doctor=1"][..],
+            &["--doctor", "--warm"][..],
+            &["--clear-cache", "--doctor"][..],
+            &["--doctor", "--bind", "Alt+m"][..],
+        ] {
+            assert!(
+                parse_cli_args(&s(bad)).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
     }
 }

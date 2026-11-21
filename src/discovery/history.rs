@@ -201,16 +201,26 @@ pub fn parse_shell_history_from_str(
     out
 }
 
-/// Reads the tail of the active shell's history file for `dialect` and returns up to `limit`
-/// deduplicated recent commands (newest first).
-pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn detect_shell_history_with_source_from(
+    dialect: ShellDialect,
+    limit: usize,
+    is_windows: bool,
+    is_macos: bool,
+    histfile: Option<&str>,
+    shell: Option<&str>,
+    appdata: Option<&std::path::Path>,
+    xdg_data_home: Option<&std::path::Path>,
+    xdg_config_home: Option<&std::path::Path>,
+    home: Option<&std::path::Path>,
+) -> (Option<PathBuf>, Vec<String>) {
     const MAX_HIST_BYTES: u64 = 262_144;
     if limit == 0 {
-        return Vec::new();
+        return (None, Vec::new());
     }
 
     let mut candidates = Vec::new();
-    if let Ok(histfile) = env::var("HISTFILE") {
+    if let Some(histfile) = histfile {
         let trimmed = histfile.trim();
         if !trimmed.is_empty() && !trimmed.contains('\0') {
             candidates.push(PathBuf::from(trimmed));
@@ -219,8 +229,8 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
 
     match dialect {
         ShellDialect::PowerShell => {
-            if cfg!(windows) {
-                if let Some(appdata) = non_empty_abs_env_path("APPDATA") {
+            if is_windows {
+                if let Some(appdata) = appdata {
                     candidates.push(
                         appdata
                             .join("Microsoft")
@@ -230,7 +240,7 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
                             .join("ConsoleHost_history.txt"),
                     );
                 }
-            } else if let Some(home) = home_dir() {
+            } else if let Some(home) = home {
                 candidates.push(
                     home.join(".local")
                         .join("share")
@@ -241,10 +251,10 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
             }
         }
         ShellDialect::Fish => {
-            if let Some(xdg) = non_empty_abs_env_path("XDG_DATA_HOME") {
+            if let Some(xdg) = xdg_data_home {
                 candidates.push(xdg.join("fish").join("fish_history"));
             }
-            if let Some(home) = home_dir() {
+            if let Some(home) = home {
                 candidates.push(
                     home.join(".local")
                         .join("share")
@@ -254,17 +264,17 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
             }
         }
         ShellDialect::Nushell => {
-            if let Some(xdg) = non_empty_abs_env_path("XDG_CONFIG_HOME") {
+            if let Some(xdg) = xdg_config_home {
                 candidates.push(xdg.join("nushell").join("history.txt"));
             }
-            if cfg!(windows) {
-                if let Some(appdata) = non_empty_abs_env_path("APPDATA") {
+            if is_windows {
+                if let Some(appdata) = appdata {
                     candidates.push(appdata.join("nushell").join("history.txt"));
                 }
             }
-            if let Some(home) = home_dir() {
+            if let Some(home) = home {
                 candidates.push(home.join(".config").join("nushell").join("history.txt"));
-                if cfg!(target_os = "macos") {
+                if is_macos {
                     candidates.push(
                         home.join("Library")
                             .join("Application Support")
@@ -275,8 +285,8 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
             }
         }
         ShellDialect::Posix => {
-            if let Some(home) = home_dir() {
-                let prefers_zsh = env::var("SHELL")
+            if let Some(home) = home {
+                let prefers_zsh = shell
                     .map(|s| {
                         let t = s.trim();
                         t.ends_with("/zsh") || t == "zsh"
@@ -293,16 +303,40 @@ pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<S
         }
     }
 
+    let mut first_readable: Option<PathBuf> = None;
     for path in candidates {
         if let Some(raw) = read_tail_string(&path, MAX_HIST_BYTES) {
+            if first_readable.is_none() {
+                first_readable = Some(path.clone());
+            }
             let parsed = parse_shell_history_from_str(dialect, &raw, limit);
             if !parsed.is_empty() {
-                return parsed;
+                return (Some(path), parsed);
             }
         }
     }
 
-    Vec::new()
+    (first_readable, Vec::new())
+}
+
+/// Reads the tail of the active shell's history file for `dialect` and returns up to `limit`
+/// deduplicated recent commands (newest first).
+pub(super) fn detect_shell_history(dialect: ShellDialect, limit: usize) -> Vec<String> {
+    let histfile = env::var("HISTFILE").ok();
+    let shell = env::var("SHELL").ok();
+    detect_shell_history_with_source_from(
+        dialect,
+        limit,
+        cfg!(windows),
+        cfg!(target_os = "macos"),
+        histfile.as_deref(),
+        shell.as_deref(),
+        non_empty_abs_env_path("APPDATA").as_deref(),
+        non_empty_abs_env_path("XDG_DATA_HOME").as_deref(),
+        non_empty_abs_env_path("XDG_CONFIG_HOME").as_deref(),
+        home_dir().as_deref(),
+    )
+    .1
 }
 
 #[cfg(test)]

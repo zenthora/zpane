@@ -273,6 +273,16 @@ pub(super) fn parse_ps_metadata_entries(bytes: &[u8]) -> Vec<Entry> {
         .collect()
 }
 
+/// Counts valid PowerShell command records in serialized `ps_metadata.json` bytes.
+/// Returns `Err(())` when `bytes` is not a valid metadata JSON array.
+pub(super) fn count_ps_metadata_commands(bytes: &[u8]) -> Result<usize, ()> {
+    let exports = serde_json::from_slice::<Vec<PsCommandExport>>(bytes).map_err(|_| ())?;
+    Ok(exports
+        .iter()
+        .filter(|exp| is_safe_command_token(exp.name.trim()))
+        .count())
+}
+
 /// Resolves the PowerShell executable to run: prefers `pwsh`, and on Windows falls back to
 /// `powershell.exe` when `pwsh` is absent from `PATH`.
 pub(super) fn resolve_powershell_executable_with<F>(
