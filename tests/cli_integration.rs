@@ -449,14 +449,18 @@ fn cli_out_file_rejects_invalid_targets_and_truncates_existing_file_without_tty(
     };
     if headless_safe {
         fn detached_cmd(ws: &TempWorkspace) -> Command {
-            let mut cmd = isolated_cmd(ws);
             #[cfg(windows)]
             {
                 use std::os::windows::process::CommandExt;
                 const DETACHED_PROCESS: u32 = 0x0000_0008;
+                let mut cmd = isolated_cmd(ws);
                 cmd.creation_flags(DETACHED_PROCESS);
+                cmd
             }
-            cmd
+            #[cfg(not(windows))]
+            {
+                isolated_cmd(ws)
+            }
         }
 
         let existing = ws.path().join("existing_out.txt");

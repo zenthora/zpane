@@ -620,7 +620,7 @@ package_rpm() {
         install -m 0644 "${LICENSE_FILE}" "${rpm_top}/SOURCES/LICENSE"
         sed -e "s/^Version:.*/Version:        ${rpm_version}/" \
             -e "s/^Release:.*/Release:        ${REL}/" \
-            -e "s/^BuildArch:.*/BuildArch:      ${arch}/" \
+            -e "/^BuildArch:/d" \
             "${ROOT_DIR}/packaging/fedora/zpane.spec" > "${rpm_top}/SPECS/zpane.spec"
         chmod 0644 "${rpm_top}/SPECS/zpane.spec"
         stamp_mtime "${rpm_top}/SOURCES"

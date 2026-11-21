@@ -4,8 +4,6 @@ Release:        1%{?dist}
 Summary:        3-pane Miller column command, subcommand, parameter & variable explorer
 License:        MIT
 URL:            https://github.com/zenthora/zpane
-# scripts/package-linux.sh rewrites BuildArch to aarch64 when packaging the arm64 RPM.
-BuildArch:      x86_64
 %global __os_install_post %{nil}
 %global debug_package %{nil}
 %global use_source_date_epoch_as_buildtime 1
