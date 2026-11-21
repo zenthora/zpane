@@ -10,7 +10,7 @@ use std::time::Duration;
 use zpane::discovery::{
     clear_disk_cache, detect_runtime_context, inspect_command_chain, load_catalog,
     load_user_config_with_diagnostics, reload_catalog, sync_powershell_metadata, warm_cli_cache,
-    CliIntrospector, InspectReport, ShellDialect, UiStyle, UserConfig,
+    CliIntrospector, HeightSpec, InspectReport, ShellDialect, UiStyle, UserConfig,
 };
 use zpane::model::RuntimeContext;
 use zpane::sanitize::strip_escapes_and_controls_into;
@@ -25,10 +25,37 @@ mod conout {
     use std::io;
     use std::os::windows::io::AsRawHandle;
 
+    #[repr(C)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+
+    #[repr(C)]
+    struct ConsoleScreenBufferInfo {
+        dw_size: Coord,
+        dw_cursor_position: Coord,
+        w_attributes: u16,
+        sr_window: SmallRect,
+        dw_maximum_window_size: Coord,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
         fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
+        fn GetConsoleScreenBufferInfo(
+            hConsoleOutput: *mut std::ffi::c_void,
+            lpConsoleScreenBufferInfo: *mut ConsoleScreenBufferInfo,
+        ) -> i32;
         fn WriteConsoleW(
             hConsoleOutput: *mut std::ffi::c_void,
             lpBuffer: *const u16,
@@ -78,6 +105,21 @@ mod conout {
             }
         }
 
+        pub fn cursor_row(&mut self) -> Option<usize> {
+            let mut info = std::mem::MaybeUninit::<ConsoleScreenBufferInfo>::uninit();
+            // SAFETY: `self.handle()` returns the live `CONOUT$` HANDLE owned by `self.file`,
+            // and `info.as_mut_ptr()` points to writable stack storage for `ConsoleScreenBufferInfo`.
+            let ok = unsafe { GetConsoleScreenBufferInfo(self.handle(), info.as_mut_ptr()) };
+            if ok == 0 {
+                return None;
+            }
+            // SAFETY: `GetConsoleScreenBufferInfo` returned non-zero and initialized `info`.
+            let info = unsafe { info.assume_init() };
+            let visible_row =
+                i32::from(info.dw_cursor_position.y) - i32::from(info.sr_window.top) + 1;
+            (visible_row >= 1).then_some(visible_row as usize)
+        }
+
         pub fn write_raw(&mut self, s: &str) {
             self.utf16_buf.clear();
             self.utf16_buf.extend(s.encode_utf16());
@@ -110,8 +152,24 @@ mod conout {
 /// so the TUI renders even when stdout is captured by a shell widget (`$(zpane)`).
 #[cfg(unix)]
 mod conout {
+    use super::parse_dsr_cursor_position;
     use std::fs::{File, OpenOptions};
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    #[repr(C)]
+    struct PollFd {
+        fd: i32,
+        events: i16,
+        revents: i16,
+    }
+
+    const POLLIN: i16 = 0x0001;
+
+    extern "C" {
+        fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32;
+    }
 
     pub struct ConOut {
         file: File,
@@ -123,6 +181,46 @@ mod conout {
             Ok(Self { file })
         }
 
+        pub fn cursor_row(&mut self) -> Option<usize> {
+            self.file.write_all(b"\x1b[6n").ok()?;
+            self.file.flush().ok()?;
+            let deadline = Instant::now() + Duration::from_millis(50);
+            let mut buf = [0u8; 64];
+            let mut len = 0usize;
+            while len < buf.len() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let timeout_ms = remaining.as_millis().clamp(1, 50) as i32;
+                let mut pfd = PollFd {
+                    fd: self.file.as_raw_fd(),
+                    events: POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: `pfd` is a valid initialized `PollFd` holding the open `/dev/tty` fd.
+                let rc = unsafe { poll(&mut pfd, 1, timeout_ms) };
+                if rc < 0 {
+                    if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if rc == 0 || (pfd.revents & POLLIN) == 0 {
+                    break;
+                }
+                let n = self.file.read(&mut buf[len..]).ok()?;
+                if n == 0 {
+                    break;
+                }
+                len += n;
+                if let Some((row, _col)) = parse_dsr_cursor_position(&buf[..len]) {
+                    return Some(row);
+                }
+            }
+            None
+        }
+
         pub fn write_raw(&mut self, s: &str) {
             let _ = self.file.write_all(s.as_bytes());
             let _ = self.file.flush();
@@ -132,20 +230,177 @@ mod conout {
 
 use conout::ConOut;
 
-struct TerminalGuard {
-    conout: ConOut,
+/// Parses a VT Device Status Report (`\x1b[<row>;<col>R`) into 1-based `(row, col)`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn parse_dsr_cursor_position(bytes: &[u8]) -> Option<(usize, usize)> {
+    for start in 0..bytes.len() {
+        if bytes.get(start..start + 2) != Some(b"\x1b[") {
+            continue;
+        }
+        let rest = &bytes[start + 2..];
+        let Some(semi) = rest.iter().position(|&b| b == b';') else {
+            continue;
+        };
+        let row_bytes = &rest[..semi];
+        if row_bytes.is_empty() || !row_bytes.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let after_semi = &rest[semi + 1..];
+        let Some(term) = after_semi.iter().position(|&b| b == b'R') else {
+            continue;
+        };
+        let col_bytes = &after_semi[..term];
+        if col_bytes.is_empty() || !col_bytes.iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let row = std::str::from_utf8(row_bytes).ok()?.parse::<usize>().ok()?;
+        let col = std::str::from_utf8(col_bytes).ok()?.parse::<usize>().ok()?;
+        if row >= 1 && col >= 1 {
+            return Some((row, col));
+        }
+    }
+    None
+}
+
+trait TerminalIo {
+    fn enable_raw(&mut self) -> io::Result<()>;
+    fn disable_raw(&mut self);
+    fn write_raw(&mut self, s: &str);
+    fn cursor_row(&mut self) -> Option<usize>;
+}
+
+impl TerminalIo for ConOut {
+    fn enable_raw(&mut self) -> io::Result<()> {
+        enable_raw_mode()
+    }
+
+    fn disable_raw(&mut self) {
+        let _ = disable_raw_mode();
+    }
+
+    fn write_raw(&mut self, s: &str) {
+        ConOut::write_raw(self, s);
+    }
+
+    fn cursor_row(&mut self) -> Option<usize> {
+        ConOut::cursor_row(self)
+    }
+}
+
+struct TerminalGuard<T: TerminalIo = ConOut> {
+    io: T,
+    mode: ui::DisplayMode,
+    saved_inline_anchor: Option<usize>,
     last_frame: String,
 }
 
-impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        let mut conout = ConOut::open()?;
-        enable_raw_mode()?;
-        conout.write_raw("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+impl TerminalGuard<ConOut> {
+    fn enter(term_rows: usize, requested_inline_rows: Option<usize>) -> io::Result<Self> {
+        let conout = ConOut::open()?;
+        Self::enter_with(conout, term_rows, requested_inline_rows)
+    }
+}
+
+impl<T: TerminalIo> TerminalGuard<T> {
+    fn enter_with(
+        mut io: T,
+        term_rows: usize,
+        requested_inline_rows: Option<usize>,
+    ) -> io::Result<Self> {
+        io.enable_raw()?;
+        let (mode, saved_inline_anchor) = if let Some(height_rows) = requested_inline_rows {
+            if let Some(cur_row) = io.cursor_row() {
+                let anchor_row = ui::compute_anchor_row(cur_row, term_rows, height_rows);
+                io.write_raw(&ui::inline_reserve_sequence(height_rows));
+                (
+                    ui::DisplayMode::Inline {
+                        anchor_row,
+                        height_rows,
+                    },
+                    Some(anchor_row),
+                )
+            } else {
+                io.write_raw("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+                (ui::DisplayMode::FullAltScreen, None)
+            }
+        } else {
+            io.write_raw("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+            (ui::DisplayMode::FullAltScreen, None)
+        };
         Ok(Self {
-            conout,
+            io,
+            mode,
+            saved_inline_anchor,
             last_frame: String::new(),
         })
+    }
+
+    fn mode(&self) -> ui::DisplayMode {
+        self.mode
+    }
+
+    fn anchor_row(&self) -> Option<usize> {
+        match self.mode {
+            ui::DisplayMode::FullAltScreen => None,
+            ui::DisplayMode::Inline { anchor_row, .. } => Some(anchor_row),
+        }
+    }
+
+    fn reconcile_resize(
+        &mut self,
+        term_rows: usize,
+        next_inline_rows: Option<usize>,
+    ) -> ui::DisplayMode {
+        match (self.mode, next_inline_rows) {
+            (ui::DisplayMode::Inline { anchor_row, .. }, Some(height_rows)) => {
+                let next_anchor = ui::compute_anchor_row(anchor_row, term_rows, height_rows);
+                self.mode = ui::DisplayMode::Inline {
+                    anchor_row: next_anchor,
+                    height_rows,
+                };
+                self.saved_inline_anchor = Some(next_anchor);
+                self.last_frame.clear();
+            }
+            (ui::DisplayMode::Inline { anchor_row, .. }, None) => {
+                use std::fmt::Write as _;
+                let mut seq = String::with_capacity(48);
+                let _ = write!(
+                    seq,
+                    "\x1b[{};1H\x1b[J\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H",
+                    anchor_row.max(1)
+                );
+                self.io.write_raw(&seq);
+                self.saved_inline_anchor = Some(anchor_row);
+                self.mode = ui::DisplayMode::FullAltScreen;
+                self.last_frame.clear();
+            }
+            (ui::DisplayMode::FullAltScreen, Some(height_rows)) => {
+                use std::fmt::Write as _;
+                self.io.write_raw("\x1b[?1049l");
+                let base_row = self.saved_inline_anchor.or_else(|| self.io.cursor_row());
+                if let Some(base) = base_row {
+                    let mut seq = String::with_capacity(height_rows + 32);
+                    if self.saved_inline_anchor.is_some() {
+                        let _ = write!(seq, "\x1b[{};1H", base.max(1));
+                    }
+                    seq.push_str(&ui::inline_reserve_sequence(height_rows));
+                    self.io.write_raw(&seq);
+                    let anchor_row = ui::compute_anchor_row(base, term_rows, height_rows);
+                    self.mode = ui::DisplayMode::Inline {
+                        anchor_row,
+                        height_rows,
+                    };
+                    self.saved_inline_anchor = Some(anchor_row);
+                    self.last_frame.clear();
+                } else {
+                    self.io.write_raw("\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+                    self.mode = ui::DisplayMode::FullAltScreen;
+                    self.last_frame.clear();
+                }
+            }
+            (ui::DisplayMode::FullAltScreen, None) => {}
+        }
+        self.mode
     }
 
     fn write_frame(&mut self, frame: &str) {
@@ -154,14 +409,21 @@ impl TerminalGuard {
         }
         self.last_frame.clear();
         self.last_frame.push_str(frame);
-        self.conout.write_raw(frame);
+        self.io.write_raw(frame);
     }
 }
 
-impl Drop for TerminalGuard {
+impl<T: TerminalIo> Drop for TerminalGuard<T> {
     fn drop(&mut self) {
-        self.conout.write_raw("\x1b[?25h\x1b[?1049l");
-        let _ = disable_raw_mode();
+        match self.mode {
+            ui::DisplayMode::FullAltScreen => {
+                self.io.write_raw("\x1b[?25h\x1b[?1049l");
+            }
+            ui::DisplayMode::Inline { anchor_row, .. } => {
+                self.io.write_raw(&ui::inline_cleanup_sequence(anchor_row));
+            }
+        }
+        self.io.disable_raw();
     }
 }
 
@@ -177,7 +439,7 @@ Options:
       --cursor <OFFSET>      Cursor character offset in --initial (preserves trailing suffix verbatim)
       --out-file <PATH>      Write the accepted command to <PATH> instead of stdout
       --width <COLS>         Fallback terminal width (default: 120)
-      --height <ROWS>        Fallback terminal height (default: 30)
+      --height <ROWS|PCT>    Inline height in rows or % (e.g. 18, 45%; 100% = full screen) & fallback
       --context <JSON>       Dynamic runtime context JSON payload (git branch, cwd, history)
       --context-file <PATH>  Read dynamic runtime context JSON payload from <PATH>
       --git-branch <NAME>    Override current Git branch name for runtime context
@@ -809,6 +1071,7 @@ struct CliOptions {
     out_file: Option<PathBuf>,
     fallback_width: usize,
     fallback_height: usize,
+    height_spec: Option<HeightSpec>,
     runtime_context: RuntimeContext,
 }
 
@@ -1139,6 +1402,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
     let mut out_file: Option<PathBuf> = None;
     let mut fallback_width: usize = 120;
     let mut fallback_height: usize = 30;
+    let mut height_spec: Option<HeightSpec> = None;
     let mut context_args: Vec<ContextArg<'_>> = Vec::new();
     let mut git_branch_override: Option<String> = None;
     let mut history_overrides: Vec<String> = Vec::new();
@@ -1283,7 +1547,12 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
             }
             "--height" => {
                 let val = take_flag_value(flag, inline_val, args, &mut i)?;
-                fallback_height = parse_dimension(flag, val, ui::Viewport::MIN_HEIGHT)?;
+                let spec = HeightSpec::parse(val)
+                    .map_err(|msg| anyhow::anyhow!("Invalid {flag}: {msg}"))?;
+                if let HeightSpec::Rows(rows) = spec {
+                    fallback_height = rows;
+                }
+                height_spec = Some(spec);
             }
             "--context" => {
                 let val = take_flag_value(flag, inline_val, args, &mut i)?;
@@ -1375,6 +1644,7 @@ fn parse_cli_args(args: &[String]) -> anyhow::Result<CliCommand> {
         out_file,
         fallback_width,
         fallback_height,
+        height_spec,
         runtime_context,
     }))
 }
@@ -1585,12 +1855,31 @@ fn main() -> anyhow::Result<()> {
         user_config.effective_introspect_timeout(),
     );
 
+    let effective_height_spec = opts.height_spec.or(user_config.ui.height);
+    let min_height = user_config.ui.effective_min_height();
+
     let (tw, th) = size().unwrap_or((
         opts.fallback_width.min(u16::MAX as usize) as u16,
         opts.fallback_height.min(u16::MAX as usize) as u16,
     ));
-    let viewport =
-        ui::Viewport::from_terminal_size(tw, th, opts.fallback_width, opts.fallback_height);
+    let requested_inline =
+        ui::resolve_inline_height(th as usize, effective_height_spec, min_height);
+
+    let mut guard = TerminalGuard::enter(th as usize, requested_inline)?;
+    let (viewport, session_height_spec) = match guard.mode() {
+        ui::DisplayMode::Inline { height_rows, .. } => (
+            ui::Viewport::inline_for_terminal_size(tw, opts.fallback_width, height_rows),
+            effective_height_spec,
+        ),
+        ui::DisplayMode::FullAltScreen => (
+            ui::Viewport::from_terminal_size(tw, th, opts.fallback_width, opts.fallback_height),
+            if requested_inline.is_some() {
+                None
+            } else {
+                effective_height_spec
+            },
+        ),
+    };
 
     let reload_ctx = runtime_ctx.clone();
     let mut session = build_interactive_session(
@@ -1604,9 +1893,9 @@ fn main() -> anyhow::Result<()> {
         user_config,
         ui_style,
     )
+    .with_inline_layout(session_height_spec, min_height, guard.anchor_row())
     .with_catalog_loader(move |d| reload_catalog(d, &reload_ctx));
 
-    let mut guard = TerminalGuard::enter()?;
     let accepted: Option<String>;
 
     'main_loop: loop {
@@ -1624,8 +1913,12 @@ fn main() -> anyhow::Result<()> {
             continue;
         }
 
+        let mut pending_resize: Option<(u16, u16)> = None;
         loop {
             let ev = event::read()?;
+            if let event::Event::Resize(rw, rh) = ev {
+                pending_resize = Some((rw, rh));
+            }
             match session.handle_terminal_event(ev) {
                 SessionOutcome::Continue => {}
                 SessionOutcome::Confirmed(cmd) => {
@@ -1639,6 +1932,26 @@ fn main() -> anyhow::Result<()> {
             }
             if !event::poll(Duration::ZERO)? {
                 break;
+            }
+        }
+
+        if let Some((rw, rh)) = pending_resize {
+            let next_inline = if session_height_spec.is_some() {
+                ui::resolve_inline_height(rh as usize, session_height_spec, min_height)
+            } else {
+                None
+            };
+            match guard.reconcile_resize(rh as usize, next_inline) {
+                ui::DisplayMode::Inline { anchor_row, .. } => {
+                    session.set_anchor_row(Some(anchor_row));
+                }
+                ui::DisplayMode::FullAltScreen => {
+                    if session.anchor_row().is_some() {
+                        session.set_anchor_row(None);
+                        let next_vp = session.view().viewport.resized(rw, rh);
+                        session.set_viewport(next_vp);
+                    }
+                }
             }
         }
     }
@@ -1728,6 +2041,7 @@ mod tests {
                 out_file: Some(PathBuf::from("/tmp/out")),
                 fallback_width: 80,
                 fallback_height: 24,
+                height_spec: Some(HeightSpec::Rows(24)),
                 runtime_context: RuntimeContext::default(),
             })
         );
@@ -1747,6 +2061,7 @@ mod tests {
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
+                height_spec: None,
                 runtime_context: RuntimeContext::default(),
             })
         );
@@ -1759,6 +2074,7 @@ mod tests {
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
+                height_spec: None,
                 runtime_context: RuntimeContext::default(),
             })
         );
@@ -1810,6 +2126,7 @@ mod tests {
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
+                height_spec: None,
                 runtime_context: RuntimeContext {
                     git_branch: Some("feat/context".to_string()),
                     git_branches: vec!["main".to_string(), "dev".to_string()],
@@ -2220,6 +2537,7 @@ mod tests {
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
+                height_spec: None,
                 runtime_context: RuntimeContext {
                     history: vec!["--warm".to_string()],
                     ..RuntimeContext::default()
@@ -2244,6 +2562,7 @@ mod tests {
                 out_file: Some(PathBuf::from("/tmp/zpane_out")),
                 fallback_width: 80,
                 fallback_height: 24,
+                height_spec: Some(HeightSpec::Rows(24)),
                 runtime_context: RuntimeContext::default(),
             })
         );
@@ -2257,6 +2576,7 @@ mod tests {
                 out_file: None,
                 fallback_width: 120,
                 fallback_height: 30,
+                height_spec: None,
                 runtime_context: RuntimeContext::default(),
             })
         );
@@ -2760,5 +3080,169 @@ borders = "plain"
             }
             other => panic!("expected Interactive, got {other:?}"),
         }
+    }
+
+    #[derive(Default)]
+    struct FakeTerminalIo {
+        raw_enabled: bool,
+        raw_disabled: bool,
+        cursor_rows: std::collections::VecDeque<Option<usize>>,
+        written: String,
+    }
+
+    impl FakeTerminalIo {
+        fn with_cursor_rows(rows: &[Option<usize>]) -> Self {
+            Self {
+                cursor_rows: rows.iter().copied().collect(),
+                ..Self::default()
+            }
+        }
+    }
+
+    impl TerminalIo for FakeTerminalIo {
+        fn enable_raw(&mut self) -> io::Result<()> {
+            self.raw_enabled = true;
+            Ok(())
+        }
+
+        fn disable_raw(&mut self) {
+            self.raw_disabled = true;
+        }
+
+        fn write_raw(&mut self, s: &str) {
+            self.written.push_str(s);
+        }
+
+        fn cursor_row(&mut self) -> Option<usize> {
+            self.cursor_rows.pop_front().flatten()
+        }
+    }
+
+    #[test]
+    fn test_parse_dsr_cursor_position_and_cli_height_specs() {
+        use zpane::discovery::HeightSpec;
+
+        // DSR cursor position parser handles clean replies, prefixed typeahead, and invalid bytes
+        assert_eq!(parse_dsr_cursor_position(b"\x1b[24;10R"), Some((24, 10)));
+        assert_eq!(parse_dsr_cursor_position(b"abc\x1b[1;1R"), Some((1, 1)));
+        assert_eq!(parse_dsr_cursor_position(b"\x1b[0;1R"), None);
+        assert_eq!(parse_dsr_cursor_position(b"\x1b[24;R"), None);
+        assert_eq!(parse_dsr_cursor_position(b"no-dsr"), None);
+
+        let s = |vals: &[&str]| vals.iter().map(|v| (*v).to_string()).collect::<Vec<_>>();
+        match parse_cli_args(&s(&["--height", "45%"])).unwrap() {
+            CliCommand::Interactive(opts) => {
+                assert_eq!(opts.height_spec, Some(HeightSpec::Percent(45)));
+                assert_eq!(opts.fallback_height, 30);
+            }
+            other => panic!("expected Interactive, got {other:?}"),
+        }
+        match parse_cli_args(&s(&["--height=100%"])).unwrap() {
+            CliCommand::Interactive(opts) => {
+                assert_eq!(opts.height_spec, Some(HeightSpec::Percent(100)));
+            }
+            other => panic!("expected Interactive, got {other:?}"),
+        }
+        for bad in [
+            &["--height", "0%"][..],
+            &["--height", "101%"][..],
+            &["--height", "11"][..],
+            &["--height", "70000"][..],
+        ] {
+            assert!(
+                parse_cli_args(&s(bad)).is_err(),
+                "{bad:?} should fail validation"
+            );
+        }
+    }
+
+    #[test]
+    fn test_terminal_guard_inline_reservation_resize_fallback_and_drop_cleanup() {
+        // 1. Inline entry near bottom scrolls N-1 lines, moves up N-1, never emits alt-screen
+        let io = FakeTerminalIo::with_cursor_rows(&[Some(28)]);
+        let mut guard = TerminalGuard::enter_with(io, 30, Some(15)).unwrap();
+        assert_eq!(
+            guard.mode(),
+            ui::DisplayMode::Inline {
+                anchor_row: 16,
+                height_rows: 15,
+            }
+        );
+        assert!(guard.io.raw_enabled);
+        assert!(!guard.io.written.contains("\x1b[?1049h"));
+        assert!(!guard.io.written.contains("\x1b[?1049l"));
+        assert!(!guard.io.written.contains("\x1b[2J"));
+        assert_eq!(guard.io.written.matches('\n').count(), 14);
+        assert!(guard.io.written.contains("\x1b[14A"));
+
+        // 2. Resize shrinking inline height clamps anchor cleanly
+        guard.io.written.clear();
+        let next = guard.reconcile_resize(25, Some(12));
+        assert_eq!(
+            next,
+            ui::DisplayMode::Inline {
+                anchor_row: 14,
+                height_rows: 12,
+            }
+        );
+
+        // 3. Resize below min_height clears inline region and transitions to FullAltScreen
+        guard.io.written.clear();
+        let fallback = guard.reconcile_resize(13, None);
+        assert_eq!(fallback, ui::DisplayMode::FullAltScreen);
+        assert!(guard.io.written.starts_with("\x1b[14;1H\x1b[J"));
+        assert!(guard.io.written.contains("\x1b[?1049h"));
+
+        // 4. Growing back above min_height exits alt-screen and re-anchors inline
+        guard.io.written.clear();
+        let restored = guard.reconcile_resize(30, Some(15));
+        assert_eq!(
+            restored,
+            ui::DisplayMode::Inline {
+                anchor_row: 14,
+                height_rows: 15,
+            }
+        );
+        assert!(guard.io.written.contains("\x1b[?1049l"));
+
+        // 5. Dropping inline guard clears only from anchor_row and restores cursor without ?1049l
+        guard.io.written.clear();
+        let mut log = String::new();
+        // Verify cleanup output by taking ownership via drop wrapper
+        drop(guard);
+        let _ = &mut log;
+
+        // Separate inline guard to inspect exact Drop output via shared buffer
+        struct SharedIo(std::rc::Rc<std::cell::RefCell<FakeTerminalIo>>);
+        impl TerminalIo for SharedIo {
+            fn enable_raw(&mut self) -> io::Result<()> {
+                self.0.borrow_mut().enable_raw()
+            }
+            fn disable_raw(&mut self) {
+                self.0.borrow_mut().disable_raw()
+            }
+            fn write_raw(&mut self, s: &str) {
+                self.0.borrow_mut().write_raw(s)
+            }
+            fn cursor_row(&mut self) -> Option<usize> {
+                self.0.borrow_mut().cursor_row()
+            }
+        }
+        let shared = std::rc::Rc::new(std::cell::RefCell::new(FakeTerminalIo::with_cursor_rows(
+            &[Some(10)],
+        )));
+        let g2 = TerminalGuard::enter_with(SharedIo(shared.clone()), 30, Some(15)).unwrap();
+        shared.borrow_mut().written.clear();
+        drop(g2);
+        let dropped = shared.borrow();
+        assert_eq!(dropped.written, "\x1b[10;1H\x1b[J\x1b[?25h");
+        assert!(dropped.raw_disabled);
+        assert!(!dropped.written.contains("\x1b[?1049l"));
+
+        // 6. When cursor_row() fails, enter_with automatically falls back to FullAltScreen
+        let no_dsr = FakeTerminalIo::with_cursor_rows(&[None]);
+        let g3 = TerminalGuard::enter_with(no_dsr, 30, Some(15)).unwrap();
+        assert_eq!(g3.mode(), ui::DisplayMode::FullAltScreen);
+        assert!(g3.io.written.contains("\x1b[?1049h"));
     }
 }

@@ -1,6 +1,7 @@
 use crate::discovery::{
-    apply_ps_help_to_entry, BindableAction, CliIntrospector, Introspect, KeybindingsConfig,
-    PsCmdHelp, ShellDialect, UiConfig, UiStyle,
+    apply_ps_help_to_entry, BindableAction, CliIntrospector, HeightSpec, Introspect,
+    KeybindingsConfig, PsCmdHelp, ShellDialect, UiConfig, UiStyle, DEFAULT_MIN_HEIGHT,
+    MAX_MIN_HEIGHT,
 };
 use crate::fuzzy::PaneList;
 use crate::model::{
@@ -14,7 +15,10 @@ use crate::shell::{
     tokenize_shell_words_for_dialect,
 };
 pub use crate::shell::{split_pipeline_prefix, tokenize_shell_words};
-use crate::ui::{expanded_inspector_max_scroll, render_frame, RenderState, Viewport};
+use crate::ui::{
+    compute_anchor_row, expanded_inspector_max_scroll, render_frame_anchored,
+    resolve_inline_height, RenderState, Viewport,
+};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
@@ -1125,6 +1129,10 @@ pub struct MillerSession<I: Introspect = CliIntrospector> {
     cmd: CommandLine,
     active_param_set_label: Option<String>,
     viewport: Viewport,
+    height_spec: Option<HeightSpec>,
+    min_height: usize,
+    anchor_row: Option<usize>,
+    last_inline_anchor: Option<usize>,
     dialect: ShellDialect,
     inspector_expanded: bool,
     inspector_scroll: usize,
@@ -1172,6 +1180,10 @@ impl<I: Introspect> MillerSession<I> {
             cmd,
             active_param_set_label: None,
             viewport,
+            height_spec: None,
+            min_height: DEFAULT_MIN_HEIGHT,
+            anchor_row: None,
+            last_inline_anchor: None,
             dialect,
             inspector_expanded: false,
             inspector_scroll: 0,
@@ -1279,11 +1291,55 @@ impl<I: Introspect> MillerSession<I> {
         self
     }
 
-    /// Applies user UI preferences (`theme`, `icons`, `borders`) to frame rendering.
+    /// Applies user UI preferences (`theme`, `icons`, `borders`, `height`, `min_height`) to frame rendering.
     pub fn with_ui_config(mut self, ui: UiConfig) -> Self {
         self.ui_style = UiStyle::from(ui);
+        self.height_spec = ui.height;
+        self.min_height = ui.effective_min_height();
         self.dirty = true;
         self
+    }
+
+    /// Configures inline partial-height mode parameters and initial prompt anchor row.
+    pub fn with_inline_layout(
+        mut self,
+        height_spec: Option<HeightSpec>,
+        min_height: usize,
+        anchor_row: Option<usize>,
+    ) -> Self {
+        self.height_spec = height_spec;
+        self.min_height = min_height.clamp(Viewport::MIN_HEIGHT, MAX_MIN_HEIGHT);
+        self.anchor_row = anchor_row;
+        if anchor_row.is_some() {
+            self.last_inline_anchor = anchor_row;
+        }
+        self.dirty = true;
+        self
+    }
+
+    /// Returns the active 1-based inline anchor row, or `None` in full alternate-screen mode.
+    pub fn anchor_row(&self) -> Option<usize> {
+        self.anchor_row
+    }
+
+    /// Updates the 1-based inline anchor row (or `None` for full alternate-screen mode).
+    pub fn set_anchor_row(&mut self, anchor_row: Option<usize>) {
+        if anchor_row.is_some() {
+            self.last_inline_anchor = anchor_row;
+        }
+        if self.anchor_row != anchor_row {
+            self.anchor_row = anchor_row;
+            self.dirty = true;
+        }
+    }
+
+    /// Updates the session viewport directly and clamps pane/inspector scroll offsets.
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        if self.viewport != viewport {
+            self.viewport = viewport;
+            self.clamp_scroll();
+            self.dirty = true;
+        }
     }
 
     /// Applies a resolved [`UiStyle`] (including `NO_COLOR`/`TERM=dumb` overrides) to frame rendering.
@@ -1452,8 +1508,20 @@ impl<I: Introspect> MillerSession<I> {
     pub fn handle_terminal_event(&mut self, ev: Event) -> SessionOutcome {
         match ev {
             Event::Resize(w, h) => {
-                let next = self.viewport.resized(w, h);
-                self.apply(UserAction::Resize(next.width, next.height))
+                if let Some(inline_rows) =
+                    resolve_inline_height(h as usize, self.height_spec, self.min_height)
+                {
+                    let base_anchor = self.anchor_row.or(self.last_inline_anchor).unwrap_or(1);
+                    let next_anchor = compute_anchor_row(base_anchor, h as usize, inline_rows);
+                    self.anchor_row = Some(next_anchor);
+                    self.last_inline_anchor = Some(next_anchor);
+                    let next = self.viewport.resized_inline(w, inline_rows);
+                    self.apply(UserAction::Resize(next.width, next.height))
+                } else {
+                    self.anchor_row = None;
+                    let next = self.viewport.resized(w, h);
+                    self.apply(UserAction::Resize(next.width, next.height))
+                }
             }
             Event::Key(key) => {
                 let action = self
@@ -2057,7 +2125,7 @@ impl<I: Introspect> MillerSession<I> {
     /// Renders a complete terminal frame for the current session state and clears the dirty flag.
     pub fn render(&mut self) -> String {
         self.sync_panes();
-        let frame = render_frame(&self.view());
+        let frame = render_frame_anchored(&self.view(), self.anchor_row);
         self.dirty = false;
         frame
     }
@@ -5432,5 +5500,54 @@ confirm = "ctrl+y"
             unicode_cmd,
             SessionOutcome::Confirmed("echo 🦀 && ls[31m".to_string())
         );
+    }
+
+    #[test]
+    fn test_inline_session_resize_clamping_inspector_scroll_and_alt_screen_fallback() {
+        let long_desc = (1..=30)
+            .map(|i| format!("Line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let git = Entry::new("git", "git", EntryKind::Cli, long_desc);
+        let mut session = MillerSession::new(
+            vec![git],
+            FakeIntrospector::empty(),
+            "",
+            Viewport::inline_for_terminal_size(100, 120, 18),
+            ShellDialect::Posix,
+        )
+        .with_inline_layout(Some(HeightSpec::Percent(45)), 15, Some(23));
+
+        assert_eq!(session.anchor_row(), Some(23));
+        let initial_frame = session.render();
+        assert!(initial_frame.starts_with("\x1b[?2026h\x1b[23;1H"));
+
+        // Expand F1 Inspector and scroll to bottom at compact height 18
+        session.apply(UserAction::ToggleInspector);
+        session.apply(UserAction::MoveEnd);
+        let scrolled = session.view().inspector_scroll;
+        assert!(scrolled > 0);
+
+        // Shrink terminal from 40 to 28 rows: 45% -> 12 rows, anchor clamps to 28 - 12 + 1 = 17
+        session.handle_terminal_event(Event::Resize(80, 28));
+        assert_eq!(session.view().viewport, Viewport::new(79, 12));
+        assert_eq!(session.anchor_row(), Some(17));
+        let compact_frame = session.render();
+        assert!(compact_frame.starts_with("\x1b[?2026h\x1b[17;1H"));
+        assert!(!compact_frame.contains("\x1b[H"));
+
+        // Shrink below min_height (15): falls back to full screen (anchor_row = None)
+        session.handle_terminal_event(Event::Resize(80, 14));
+        assert_eq!(session.anchor_row(), None);
+        assert_eq!(session.view().viewport, Viewport::new(79, 13));
+        let fallback_frame = session.render();
+        assert!(fallback_frame.starts_with("\x1b[?2026h\x1b[H"));
+
+        // Grow back above min_height (40 rows): restores inline mode (18 rows) and clamps anchor
+        session.handle_terminal_event(Event::Resize(100, 40));
+        assert_eq!(session.view().viewport, Viewport::new(99, 18));
+        assert_eq!(session.anchor_row(), Some(17));
+        let restored_frame = session.render();
+        assert!(restored_frame.starts_with("\x1b[?2026h\x1b[17;1H"));
     }
 }

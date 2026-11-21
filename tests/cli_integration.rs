@@ -154,6 +154,7 @@ fn cli_help_prints_usage_and_env_vars_with_clean_stderr() {
         assert!(stdout.contains("Usage: zpane"), "missing usage: {stdout}");
         assert!(stdout.contains("zpane init <pwsh|zsh|bash|fish|nu>"));
         assert!(stdout.contains("--cursor <OFFSET>"));
+        assert!(stdout.contains("--height <ROWS|PCT>"));
         assert!(stdout.contains("--bind <CHORD>"));
         assert!(stdout.contains("--no-bind"));
         assert!(stdout.contains("zpane inspect [--json] <CMD>..."));
@@ -359,6 +360,10 @@ fn cli_invalid_flags_and_hostile_args_exit_nonzero_and_sanitize_stderr() {
         &["--inspect="][..],
         &["inspect"][..],
         &["--width", "0"][..],
+        &["--height", "0%"][..],
+        &["--height", "101%"][..],
+        &["--height", "11"][..],
+        &["--height", "abc"][..],
     ] {
         let out = run_isolated(&ws, args);
         assert!(

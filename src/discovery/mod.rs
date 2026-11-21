@@ -13,8 +13,9 @@ pub use catalog::{load_catalog, reload_catalog, ShellDialect};
 pub use config::{
     config_path, load_user_config, load_user_config_with_diagnostics, parse_user_config_toml,
     parse_user_config_toml_with_diagnostics, BindableAction, BorderStyle, ConfigDiagnostic,
-    IconMode, KeyChord, KeybindingsConfig, ThemePreset, UiConfig, UiStyle, UserConfig,
-    DEFAULT_INTROSPECT_TIMEOUT_MS, MAX_INTROSPECT_TIMEOUT_MS, MIN_INTROSPECT_TIMEOUT_MS,
+    HeightSpec, IconMode, KeyChord, KeybindingsConfig, ThemePreset, UiConfig, UiStyle, UserConfig,
+    DEFAULT_INTROSPECT_TIMEOUT_MS, DEFAULT_MIN_HEIGHT, MAX_INTROSPECT_TIMEOUT_MS, MAX_MIN_HEIGHT,
+    MIN_INTROSPECT_TIMEOUT_MS,
 };
 pub use context::detect_runtime_context;
 pub use introspect::{

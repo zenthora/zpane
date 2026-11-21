@@ -1,5 +1,8 @@
 use crate::discovery::ShellDialect;
-pub use crate::discovery::{BorderStyle, IconMode, ThemePreset, UiConfig, UiStyle};
+pub use crate::discovery::{
+    BorderStyle, HeightSpec, IconMode, ThemePreset, UiConfig, UiStyle, DEFAULT_MIN_HEIGHT,
+    MAX_MIN_HEIGHT,
+};
 use crate::fuzzy::PaneList;
 use crate::model::{Entry, EntryKind, Pane};
 use crate::sanitize::{
@@ -316,6 +319,22 @@ impl Viewport {
         }
     }
 
+    /// Returns a viewport sized for inline partial-height mode using `height_rows`.
+    pub const fn inline_for_terminal_size(w: u16, fallback_w: usize, height_rows: usize) -> Self {
+        Self {
+            width: Self::clamp_axis(w, Self::MIN_WIDTH, fallback_w.saturating_sub(1)),
+            height: height_rows,
+        }
+    }
+
+    /// Returns a resized inline viewport, keeping the previous width if `w` is below minimum.
+    pub const fn resized_inline(self, w: u16, height_rows: usize) -> Self {
+        Self {
+            width: Self::clamp_axis(w, Self::MIN_WIDTH, self.width),
+            height: height_rows,
+        }
+    }
+
     /// Authoritative visible list-row count for `pane`, accounting for frame chrome
     /// and Pane 3's inspector header. Never exceeds the terminal height.
     pub fn rows(self, pane: Pane) -> usize {
@@ -325,6 +344,67 @@ impl Viewport {
             Pane::First | Pane::Second => list_rows,
         }
     }
+}
+
+/// Resolved terminal rendering mode (full alternate screen vs anchored inline region).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DisplayMode {
+    FullAltScreen,
+    Inline {
+        anchor_row: usize,
+        height_rows: usize,
+    },
+}
+
+/// Resolves the inline row count for a terminal with `term_rows`, returning `None` when
+/// full alternate screen should be used (`unset`, `100%`, `term_rows < min_height`, or
+/// resolved height `< Viewport::MIN_HEIGHT`).
+pub fn resolve_inline_height(
+    term_rows: usize,
+    height_spec: Option<HeightSpec>,
+    min_height: usize,
+) -> Option<usize> {
+    let effective_min = min_height.clamp(Viewport::MIN_HEIGHT, MAX_MIN_HEIGHT);
+    if term_rows < effective_min {
+        return None;
+    }
+    let resolved = match height_spec? {
+        HeightSpec::Percent(100) => return None,
+        HeightSpec::Percent(pct) => (term_rows * (pct as usize).min(100)) / 100,
+        HeightSpec::Rows(rows) => rows.min(term_rows),
+    };
+    (resolved >= Viewport::MIN_HEIGHT).then_some(resolved)
+}
+
+/// Computes the 1-based anchor row so `height_rows` fit within `term_rows` without
+/// overflowing row 1 or scrolling past the bottom.
+pub fn compute_anchor_row(cursor_row: usize, term_rows: usize, height_rows: usize) -> usize {
+    let term_rows = term_rows.max(1);
+    let height_rows = height_rows.clamp(1, term_rows);
+    let max_anchor = term_rows - height_rows + 1;
+    cursor_row.max(1).min(max_anchor)
+}
+
+/// Builds the VT escape sequence that reserves `height_rows` below the current prompt
+/// without entering the alternate screen buffer, leaving the cursor at `(anchor_row, 1)`.
+pub fn inline_reserve_sequence(height_rows: usize) -> String {
+    let down = height_rows.saturating_sub(1);
+    let mut seq = String::with_capacity(down + 16);
+    seq.push('\r');
+    for _ in 0..down {
+        seq.push('\n');
+    }
+    if down > 0 {
+        let _ = write!(seq, "\x1b[{down}A");
+    }
+    seq.push_str("\x1b[?25l");
+    seq
+}
+
+/// Builds the VT escape sequence that clears only the reserved inline region from
+/// `anchor_row` downward and restores cursor position and visibility.
+pub fn inline_cleanup_sequence(anchor_row: usize) -> String {
+    format!("\x1b[{};1H\x1b[J\x1b[?25h", anchor_row.max(1))
 }
 
 fn display_width_sanitized(s: &str) -> usize {
@@ -1390,6 +1470,12 @@ const FOOTER_PS_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  
 const FOOTER_RELOAD_ASCII: &str = " [^/v|Ctrl+N/P] Move  [</>] Pane  [Type] Filter  [Tab] Append  [Ctrl+U] Clear  [F1] Inspect  [Ctrl+R] Reload  [Ctrl+O] Pipe  [Enter] Accept  [Esc]";
 
 pub fn render_frame(st: &RenderState<'_>) -> String {
+    render_frame_anchored(st, None)
+}
+
+/// Renders a synchronized DEC Mode 2026 frame anchored either at `(1, 1)` (`None`, full
+/// alternate screen) or at `(anchor_row, 1)` (`Some(row)`, inline partial-height mode).
+pub fn render_frame_anchored(st: &RenderState<'_>, anchor_row: Option<usize>) -> String {
     let palette = palette_for(st.style.theme);
     let borders = border_chars_for(st.style.borders);
     let icons = st.style.icons;
@@ -1425,7 +1511,12 @@ pub fn render_frame(st: &RenderState<'_>) -> String {
     let mut sb = String::with_capacity(estimated_cap);
     let mut scratch = String::with_capacity(256);
     let mut sanitize_scratch = String::with_capacity(256);
-    sb.push_str("\x1b[?2026h\x1b[H"); // Begin synchronized update + Cursor to home (0,0) for flicker-free overwrite
+    sb.push_str("\x1b[?2026h");
+    if let Some(row) = anchor_row {
+        let _ = write!(sb, "\x1b[{};1H", row.max(1));
+    } else {
+        sb.push_str("\x1b[H");
+    }
 
     let header_color = |pane: Pane| {
         if st.active_pane == pane {
@@ -2663,6 +2754,7 @@ mod tests {
             theme: ThemePreset::Dark,
             icons: IconMode::Unicode,
             borders: BorderStyle::Rounded,
+            ..UiConfig::default()
         };
 
         // Empty NO_COLOR keeps configured Dark theme colors
@@ -3243,5 +3335,142 @@ mod tests {
         assert!(inspector_plain.contains("Pipe: ByValue, ByPropertyName"));
         assert!(inspector_plain.contains("Range: 1..100"));
         assert!(inspector_plain.contains("Required:"));
+    }
+
+    #[test]
+    fn test_inline_height_resolution_fallback_and_anchor_math() {
+        // Unset or 100% resolves to None (FullAltScreen)
+        assert_eq!(resolve_inline_height(40, None, 15), None);
+        assert_eq!(
+            resolve_inline_height(40, Some(HeightSpec::Percent(100)), 15),
+            None
+        );
+
+        // Terminal smaller than min_height falls back to FullAltScreen
+        assert_eq!(
+            resolve_inline_height(14, Some(HeightSpec::Rows(14)), 15),
+            None
+        );
+        assert_eq!(
+            resolve_inline_height(14, Some(HeightSpec::Percent(90)), 15),
+            None
+        );
+
+        // Percentage resolving below Viewport::MIN_HEIGHT (12) falls back to FullAltScreen
+        assert_eq!(
+            resolve_inline_height(24, Some(HeightSpec::Percent(45)), 15),
+            None // 24 * 45 / 100 = 10 < 12
+        );
+
+        // Valid percentage and row counts resolve and clamp to terminal rows
+        assert_eq!(
+            resolve_inline_height(40, Some(HeightSpec::Percent(45)), 15),
+            Some(18)
+        );
+        assert_eq!(
+            resolve_inline_height(30, Some(HeightSpec::Rows(18)), 15),
+            Some(18)
+        );
+        assert_eq!(
+            resolve_inline_height(18, Some(HeightSpec::Rows(24)), 15),
+            Some(18)
+        );
+        assert_eq!(
+            resolve_inline_height(15, Some(HeightSpec::Rows(12)), 15),
+            Some(12)
+        );
+
+        // Anchor row calculation clamps cleanly when near bottom without overflowing row 1
+        assert_eq!(compute_anchor_row(1, 40, 18), 1);
+        assert_eq!(compute_anchor_row(10, 40, 18), 10);
+        assert_eq!(compute_anchor_row(23, 40, 18), 23);
+        assert_eq!(compute_anchor_row(35, 40, 18), 23);
+        assert_eq!(compute_anchor_row(40, 40, 18), 23);
+        assert_eq!(compute_anchor_row(20, 20, 20), 1);
+    }
+
+    #[test]
+    fn test_inline_escape_sequences_and_compact_anchored_frames() {
+        let reserve = inline_reserve_sequence(15);
+        assert!(!reserve.contains("\x1b[?1049h"));
+        assert!(!reserve.contains("\x1b[?1049l"));
+        assert!(!reserve.contains("\x1b[2J"));
+        assert!(!reserve.contains("\x1b[H"));
+        assert_eq!(reserve.matches('\n').count(), 14);
+        assert!(reserve.contains("\x1b[14A"));
+        assert!(reserve.contains("\x1b[?25l"));
+
+        let cleanup = inline_cleanup_sequence(16);
+        assert_eq!(cleanup, "\x1b[16;1H\x1b[J\x1b[?25h");
+        assert!(!cleanup.contains("\x1b[?1049l"));
+        assert!(!cleanup.contains("\x1b[2J"));
+
+        let long_desc = (1..=20)
+            .map(|i| format!("Inspector line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pane1 = PaneList::new(vec![
+            Entry::new("git", "git", EntryKind::Cli, long_desc),
+            Entry::new("cargo", "cargo", EntryKind::Cli, "Rust"),
+        ]);
+        let pane2 = PaneList::new(vec![Entry::new(
+            "commit",
+            "commit",
+            EntryKind::Subcmd,
+            "Commit",
+        )]);
+        let pane3 = PaneList::new(vec![Entry::new(
+            "--amend",
+            "--amend",
+            EntryKind::Flag,
+            "Amend",
+        )]);
+
+        for compact_h in [12usize, 15, 18, 20] {
+            let vp = Viewport::inline_for_terminal_size(160, 120, compact_h);
+            assert_eq!(vp, Viewport::new(159, compact_h));
+
+            for (expanded, scroll) in [(false, 0usize), (true, 0), (true, 4)] {
+                let raw = render_frame_anchored(
+                    &RenderState {
+                        viewport: vp,
+                        active_pane: Pane::First,
+                        panes: [&pane1, &pane2, &pane3],
+                        command_line: "git commit --amend".to_string(),
+                        active_param_set: None,
+                        subcmd_chain: &[],
+                        committed_tokens: &[],
+                        dialect: ShellDialect::Posix,
+                        inspector_expanded: expanded,
+                        inspector_scroll: scroll,
+                        style: UiStyle::default(),
+                    },
+                    Some(17),
+                );
+                assert!(raw.starts_with("\x1b[?2026h\x1b[17;1H"));
+                assert!(raw.ends_with("\x1b[K\x1b[J\x1b[?2026l"));
+                assert!(!raw.contains("\x1b[H"));
+                assert!(!raw.contains("\x1b[2J"));
+                assert!(!raw.contains("\x1b[?1049h"));
+
+                let plain = strip_ansi(&raw);
+                let lines: Vec<&str> = plain.lines().collect();
+                assert_eq!(
+                    lines.len(),
+                    compact_h,
+                    "compact height {compact_h} (expanded={expanded}) must emit exact row count"
+                );
+                for line in &lines {
+                    assert_eq!(UnicodeWidthStr::width(*line), 159);
+                }
+                assert!(plain.contains("Command Line  :"));
+                assert!(plain.contains("git commit --amend"));
+                assert!(plain.contains("[Enter] Accept"));
+                if expanded {
+                    assert!(plain.contains("3. Inspector"));
+                    assert!(plain.contains("Inspector line"));
+                }
+            }
+        }
     }
 }

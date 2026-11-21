@@ -80,12 +80,63 @@ impl BorderStyle {
     }
 }
 
-/// User-configured UI appearance preferences loaded from `config.toml`.
+/// Default minimum terminal height (in rows) required for inline partial-height mode.
+pub const DEFAULT_MIN_HEIGHT: usize = 15;
+/// Maximum configurable `min_height` bound in rows.
+pub const MAX_MIN_HEIGHT: usize = 100;
+
+/// User- or CLI-specified UI height preference (`Rows(n)` or `Percent(1..=100)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeightSpec {
+    Rows(usize),
+    Percent(u8),
+}
+
+impl HeightSpec {
+    /// Validates an integer row count (`Viewport::MIN_HEIGHT..=u16::MAX`).
+    pub fn from_rows(rows: usize) -> Result<Self, String> {
+        let min = crate::ui::Viewport::MIN_HEIGHT;
+        if rows < min {
+            return Err(format!("height must be at least {min}, got {rows}"));
+        }
+        if rows > u16::MAX as usize {
+            return Err(format!("height must be at most {}, got {rows}", u16::MAX));
+        }
+        Ok(Self::Rows(rows))
+    }
+
+    /// Parses a height specification from rows (`"18"`) or percentage (`"45%"`, `"100%"`).
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if let Some(pct_raw) = trimmed.strip_suffix('%') {
+            if pct_raw.is_empty() || !pct_raw.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!("Invalid integer or percentage: {raw}"));
+            }
+            let pct = pct_raw
+                .parse::<u8>()
+                .ok()
+                .filter(|&v| (1..=100).contains(&v))
+                .ok_or_else(|| format!("percentage must be between 1% and 100%, got {trimmed}"))?;
+            return Ok(Self::Percent(pct));
+        }
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("Invalid integer or percentage: {raw}"));
+        }
+        let rows = trimmed
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid integer or percentage: {raw}"))?;
+        Self::from_rows(rows)
+    }
+}
+
+/// User-configured UI appearance and layout preferences loaded from `config.toml`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UiConfig {
     pub theme: ThemePreset,
     pub icons: IconMode,
     pub borders: BorderStyle,
+    pub height: Option<HeightSpec>,
+    pub min_height: Option<usize>,
 }
 
 /// Resolved UI rendering style after applying environment overrides (`NO_COLOR`, `TERM=dumb`).
@@ -97,6 +148,14 @@ pub struct UiStyle {
 }
 
 impl UiConfig {
+    /// Returns the effective bounded `min_height` for inline mode, defaulting to
+    /// [`DEFAULT_MIN_HEIGHT`] (`15`) and clamped to `Viewport::MIN_HEIGHT..=MAX_MIN_HEIGHT`.
+    pub fn effective_min_height(self) -> usize {
+        self.min_height
+            .unwrap_or(DEFAULT_MIN_HEIGHT)
+            .clamp(crate::ui::Viewport::MIN_HEIGHT, MAX_MIN_HEIGHT)
+    }
+
     /// Resolves UI settings with explicit `NO_COLOR` and `TERM` values without mutating process env.
     pub fn resolve_env(self, no_color: Option<&str>, term: Option<&str>) -> UiStyle {
         let no_color_active = no_color.is_some_and(|v| !v.is_empty());
@@ -736,6 +795,55 @@ fn apply_config_entry(
                         format!("Invalid value for 'borders': {err}"),
                     ),
                 },
+                "height" if allow_ui => {
+                    if let Some(rows) = parse_toml_usize(val) {
+                        match HeightSpec::from_rows(rows) {
+                            Ok(spec) => cfg.ui.height = Some(spec),
+                            Err(msg) => push_diag(
+                                diags,
+                                line_no,
+                                format!("Invalid value for 'height': {msg}"),
+                            ),
+                        }
+                    } else {
+                        match parse_toml_string_literal(val) {
+                            Ok(s) => match HeightSpec::parse(&s) {
+                                Ok(spec) => cfg.ui.height = Some(spec),
+                                Err(msg) => push_diag(
+                                    diags,
+                                    line_no,
+                                    format!("Invalid value for 'height': {msg}"),
+                                ),
+                            },
+                            Err(err) => push_diag(
+                                diags,
+                                line_no,
+                                format!("Invalid value for 'height': {err}"),
+                            ),
+                        }
+                    }
+                }
+                "min_height" if allow_ui => match parse_toml_usize(val) {
+                    Some(h) => {
+                        let min_bound = crate::ui::Viewport::MIN_HEIGHT;
+                        let clamped = h.clamp(min_bound, MAX_MIN_HEIGHT);
+                        cfg.ui.min_height = Some(clamped);
+                        if clamped != h {
+                            push_diag(
+                                diags,
+                                line_no,
+                                format!(
+                                    "Value for 'min_height' ({h}) out of range ({min_bound}..={MAX_MIN_HEIGHT}); clamped to {clamped}"
+                                ),
+                            );
+                        }
+                    }
+                    None => push_diag(
+                        diags,
+                        line_no,
+                        format!("Invalid integer for 'min_height': {}", val.trim()),
+                    ),
+                },
                 _ => push_diag(
                     diags,
                     line_no,
@@ -1039,6 +1147,7 @@ confirm = "ctrl+y"
                 theme: ThemePreset::Light,
                 icons: IconMode::Ascii,
                 borders: BorderStyle::Plain,
+                ..UiConfig::default()
             }
         );
         assert_eq!(
@@ -1074,6 +1183,7 @@ history_limit = 10
                 theme: ThemePreset::Ansi16,
                 icons: IconMode::Ascii,
                 borders: BorderStyle::Ascii,
+                ..UiConfig::default()
             }
         );
         assert_eq!(top_cfg.history_limit, Some(10));
@@ -1190,6 +1300,7 @@ toggle_inspector = "ctrl+badkey"
             theme: ThemePreset::Dark,
             icons: IconMode::Unicode,
             borders: BorderStyle::Rounded,
+            ..UiConfig::default()
         };
         assert_eq!(
             dark_unicode.resolve_env(None, Some("xterm-256color")).theme,
@@ -1348,5 +1459,59 @@ toggle_inspector = "ctrl+badkey"
         );
         assert!(!bad_cfg.sync_profile);
         assert_eq!(bad_diags.len(), 3);
+    }
+
+    #[test]
+    fn test_ui_height_and_min_height_parsing_bounds_and_diagnostics() {
+        assert_eq!(UiConfig::default().height, None);
+        assert_eq!(UiConfig::default().min_height, None);
+        assert_eq!(UiConfig::default().effective_min_height(), 15);
+
+        // HeightSpec::parse unit cases
+        assert_eq!(HeightSpec::parse("18"), Ok(HeightSpec::Rows(18)));
+        assert_eq!(HeightSpec::parse(" 45% "), Ok(HeightSpec::Percent(45)));
+        assert_eq!(HeightSpec::parse("100%"), Ok(HeightSpec::Percent(100)));
+        assert!(HeightSpec::parse("11").is_err());
+        assert!(HeightSpec::parse("70000").is_err());
+        assert!(HeightSpec::parse("0%").is_err());
+        assert!(HeightSpec::parse("101%").is_err());
+        assert!(HeightSpec::parse("abc").is_err());
+
+        // [ui] section with percentage height and valid min_height
+        let (pct_cfg, pct_diags) =
+            parse_user_config_toml_with_diagnostics("[ui]\nheight = \"45%\"\nmin_height = 18\n");
+        assert!(pct_diags.is_empty(), "unexpected diags: {pct_diags:?}");
+        assert_eq!(pct_cfg.ui.height, Some(HeightSpec::Percent(45)));
+        assert_eq!(pct_cfg.ui.min_height, Some(18));
+        assert_eq!(pct_cfg.ui.effective_min_height(), 18);
+
+        // Top-level compat with integer height
+        let (rows_cfg, rows_diags) =
+            parse_user_config_toml_with_diagnostics("height = 18\nmin_height = 12\n");
+        assert!(rows_diags.is_empty(), "unexpected diags: {rows_diags:?}");
+        assert_eq!(rows_cfg.ui.height, Some(HeightSpec::Rows(18)));
+        assert_eq!(rows_cfg.ui.effective_min_height(), 12);
+
+        // Out-of-range min_height clamps to 12..=100 with non-fatal diagnostics
+        let (clamped_cfg, clamped_diags) =
+            parse_user_config_toml_with_diagnostics("[ui]\nmin_height = 5\n");
+        assert_eq!(clamped_cfg.ui.min_height, Some(12));
+        assert_eq!(clamped_cfg.ui.effective_min_height(), 12);
+        assert_eq!(clamped_diags.len(), 1);
+        assert!(clamped_diags[0].message.contains("min_height"));
+
+        let (clamped_hi, clamped_hi_diags) =
+            parse_user_config_toml_with_diagnostics("min_height = 250\n");
+        assert_eq!(clamped_hi.ui.effective_min_height(), 100);
+        assert_eq!(clamped_hi_diags.len(), 1);
+
+        // Invalid height/min_height or wrong section emit non-fatal diagnostics and keep defaults
+        let (bad_cfg, bad_diags) = parse_user_config_toml_with_diagnostics(
+            "height = \"0%\"\n[ui]\nheight = 5\nmin_height = -3\n[discovery]\nheight = 18\nmin_height = 20\n",
+        );
+        assert_eq!(bad_cfg.ui.height, None);
+        assert_eq!(bad_cfg.ui.min_height, None);
+        assert_eq!(bad_cfg.ui.effective_min_height(), 15);
+        assert_eq!(bad_diags.len(), 5);
     }
 }
