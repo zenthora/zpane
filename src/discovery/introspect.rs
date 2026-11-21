@@ -242,16 +242,12 @@ fn is_safe_catalog_command_token(tok: &str) -> bool {
 
 fn is_safe_sub_arg(arg: &str) -> bool {
     let trimmed = arg.trim();
-    if trimmed.is_empty()
+    !(trimmed.is_empty()
         || trimmed.len() > 128
         || trimmed.starts_with(['-', '/', '\\', '.'])
         || trimmed.contains("..")
         || trimmed.chars().any(|c| c.is_whitespace() || c == '=')
-        || has_shell_metachar_or_control(trimmed)
-    {
-        return false;
-    }
-    true
+        || has_shell_metachar_or_control(trimmed))
 }
 
 fn normalize_and_validate_chain<'a>(
@@ -308,17 +304,14 @@ fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
-    if !meta.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        (meta.permissions().mode() & 0o111) != 0
+        meta.is_file() && (meta.permissions().mode() & 0o111) != 0
     }
     #[cfg(not(unix))]
     {
-        true
+        meta.is_file()
     }
 }
 

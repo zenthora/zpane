@@ -7,7 +7,7 @@ use crate::sanitize::{is_disallowed_control, sanitize_multiline_desc, sanitize_s
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const MAX_YAML_DEPTH: usize = 48;
 const MAX_YAML_LINES: usize = 16_384;
@@ -25,12 +25,30 @@ pub(super) struct SpecDirEnv {
     pub(super) cache_dir: PathBuf,
 }
 
+fn windows_paths_equal(a: &Path, b: &Path) -> bool {
+    let a_s = a.to_string_lossy();
+    let b_s = b.to_string_lossy();
+    a_s.bytes()
+        .map(|byte| {
+            if byte == b'\\' {
+                b'/'
+            } else {
+                byte.to_ascii_lowercase()
+            }
+        })
+        .eq(b_s.bytes().map(|byte| {
+            if byte == b'\\' {
+                b'/'
+            } else {
+                byte.to_ascii_lowercase()
+            }
+        }))
+}
+
 fn push_unique_dir(dirs: &mut Vec<PathBuf>, candidate: PathBuf, is_windows: bool) {
     let dup = dirs.iter().any(|existing| {
         if is_windows {
-            existing
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&candidate.to_string_lossy())
+            windows_paths_equal(existing, &candidate)
         } else {
             existing == &candidate
         }
@@ -1733,6 +1751,21 @@ commands:
                     .join("specs"),
                 PathBuf::from(r"D:\legacy_cache\zpane").join("specs"),
             ]
+        );
+
+        let mixed_sep_cache = spec_search_dirs_from(&SpecDirEnv {
+            is_windows: true,
+            xdg_config_home: None,
+            home: None,
+            appdata: Some(PathBuf::from(r"C:\Users\alice\AppData\Roaming")),
+            local_appdata: Some(PathBuf::from(r"C:\Users\alice\AppData\Local")),
+            userprofile: Some(PathBuf::from(r"C:\Users\alice")),
+            cache_dir: PathBuf::from("C:/Users/Alice/AppData/Local/zpane"),
+        });
+        assert_eq!(
+            mixed_sep_cache.len(),
+            4,
+            "mixed separator and case Windows cache_dir/specs must deduplicate against %LOCALAPPDATA%: {mixed_sep_cache:?}"
         );
     }
 }
