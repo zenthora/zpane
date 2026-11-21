@@ -21,6 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(discovery)* Lazy cache fingerprinting, config-aware warm, and configurable timeout
 
+### Bug Fixes
+
+- *(ci)* Normalize Windows spec-dir dedup and satisfy Rust 1.100 clippy
+
 ### Refactoring
 
 - *(core)* Unify sanitization, Entry::walk_chain, and add CLI integration tests
@@ -29,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous Tasks
 
 - *(release)* Add PR CI matrix, macOS and Linux arm64 packages, and package manager support
+- *(release)* Bump version to 0.6.0 and update CHANGELOG.md
 
 ## [0.5.2] - 2026-11-17
 
