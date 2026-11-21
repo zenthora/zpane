@@ -1,5 +1,5 @@
 Name:           zpane
-Version:        0.5.2
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        3-pane Miller column command, subcommand, parameter & variable explorer
 License:        MIT
@@ -41,6 +41,9 @@ install -Dm0644 "%{_sourcedir}/LICENSE" "%{buildroot}%{_datadir}/licenses/zpane/
 %license %attr(0644,root,root) %{_datadir}/licenses/zpane/LICENSE
 
 %changelog
+* Sat Nov 21 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.6.0-1
+- Release zpane 0.6.0 (inline --height mode, Nushell & cursor-aware init, zpane doctor, themes/NO_COLOR, XDG specs & project tasks, lazy cache & rich PowerShell metadata)
+
 * Tue Nov 17 2026 zenthora <105382125+zenthora@users.noreply.github.com> - 0.5.2-1
 - Release zpane 0.5.2 (preserve Pane 2 selection during background catalog refresh)
 

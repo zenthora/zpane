@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-11-21
+
+### Features
+
+- *(config)* Respect NO_COLOR, add themes and ASCII UI modes, and expand config.toml schema
+- *(discovery)* Add XDG spec precedence, knack/argparse/man fallbacks, and project tasks
+- *(ui)* Add subcommand breadcrumbs, committed markers, pipeline chaining, and scrollable inspector
+- *(pwsh)* Add rich CLR parameter metadata, MAML help, profile sync, and PS 5.1 fallback
+- *(shell)* Add cursor-aware editing, init --bind/--no-bind, live history, and Nushell support
+- *(ui)* Add inline partial-height rendering mode (--height)
+- *(cli)* Add zpane doctor diagnostics and sync docs
+
+### Performance
+
+- *(discovery)* Lazy cache fingerprinting, config-aware warm, and configurable timeout
+
+### Refactoring
+
+- *(core)* Unify sanitization, Entry::walk_chain, and add CLI integration tests
+- *(core)* Split discovery catalog submodules and extract shell module
+
+### Miscellaneous Tasks
+
+- *(release)* Add PR CI matrix, macOS and Linux arm64 packages, and package manager support
+
 ## [0.5.2] - 2026-11-17
 
 ### Bug Fixes
@@ -14,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Miscellaneous Tasks
 
 - *(git)* Expand .gitignore and untrack AGENTS.md and docs/agents
+- *(release)* Bump version to 0.5.2 and update CHANGELOG.md
 
 ## [0.5.1] - 2026-11-15
 

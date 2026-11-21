@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 022
 
-VERSION="${1:-0.5.2}"
+VERSION="${1:-0.6.0}"
 VERSION="${VERSION#v}"
 REL="1"
 

@@ -116,9 +116,9 @@ winget install zenthora.zpane
 ### Prebuilt Release Archives
 
 Each GitHub Release publishes deterministic archives and `SHA256SUMS` for:
-- **Windows (`x86_64`)**: `zpane-v0.5.2-x86_64-pc-windows-msvc.zip`
-- **macOS (`arm64` & `x86_64`)**: `zpane-v0.5.2-aarch64-apple-darwin.tar.gz`, `zpane-v0.5.2-x86_64-apple-darwin.tar.gz`
-- **Linux (`x86_64` & `aarch64` static musl)**: `zpane-v0.5.2-x86_64-unknown-linux-musl.tar.gz`, `zpane-v0.5.2-aarch64-unknown-linux-musl.tar.gz`
+- **Windows (`x86_64`)**: `zpane-v0.6.0-x86_64-pc-windows-msvc.zip`
+- **macOS (`arm64` & `x86_64`)**: `zpane-v0.6.0-aarch64-apple-darwin.tar.gz`, `zpane-v0.6.0-x86_64-apple-darwin.tar.gz`
+- **Linux (`x86_64` & `aarch64` static musl)**: `zpane-v0.6.0-x86_64-unknown-linux-musl.tar.gz`, `zpane-v0.6.0-aarch64-unknown-linux-musl.tar.gz`
 
 ### Arch Linux (`pacman` / `makepkg`)
 
@@ -126,7 +126,7 @@ Install the prebuilt `.pkg.tar.zst` release package (`x86_64` or `aarch64`) or b
 
 ```bash
 # Install release package directly
-sudo pacman -U dist/zpane-0.5.2-1-x86_64.pkg.tar.zst
+sudo pacman -U dist/zpane-0.6.0-1-x86_64.pkg.tar.zst
 
 # Or build from PKGBUILD
 cd packaging/arch && makepkg -si
@@ -135,7 +135,7 @@ cd packaging/arch && makepkg -si
 ### Debian / Ubuntu (`.deb` — `amd64` & `arm64`)
 
 ```bash
-sudo dpkg -i dist/zpane_0.5.2-1_amd64.deb
+sudo dpkg -i dist/zpane_0.6.0-1_amd64.deb
 ```
 
 ### Fedora / RHEL / openSUSE (`.rpm` — `x86_64` & `aarch64`)
@@ -143,9 +143,9 @@ sudo dpkg -i dist/zpane_0.5.2-1_amd64.deb
 Install the prebuilt `.rpm` package via `dnf` / `rpm` or build from [`packaging/fedora/zpane.spec`](packaging/fedora/zpane.spec):
 
 ```bash
-sudo dnf install ./dist/zpane-0.5.2-1.x86_64.rpm
+sudo dnf install ./dist/zpane-0.6.0-1.x86_64.rpm
 # or
-sudo rpm -Uvh dist/zpane-0.5.2-1.x86_64.rpm
+sudo rpm -Uvh dist/zpane-0.6.0-1.x86_64.rpm
 ```
 
 ### Android Termux (`aarch64`)
@@ -153,7 +153,7 @@ sudo rpm -Uvh dist/zpane-0.5.2-1.x86_64.rpm
 Install the Termux `.deb` package (built with the `/data/data/com.termux/files/usr` prefix) or see [`packaging/termux/build.sh`](packaging/termux/build.sh):
 
 ```bash
-dpkg -i zpane_0.5.2_aarch64.deb
+dpkg -i zpane_0.6.0_aarch64.deb
 zpane --warm
 ```
 

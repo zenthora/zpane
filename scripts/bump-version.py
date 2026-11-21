@@ -70,7 +70,7 @@ def main() -> int:
     # (packaging/{homebrew,scoop,winget}/ keep __VERSION__/__SHA256_*__ placeholders rendered at release time.)
     replace_once("packaging/termux/build.sh", r"^TERMUX_PKG_SHA256=.*$", f"TERMUX_PKG_SHA256={SOURCE_SHA256_PLACEHOLDER}")
     replace_once("scripts/package-linux.sh", r'^VERSION="\$\{1:-[^}]+\}"', f'VERSION="${{1:-{version}}}"')
-    replace_all("README.md", r"zpane[-_]\d+\.\d+\.\d+", lambda m: m.group(0)[:6] + version)
+    replace_all("README.md", r"(zpane[-_]v?)\d+\.\d+\.\d+", rf"\g<1>{version}")
 
     # Refresh Cargo.lock for the workspace package without touching external dependencies.
     run(["cargo", "update", "--workspace", "--offline"], capture=True)

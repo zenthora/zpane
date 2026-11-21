@@ -2,7 +2,7 @@ TERMUX_PKG_HOMEPAGE=https://github.com/zenthora/zpane
 TERMUX_PKG_DESCRIPTION="3-pane Miller column command, subcommand, parameter & variable explorer"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="@zenthora"
-TERMUX_PKG_VERSION="0.5.2"
+TERMUX_PKG_VERSION="0.6.0"
 TERMUX_PKG_SRCURL="https://github.com/zenthora/zpane/archive/refs/tags/v${TERMUX_PKG_VERSION}.tar.gz"
 # Security: the all-zero digest is a deliberate placeholder that fails verification. The release workflow
 # (scripts/render-package-manifests.py --source-sha256) renders a copy pinned to the v${TERMUX_PKG_VERSION}
