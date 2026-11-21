@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Bug Fixes
 
 - *(ci)* Normalize Windows spec-dir dedup and satisfy Rust 1.100 clippy
+- *(packaging)* Fix Unix unused_mut lint and aarch64 RPM cross-build
 
 ### Refactoring
 
@@ -34,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - *(release)* Add PR CI matrix, macOS and Linux arm64 packages, and package manager support
 - *(release)* Bump version to 0.6.0 and update CHANGELOG.md
+- *(release)* Refresh CHANGELOG.md for v0.6.0
 
 ## [0.5.2] - 2026-11-17
 
